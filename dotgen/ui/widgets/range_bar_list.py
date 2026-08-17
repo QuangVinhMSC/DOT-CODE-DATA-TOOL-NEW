@@ -1,0 +1,267 @@
+"""RangeBarList -- a scrollable, filterable, collapsible list of RangeBars.
+
+Tab 1 uses it with group-level enable checkboxes for the optional parameter
+groups; Tab 3 uses it read-only with per-bar compare checkboxes.
+"""
+
+from __future__ import annotations
+
+from typing import Iterable
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QScrollArea,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from ...core.params import GROUP_ORDER, ParamSet, group_of
+from ...core.state import AppState
+from .. import theme
+from ..qtutil import clear_layout
+from .range_bar import RangeBar
+
+# Groups the draft marks as "can be used or unused".
+OPTIONAL_GROUPS: dict[str, tuple[str, ...]] = {
+    "Perspective / Tilt": ("persp", "tilt"),
+    "Curve": ("curve",),
+}
+
+
+class _Section(QFrame):
+    def __init__(self, title: str, parent=None) -> None:
+        super().__init__(parent)
+        self.title = title
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        header = QWidget()
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(0, 2, 0, 2)
+        hl.setSpacing(4)
+
+        self.toggle = QToolButton()
+        self.toggle.setText(title)
+        self.toggle.setCheckable(True)
+        self.toggle.setChecked(True)
+        self.toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.toggle.setArrowType(Qt.DownArrow)
+        self.toggle.setStyleSheet("QToolButton { font-weight: 600; border: none; }")
+        self.toggle.toggled.connect(self._on_toggled)
+        hl.addWidget(self.toggle)
+
+        self.group_box: QCheckBox | None = None
+        hl.addStretch(1)
+
+        self.header = header
+        self.header_layout = hl
+        outer.addWidget(header)
+
+        self.body = QWidget()
+        self.body_layout = QVBoxLayout(self.body)
+        self.body_layout.setContentsMargins(14, 0, 0, 4)
+        self.body_layout.setSpacing(1)
+        outer.addWidget(self.body)
+
+    def add_group_checkbox(self, text: str = "use") -> QCheckBox:
+        self.group_box = QCheckBox(text)
+        self.group_box.setToolTip("Use this parameter group when rendering")
+        self.header_layout.insertWidget(1, self.group_box)
+        return self.group_box
+
+    def add(self, w: QWidget) -> None:
+        self.body_layout.addWidget(w)
+
+    def _on_toggled(self, checked: bool) -> None:
+        self.toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+        self.body.setVisible(checked)
+
+
+class RangeBarList(QWidget):
+    def __init__(
+        self,
+        state: AppState,
+        keys: Iterable[str] | None = None,
+        show_enable: bool = False,
+        show_compare: bool = False,
+        editable: bool = True,
+        group_enable: bool = False,
+        show_filter: bool = True,
+        label_width: int = 128,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.state = state
+        self.keys = list(keys) if keys is not None else None
+        self.show_enable = show_enable
+        self.show_compare = show_compare
+        self.editable = editable
+        self.group_enable = group_enable
+        self.label_width = label_width
+
+        self.bars: dict[str, RangeBar] = {}
+        self.sections: dict[str, _Section] = {}
+        self._extra: list[tuple[str, QWidget]] = []
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(theme.GAP)
+
+        self.filter_edit = QLineEdit()
+        self.filter_edit.setPlaceholderText("Filter parameters...")
+        self.filter_edit.setClearButtonEnabled(True)
+        self.filter_edit.textChanged.connect(self._apply_filter)
+        self.filter_edit.setVisible(show_filter)
+        outer.addWidget(self.filter_edit)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        outer.addWidget(self.scroll, 1)
+
+        self.container = QWidget()
+        self.container_layout = QVBoxLayout(self.container)
+        self.container_layout.setContentsMargins(0, 0, 0, 0)
+        self.container_layout.setSpacing(2)
+        self.scroll.setWidget(self.container)
+
+        self.empty_label = QLabel("No parameters yet.")
+        self.empty_label.setObjectName("hint")
+        self.container_layout.addWidget(self.empty_label)
+
+        self.rebuild()
+
+        state.paramsChanged.connect(self.refresh)
+
+    # ------------------------------------------------------------------
+    def add_section(self, title: str, widget: QWidget) -> None:
+        """Attach an extra panel (Tab 1's test panel, geometry debug, ...)."""
+        self._extra.append((title, widget))
+        self.rebuild()
+
+    def visible_params(self) -> ParamSet:
+        params = self.state.params
+
+        if self.keys is None:
+            return params
+
+        return ParamSet([params[k] for k in self.keys if k in params])
+
+    # ------------------------------------------------------------------
+    def rebuild(self) -> None:
+        # The attached panels and the empty label belong to whoever supplied
+        # them and are re-added below; everything else is a section this method
+        # built last time and must be destroyed, not merely unparented.
+        for _title, widget in self._extra:
+            widget.hide()
+            widget.setParent(None)
+
+        clear_layout(self.container_layout, keep=[self.empty_label])
+
+        self.bars.clear()
+        self.sections.clear()
+
+        params = self.visible_params()
+        by_group: dict[str, list] = {}
+
+        for key, p in params.items():
+            by_group.setdefault(group_of(key), []).append(p)
+
+        order = [g for g in GROUP_ORDER if g in by_group]
+        order += [g for g in by_group if g not in order]
+
+        for gname in order:
+            section = _Section(gname)
+            self.sections[gname] = section
+
+            if self.group_enable and gname in OPTIONAL_GROUPS:
+                box = section.add_group_checkbox()
+                prefixes = OPTIONAL_GROUPS[gname]
+                box.setChecked(any(p.enabled for p in by_group[gname]))
+                box.toggled.connect(
+                    lambda v, pref=prefixes: self.state.set_group_enabled(pref, v)
+                )
+
+            for p in by_group[gname]:
+                bar = RangeBar(
+                    p,
+                    show_enable=self.show_enable,
+                    show_compare=self.show_compare,
+                    label_width=self.label_width,
+                )
+                bar.setEditable(self.editable)
+                bar.valueChanged.connect(self.state.set_param)
+                bar.enabledToggled.connect(self.state.set_param_enabled)
+                bar.compareToggled.connect(self.state.set_param_compare)
+                self.bars[p.key] = bar
+                section.add(bar)
+
+            self.container_layout.addWidget(section)
+
+        for title, widget in self._extra:
+            section = _Section(title)
+            section.add(widget)
+            self.sections[title] = section
+            self.container_layout.addWidget(section)
+
+        self.empty_label.setVisible(not params)
+        self.container_layout.addWidget(self.empty_label)
+        self.container_layout.addStretch(1)
+        self._apply_filter(self.filter_edit.text())
+
+    # ------------------------------------------------------------------
+    def refresh(self, keys: list[str] | None = None) -> None:
+        params = self.state.params
+
+        # A key we have never shown means the visible set changed.
+        wanted = set(self.visible_params())
+
+        if wanted - set(self.bars):
+            self.rebuild()
+            return
+
+        for key in keys or list(self.bars):
+            bar = self.bars.get(key)
+            p = params.get(key)
+
+            if bar is not None and p is not None:
+                bar.setParam(p)
+
+        for gname, section in self.sections.items():
+            if section.group_box is not None:
+                prefixes = OPTIONAL_GROUPS.get(gname, ())
+                on = any(
+                    p.enabled for k, p in params.items() if k.split(".", 1)[0] in prefixes
+                )
+                section.group_box.blockSignals(True)
+                section.group_box.setChecked(on)
+                section.group_box.blockSignals(False)
+
+    # ------------------------------------------------------------------
+    def _apply_filter(self, text: str) -> None:
+        needle = text.strip().lower()
+
+        for key, bar in self.bars.items():
+            match = (
+                not needle
+                or needle in key.lower()
+                or needle in bar.param.label.lower()
+            )
+            bar.setVisible(match)
+
+        for gname, section in self.sections.items():
+            if gname in [t for t, _ in self._extra]:
+                continue
+
+            any_visible = any(
+                b.isVisible() for k, b in self.bars.items() if group_of(k) == gname
+            )
+            section.setVisible(any_visible or not needle)
