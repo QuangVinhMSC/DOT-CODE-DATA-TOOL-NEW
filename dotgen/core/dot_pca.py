@@ -5,6 +5,15 @@ the samples themselves would make the generator repeat itself, so instead we
 keep the mean patch and the few principal directions along which the samples
 actually differ, and synthesise each new dot as ``mean + noise * components``.
 
+This is where ``P(D | B, r)`` lives.  Patches hold darkness ``D = B - L``
+(see :mod:`~dotgen.core.ink`) and every pixel of a patch sits at a fixed
+distance from the dot centre, so the mean and the components together *are* a
+distribution of darkness against radial position -- ``r`` is the pixel index,
+and no separate radial model is needed or wanted, since a real dot is not
+perfectly round and a radial profile would throw that away.  ``B`` conditions
+nothing here on purpose: darkness is absolute, so a dot generated once is
+correct on any background, and ``B`` enters only at the paste, as ``L = B - D``.
+
 The degenerate cases matter more than the general one here: the user may click
 a single dot, or click the *same* dot ten times, and the model must then be a
 constant rather than a source of invented variation.  Nothing in this module
@@ -160,10 +169,10 @@ def dot_params(samples: list[DotSample], model: DotModel | None) -> ParamSet:
         p.add(RangeParam("dot.area", "Dot area", "px", a_mean, a_min, a_max, 0, 5000, step=1))
 
         m_mean, m_min, m_max = stats(max_inks)
-        p.add(RangeParam("dot.max_ink", "Dot max ink", "", m_mean, m_min, m_max, 0, 1))
+        p.add(RangeParam("dot.max_ink", "Dot max darkness", "", m_mean, m_min, m_max, 0, 1))
 
         i_mean, i_min, i_max = stats(mean_inks)
-        p.add(RangeParam("dot.mean_ink", "Dot mean ink", "", i_mean, i_min, i_max, 0, 1))
+        p.add(RangeParam("dot.mean_ink", "Dot mean darkness", "", i_mean, i_min, i_max, 0, 1))
 
         r_mean, r_min, r_max = stats(radii)
         p.add(

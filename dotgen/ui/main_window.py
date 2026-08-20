@@ -23,8 +23,8 @@ constructor that opens a modal cannot be built in a test.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QKeySequence, QCloseEvent
+from PySide6.QtCore import QSize, Qt, QTimer
+from PySide6.QtGui import QAction, QGuiApplication, QKeySequence, QCloseEvent
 from PySide6.QtWidgets import (
     QFileDialog,
     QLabel,
@@ -43,6 +43,9 @@ from .tabs.tab4_job import Tab4Job
 from .tabs.tab5_class import Tab5Class
 from .tabs.tab6_export import Tab6Export
 
+# The size the six tabs were laid out for, before the screen gets a say.
+WANTED_SIZE = (1600, 1000)
+
 TAB_TITLES = [
     "1 - Sample collection",
     "2 - Number matrix",
@@ -59,7 +62,7 @@ class MainWindow(QMainWindow):
         self.state = state or AppState()
 
         self.setWindowTitle("DOT-CODE-DATA-TOOL")
-        self.resize(1600, 1000)
+        self.resize(self._preferred_size())
 
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
@@ -111,6 +114,28 @@ class MainWindow(QMainWindow):
         self.autosave_timer.setInterval(session.AUTOSAVE_SECONDS * 1000)
         self.autosave_timer.timeout.connect(self.autosave)
         self.autosave_timer.start()
+
+    @staticmethod
+    def _preferred_size() -> QSize:
+        """:data:`WANTED_SIZE`, or as much of it as the screen actually has.
+
+        The tabs are wide -- Tab 1 carries three columns and Tab 3 puts the
+        parameter bars beside two preview frames.  Asking for 1600x1000 on a
+        1536x864 laptop puts the rightmost column off the edge of the display
+        with no horizontal scrollbar to reach it, so the bars the user is
+        looking for are not merely cramped, they are invisible.
+        """
+        screen = QGuiApplication.primaryScreen()
+
+        if screen is None:
+            return QSize(*WANTED_SIZE)
+
+        available = screen.availableGeometry()
+
+        return QSize(
+            min(WANTED_SIZE[0], available.width()),
+            min(WANTED_SIZE[1], available.height()),
+        )
 
     # ==================================================================
     # crash survival

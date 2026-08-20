@@ -111,6 +111,41 @@ def test_merge_reports_changed_keys_and_keeps_user_flags():
     assert ps["t.x"].compare is True
 
 
+def test_merge_leaves_a_hand_set_bar_alone():
+    """A measurement may be taken again; a number a person chose may not."""
+    ps = ParamSet([make(user_set=True)])
+    ps.merge(ParamSet([make(mean=7.0, min=6.5, max=7.5)]))
+
+    assert (ps["t.x"].mean, ps["t.x"].min, ps["t.x"].max) == (5.0, 4.0, 6.0)
+    assert ps["t.x"].user_set is True
+
+
+def test_merge_still_widens_the_hard_bounds_of_a_hand_set_bar():
+    """The user placed the handles, not the track they slide along."""
+    ps = ParamSet([make(user_set=True)])
+    ps.merge(ParamSet([make(hard_min=-100.0, hard_max=100.0)]))
+
+    assert ps["t.x"].hard_max == 100.0
+    assert ps["t.x"].mean == 5.0
+
+
+def test_a_hand_set_bar_is_reclamped_to_new_hard_bounds():
+    """Held-back values still have to obey a limit that just tightened."""
+    ps = ParamSet([make(user_set=True, mean=9.0, min=8.0, max=9.5)])
+    ps.merge(ParamSet([make(hard_min=0.0, hard_max=6.0)]))
+
+    assert ps["t.x"].max <= 6.0
+    assert ps["t.x"].mean <= 6.0
+
+
+def test_from_dict_ignores_a_key_it_does_not_know():
+    """A config written by a newer build has to load, not raise."""
+    d = make().to_dict()
+    d["invented_later"] = 3
+
+    assert RangeParam.from_dict(d).mean == 5.0
+
+
 def test_merge_reports_nothing_when_identical():
     ps = ParamSet([make()])
     assert ps.merge(ParamSet([make()])) == []

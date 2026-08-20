@@ -2,6 +2,7 @@ import math
 
 import cv2
 import numpy as np
+import pytest
 
 from dotgen.core.dot_pca import build_pca_model
 from dotgen.core.models import CharFormat, DefectSpec, DotSample
@@ -108,6 +109,65 @@ def blob_count(ink: np.ndarray) -> int:
 def relative_centers(result) -> np.ndarray:
     """Centres measured from the metric origin, so canvas framing cancels."""
     return np.array(result.dot_centers, dtype=np.float64) - np.array(result.origin)
+
+
+# ----------------------------------------------------------------------
+# Overlapping dots: Dab = Da + Db, floored at the darkest dot
+# ----------------------------------------------------------------------
+
+
+def test_overlapping_dots_add_their_darkness():
+    """``Dab = Da + Db``.
+
+    Two dots eight pixels apart both reach the pixel between them, four from
+    each centre.  Under the old ``max`` rule that pixel was as dark as one dot
+    made it and the join between two touching dots read as a valley; it is now
+    the sum, which is what a second layer of ink actually does.
+    """
+    patch = blob(amplitude=0.5)
+    model = build_pca_model([sample(patch) for _ in range(6)])
+
+    res = render_char(row_format(2), model, dist_params(h=8.0), "mean", rng(31))
+
+    x0, y0 = res.dot_centers[0]
+    x1, _ = res.dot_centers[1]
+    join = float(res.ink[int(round(y0)), int(round((x0 + x1) / 2.0))])
+
+    alone = float(patch[RADIUS, RADIUS - 4])
+
+    assert join == pytest.approx(2.0 * alone, rel=1e-5)
+    assert 2.0 * alone < float(patch.max())  # the cap is not what is under test
+
+
+def test_overlap_never_gets_darker_than_the_darkest_dot():
+    """``Lab = max(Lfloor, La + Lb - B)``.
+
+    Three dots two pixels apart sum to well over the blob's own peak; ink
+    saturates instead, so the darkest pixel of the character is the darkest
+    pixel of a dot -- no blacker.
+    """
+    patch = blob(amplitude=0.5)
+    model = build_pca_model([sample(patch) for _ in range(6)])
+
+    res = render_char(row_format(3), model, dist_params(h=2.0), "mean", rng(32))
+
+    assert float(res.ink.max()) == pytest.approx(float(patch.max()), rel=1e-6)
+
+
+def test_a_lone_dot_is_untouched_by_the_overlap_rule():
+    """One dot in, the same dot out: the floor only bites where dots meet."""
+    patch = blob(amplitude=0.5)
+    model = build_pca_model([sample(patch) for _ in range(6)])
+
+    res = render_char(row_format(1), model, dist_params(), "mean", rng(33))
+
+    x, y = res.dot_centers[0]
+    cut = res.ink[
+        int(round(y)) - RADIUS : int(round(y)) + RADIUS + 1,
+        int(round(x)) - RADIUS : int(round(x)) + RADIUS + 1,
+    ]
+
+    assert np.allclose(cut, patch, atol=1e-6)
 
 
 # ----------------------------------------------------------------------
@@ -522,3 +582,87 @@ def test_sub_pixel_centres_are_not_quantised():
     assert a.ink.shape == b.ink.shape
     assert not np.array_equal(a.ink, b.ink)
     assert abs(b.dot_centers[1][0] - b.dot_centers[0][0] - 29.6) < 1e-6
+
+
+# ----------------------------------------------------------------------
+# Positional deviation (dist.dev_*)
+# ----------------------------------------------------------------------
+
+
+def dev_params(dev_h: float = 0.0, dev_v: float = 0.0, enabled: bool = True) -> ParamSet:
+    p = dist_params(h=40.0, v=40.0)
+    p.add(bar("dist.dev_h", dev_h, 0, 100, enabled))
+    p.add(bar("dist.dev_v", dev_v, 0, 100, enabled))
+    return p
+
+
+def test_zero_deviation_leaves_the_grid_exact():
+    """And consumes no randomness, so old seeds keep producing old images."""
+    fmt = block_format()
+
+    plain = render_char(fmt, flat_model(), dist_params(), "mean", rng(30))
+    zeroed = render_char(fmt, flat_model(), dev_params(), "mean", rng(30))
+
+    assert np.array_equal(plain.ink, zeroed.ink)
+    assert plain.dot_centers == zeroed.dot_centers
+
+
+def test_a_deviation_moves_the_dots_off_the_grid():
+    fmt = block_format()
+
+    exact = render_char(fmt, flat_model(), dist_params(), "mean", rng(31))
+    strayed = render_char(fmt, flat_model(), dev_params(dev_h=6.0), "mean", rng(31))
+
+    offsets = relative_centers(strayed) - relative_centers(exact)
+
+    assert np.abs(offsets[:, 0]).max() > 0.1
+    assert np.abs(offsets[:, 1]).max() == pytest.approx(0.0)  # dev_v is still 0
+
+
+def test_each_dot_strays_on_its_own():
+    """Independently per point: a shared draw would move the whole grid."""
+    fmt = block_format()
+
+    exact = render_char(fmt, flat_model(), dist_params(), "mean", rng(32))
+    strayed = render_char(fmt, flat_model(), dev_params(dev_h=6.0, dev_v=6.0), "mean", rng(32))
+
+    offsets = relative_centers(strayed) - relative_centers(exact)
+
+    assert len(np.unique(np.round(offsets[:, 0], 6))) == len(offsets)
+    assert len(np.unique(np.round(offsets[:, 1], 6))) == len(offsets)
+
+
+def test_the_deviation_is_normal_with_the_measured_maximum_at_three_sigma():
+    """The recorded number is a maximum, so it is read as a 3-sigma bound."""
+    from dotgen.core.render_char import DEVIATION_SIGMAS, _position_noise
+
+    dev = 9.0
+    draws = _position_noise(20000, dev, dev, rng(33))
+
+    for axis in (0, 1):
+        assert draws[:, axis].mean() == pytest.approx(0.0, abs=0.1)
+        assert draws[:, axis].std() == pytest.approx(dev / DEVIATION_SIGMAS, rel=0.05)
+
+    assert np.abs(draws).max() < dev * 2.0
+
+
+def test_a_disabled_deviation_bar_draws_the_exact_grid():
+    """Unticking the group means "no scatter", not "scatter by the mean"."""
+    fmt = block_format()
+
+    exact = render_char(fmt, flat_model(), dist_params(), "mean", rng(34))
+    off = render_char(
+        fmt, flat_model(), dev_params(dev_h=6.0, dev_v=6.0, enabled=False), "mean", rng(34)
+    )
+
+    assert np.array_equal(exact.ink, off.ink)
+
+
+def test_two_seeds_scatter_the_dots_differently():
+    fmt = block_format()
+    params = dev_params(dev_h=6.0, dev_v=6.0)
+
+    a = render_char(fmt, flat_model(), params, "mean", rng(35))
+    b = render_char(fmt, flat_model(), params, "mean", rng(36))
+
+    assert not np.array_equal(relative_centers(a), relative_centers(b))

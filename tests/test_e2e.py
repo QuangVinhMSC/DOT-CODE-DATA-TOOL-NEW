@@ -62,7 +62,7 @@ from dotgen.core.models import (
     CharSpec,
     DotLink,
     DotModel,
-    DotPair,
+    DotSequence,
     ExportSpec,
     Job,
     LineGap,
@@ -120,11 +120,11 @@ LABEL_QUAD = Quad([(16.0, 38.0), (632.0, 20.0), (636.0, 434.0), (12.0, 462.0)])
 # refined with a distance transform so that dots which touch are still resolved
 # separately.  The horizontal pairs span the two columns of a printed character,
 # the vertical pairs two adjacent rows of one column.
-DISTANCE_PAIRS: list[DotPair] = [
-    DotPair((184.0, 323.9), (201.5, 322.2), "h"),
-    DotPair((429.0, 346.6), (450.8, 346.6), "h"),
-    DotPair((185.1, 312.0), (184.0, 323.9), "v"),
-    DotPair((183.4, 333.5), (182.7, 343.6), "v"),
+DISTANCE_PAIRS: list[DotSequence] = [
+    DotSequence.pair((184.0, 323.9), (201.5, 322.2), "h"),
+    DotSequence.pair((429.0, 346.6), (450.8, 346.6), "h"),
+    DotSequence.pair((185.1, 312.0), (184.0, 323.9), "v"),
+    DotSequence.pair((183.4, 333.5), (182.7, 343.6), "v"),
 ]
 
 # Base quadrilaterals, one per background, both axis-aligned rectangles inside

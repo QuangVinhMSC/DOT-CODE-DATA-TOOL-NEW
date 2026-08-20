@@ -1,7 +1,8 @@
 import cv2
 import numpy as np
+import pytest
 
-from dotgen.core.models import DotPair
+from dotgen.core.models import DotSequence
 from dotgen.core.params import default_params
 from dotgen.core.spacing import (
     MIN_SPACING,
@@ -14,12 +15,12 @@ from dotgen.core.spacing import (
 TOLERANCE = 0.3
 
 
-def hpair(dx: float, y_offset: float = 0.0, x0: float = 100.0) -> DotPair:
-    return DotPair((x0, 50.0), (x0 + dx, 50.0 + y_offset), "h")
+def hpair(dx: float, y_offset: float = 0.0, x0: float = 100.0) -> DotSequence:
+    return DotSequence.pair((x0, 50.0), (x0 + dx, 50.0 + y_offset), "h")
 
 
-def vpair(dy: float, x_offset: float = 0.0, y0: float = 50.0) -> DotPair:
-    return DotPair((100.0, y0), (100.0 + x_offset, y0 + dy), "v")
+def vpair(dy: float, x_offset: float = 0.0, y0: float = 50.0) -> DotSequence:
+    return DotSequence.pair((100.0, y0), (100.0 + x_offset, y0 + dy), "v")
 
 
 def dot_row(
@@ -72,14 +73,14 @@ def test_no_pairs_gives_an_empty_param_set():
 def test_only_horizontal_pairs_emit_only_the_horizontal_key():
     p = spacing_params([hpair(10.0), hpair(14.0)])
 
-    assert set(p) == {"dist.h"}
+    assert set(p) == {"dist.h", "dist.dev_h"}
     assert "dist.v" not in p
 
 
 def test_only_vertical_pairs_emit_only_the_vertical_key():
     p = spacing_params([vpair(20.0), vpair(24.0)])
 
-    assert set(p) == {"dist.v"}
+    assert set(p) == {"dist.v", "dist.dev_v"}
 
 
 def test_the_two_axes_keep_their_own_statistics():
@@ -87,7 +88,7 @@ def test_the_two_axes_keep_their_own_statistics():
 
     p = spacing_params(pairs)
 
-    assert set(p) == {"dist.h", "dist.v"}
+    assert set(p) == {"dist.h", "dist.v", "dist.dev_h", "dist.dev_v"}
     assert (p["dist.h"].min, p["dist.h"].mean, p["dist.h"].max) == (10.0, 11.0, 12.0)
     assert (p["dist.v"].min, p["dist.v"].mean, p["dist.v"].max) == (30.0, 35.0, 40.0)
 
@@ -108,8 +109,8 @@ def test_the_vertical_axis_span_ignores_the_horizontal_offset():
 
 
 def test_pairs_pointing_backwards_measure_the_same_distance():
-    forward = DotPair((100.0, 50.0), (112.0, 50.0), "h")
-    backward = DotPair((112.0, 50.0), (100.0, 50.0), "h")
+    forward = DotSequence.pair((100.0, 50.0), (112.0, 50.0), "h")
+    backward = DotSequence.pair((112.0, 50.0), (100.0, 50.0), "h")
 
     p = spacing_params([forward, backward])
 
@@ -170,6 +171,74 @@ def test_every_emitted_key_is_a_dist_key():
     p = spacing_params([hpair(12.0), vpair(20.0)], extra_h=[11.0], extra_v=[21.0])
 
     assert all(k.startswith("dist.") for k in p)
+
+
+# ----------------------------------------------------------------------
+# sequences of three dots and more
+# ----------------------------------------------------------------------
+
+
+def hrun(*xs: float, y: float = 50.0) -> DotSequence:
+    return DotSequence([(x, y) for x in xs], "h")
+
+
+def test_a_run_measures_the_gap_not_the_whole_span():
+    """L = D / (n - 1): five dots 12 px apart span 48, and the unit is 12."""
+    p = spacing_params([hrun(100.0, 112.0, 124.0, 136.0, 148.0)])
+
+    assert p["dist.h"].mean == 12.0
+    assert p["dist.h"].is_point()
+
+
+def test_an_even_run_deviates_from_its_own_spacing_by_nothing():
+    p = spacing_params([hrun(100.0, 112.0, 124.0, 136.0)])
+
+    assert p["dist.dev_h"].mean == 0.0
+
+
+def test_the_largest_gap_error_in_a_run_becomes_the_deviation():
+    """D = 36 over three gaps gives L = 12; the gaps are 10, 15 and 11."""
+    p = spacing_params([hrun(100.0, 110.0, 125.0, 136.0)])
+
+    assert p["dist.h"].mean == 12.0
+    assert p["dist.dev_h"].mean == pytest.approx(3.0)
+
+
+def test_only_the_maximum_deviation_is_kept_across_runs():
+    even = hrun(100.0, 112.0, 124.0)
+    ragged = hrun(200.0, 210.0, 224.0)  # L is the mean of 12 and 12, gaps 10 / 14
+
+    p = spacing_params([even, ragged])
+
+    assert p["dist.h"].mean == 12.0
+    assert p["dist.dev_h"].mean == pytest.approx(2.0)
+    assert p["dist.dev_h"].is_point()
+
+
+def test_a_run_clicked_out_of_order_measures_the_same_gaps():
+    """The print did not move because the user did."""
+    ordered = spacing_params([hrun(100.0, 110.0, 125.0, 136.0)])
+    shuffled = spacing_params([hrun(125.0, 100.0, 136.0, 110.0)])
+
+    assert shuffled["dist.h"].mean == ordered["dist.h"].mean
+    assert shuffled["dist.dev_h"].mean == ordered["dist.dev_h"].mean
+
+
+def test_a_detected_pitch_alone_carries_no_deviation():
+    """The autocorrelation answer is already an average -- it has no gaps."""
+    p = spacing_params([], extra_h=[9.0])
+
+    assert "dist.dev_h" not in p
+
+
+def test_the_deviation_bar_matches_its_placeholder_definition():
+    made = spacing_params([hrun(100.0, 112.0, 124.0)])["dist.dev_h"]
+    placeholder = default_params()["dist.dev_h"]
+
+    assert made.label == placeholder.label
+    assert made.unit == placeholder.unit == "px"
+    assert (made.hard_min, made.hard_max) == (placeholder.hard_min, placeholder.hard_max)
+    assert made.step == placeholder.step
 
 
 # ----------------------------------------------------------------------

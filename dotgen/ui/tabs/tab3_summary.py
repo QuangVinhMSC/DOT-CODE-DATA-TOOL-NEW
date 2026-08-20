@@ -3,6 +3,14 @@
 Two frames of the same character, one above the other, each 50% of the height.
 Checking a parameter's box renders the top frame at that parameter's Min and the
 bottom frame at its Max; unchecked parameters use the Mean in both.
+
+This is also where the parameters are *edited*.  Tab 1 measures them and shows
+them read-only because it re-measures constantly; here the handles are live, and
+they move a draft rather than the job.  Both frames render from that draft, so
+the effect of a drag is on screen immediately -- but the exporter, Tab 4's
+preview and every saved job keep the old numbers until **Load** is pressed.
+Seeing a change and committing to it are two different decisions, and the two
+preview frames exist precisely so the first can be made before the second.
 """
 
 from __future__ import annotations
@@ -24,6 +32,7 @@ from PySide6.QtWidgets import (
 
 from ...core import registry
 from ...core.imageops import white_canvas
+from ...core.ink import paste_ink_rect
 from ...core.params import ParamSet, build_compare_sets
 from ...core.state import AppState
 from .. import theme
@@ -35,7 +44,12 @@ RENDER_SEED = 4242
 
 
 def ink_over_background(ink: np.ndarray, bg: np.ndarray | None) -> np.ndarray:
-    """Composite an ink map onto a background with the multiplicative model."""
+    """Composite an ink map onto a background, padded for the preview.
+
+    The compositing itself goes through :func:`~dotgen.core.ink.paste_ink_rect`
+    rather than being written out again here: a preview that used its own
+    brightness rule would be a preview of nothing.
+    """
     h, w = ink.shape[:2]
     pad = PREVIEW_PAD
 
@@ -50,10 +64,7 @@ def ink_over_background(ink: np.ndarray, bg: np.ndarray | None) -> np.ndarray:
         if crop.shape[0] == canvas.shape[0] and crop.shape[1] == canvas.shape[1]:
             canvas = crop.copy()
 
-    roi = canvas[pad : pad + h, pad : pad + w].astype(np.float32)
-    canvas[pad : pad + h, pad : pad + w] = np.clip(
-        roi * (1.0 - ink[:, :, None]), 0, 255
-    ).astype(np.uint8)
+    paste_ink_rect(canvas, pad, pad, ink)
 
     return canvas
 
@@ -74,10 +85,15 @@ class Tab3Summary(QWidget):
         lay.setContentsMargins(theme.PAD, theme.PAD, theme.PAD, theme.PAD)
         lay.addWidget(splitter)
 
+        # paramsChanged reaches the bar list first -- it is connected in the
+        # RangeBarList constructor, above -- so by the time this runs the draft
+        # has already absorbed whatever Tab 1 re-measured.
         state.paramsChanged.connect(lambda _keys: self.render())
         state.charFormatsChanged.connect(self._refresh_chars)
         state.dotModelChanged.connect(self.render)
+        self.bars.draftEdited.connect(self._on_draft_edited)
 
+        self._update_pending()
         self._refresh_chars()
 
     # ==================================================================
@@ -124,7 +140,11 @@ class Tab3Summary(QWidget):
         lay = QVBoxLayout(box)
 
         self.bars = RangeBarList(
-            self.state, show_compare=True, editable=False, label_width=140
+            self.state, show_compare=True, editable=True, draft=True, label_width=140
+        )
+        self.bars.setToolTip(
+            "Drag the red dot for the mean and the blue dots for min and max.\n"
+            "The frames follow at once; Load is what hands the values to the job."
         )
         lay.addWidget(self.bars, 1)
 
@@ -139,6 +159,19 @@ class Tab3Summary(QWidget):
         row = QWidget()
         rl = QHBoxLayout(row)
         rl.setContentsMargins(0, 0, 0, 0)
+
+        self.load_button = QPushButton("Load")
+        self.load_button.setToolTip(
+            "Hand the edited values to the job.\n"
+            "Until this is pressed they only affect the two frames above."
+        )
+        self.load_button.clicked.connect(self._load_params)
+        rl.addWidget(self.load_button)
+
+        revert = QPushButton("Revert")
+        revert.setToolTip("Throw the unloaded edits away and take Tab 1's values back.")
+        revert.clicked.connect(self._revert_params)
+        rl.addWidget(revert)
 
         uncheck = QPushButton("Clear comparisons")
         uncheck.clicked.connect(self._clear_compare)
@@ -155,6 +188,12 @@ class Tab3Summary(QWidget):
         rl.addWidget(load)
 
         lay.addWidget(row)
+
+        self.pending_label = QLabel("")
+        self.pending_label.setObjectName("hint")
+        self.pending_label.setWordWrap(True)
+        lay.addWidget(self.pending_label)
+
         return box
 
     # ==================================================================
@@ -174,16 +213,56 @@ class Tab3Summary(QWidget):
         self.render()
 
     def _clear_compare(self) -> None:
-        for key in list(self.state.params):
-            self.state.set_param_compare(key, False)
+        self.bars.set_compare_all(False)
+
+    # ==================================================================
+    # the Load workflow
+    # ==================================================================
+
+    def _load_params(self) -> None:
+        keys = self.bars.edited_keys()
+
+        if not keys:
+            self.statusMessage.emit("No edited parameters to load.")
+            return
+
+        self.state.load_param_edits(self.bars.draft, keys)
+        self.bars.reseed()
+        self._update_pending()
+        self.statusMessage.emit(
+            f"Loaded {len(keys)} parameter(s) into the job: " + ", ".join(keys)
+        )
+
+    def _revert_params(self) -> None:
+        if not self.bars.edited_keys():
+            return
+
+        self.bars.reseed()
+        self._update_pending()
+        self.render()
+        self.statusMessage.emit("Unloaded edits discarded.")
+
+    def _on_draft_edited(self, _key: str) -> None:
+        self._update_pending()
+        self.render()
+
+    def _update_pending(self) -> None:
+        keys = self.bars.edited_keys()
+        self.load_button.setEnabled(bool(keys))
+        self.pending_label.setText(
+            f"{len(keys)} parameter(s) edited but not loaded: " + ", ".join(keys)
+            if keys
+            else "Every parameter shown is the one the job will use."
+        )
 
     # ==================================================================
 
     def render(self) -> None:
         char = self.char_combo.currentText()
         fmt = self.state.char_formats.get(char)
+        params = self.bars.draft
 
-        compared = [k for k, p in self.state.params.items() if p.compare and p.enabled]
+        compared = [k for k, p in params.items() if p.compare and p.enabled]
         self.compare_label.setText(
             f"{len(compared)} parameter(s) compared" if compared else "no parameters compared - frames identical"
         )
@@ -193,7 +272,7 @@ class Tab3Summary(QWidget):
             self.max_canvas.set_image(None)
             return
 
-        top, bottom = build_compare_sets(self.state.params)
+        top, bottom = build_compare_sets(params)
 
         self.min_canvas.set_image(self._render_one(fmt, top))
         self.max_canvas.set_image(self._render_one(fmt, bottom))

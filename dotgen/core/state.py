@@ -24,7 +24,7 @@ from .models import (
     CurveSpec,
     DefectSpec,
     DotModel,
-    DotPair,
+    DotSequence,
     DotSample,
     ExportSpec,
     Job,
@@ -66,7 +66,7 @@ class AppState(QObject):
         self.dot_model: DotModel | None = None
         self.quads: dict[int, Quad] = {}
         self.curves: dict[int, list[CurveSpec]] = {}
-        self.dot_pairs: list[DotPair] = []
+        self.dot_sequences: list[DotSequence] = []
         # Spacings detected by the autocorrelation row scan; they join the
         # hand-picked pairs as extra samples of the same unit.
         self.row_spacings: list[float] = []
@@ -303,23 +303,23 @@ class AppState(QObject):
 
         return out
 
-    def add_dot_pair(self, pair: DotPair) -> None:
-        self.dot_pairs.append(pair)
+    def add_dot_sequence(self, seq: DotSequence) -> None:
+        self.dot_sequences.append(seq)
         self._recompute_geometry()
 
-    def update_dot_pair(self, index: int, pair: DotPair) -> None:
-        """Replace one measured pair -- the select tool moved or resized it."""
-        if 0 <= index < len(self.dot_pairs):
-            self.dot_pairs[index] = pair
+    def update_dot_sequence(self, index: int, seq: DotSequence) -> None:
+        """Replace one measured run -- the select tool moved or resized it."""
+        if 0 <= index < len(self.dot_sequences):
+            self.dot_sequences[index] = seq
             self._recompute_geometry()
 
-    def remove_dot_pair(self, index: int) -> None:
-        if 0 <= index < len(self.dot_pairs):
-            self.dot_pairs.pop(index)
+    def remove_dot_sequence(self, index: int) -> None:
+        if 0 <= index < len(self.dot_sequences):
+            self.dot_sequences.pop(index)
             self._recompute_geometry()
 
-    def clear_dot_pairs(self) -> None:
-        self.dot_pairs.clear()
+    def clear_dot_sequences(self) -> None:
+        self.dot_sequences.clear()
         self.row_spacings.clear()
         self._recompute_geometry()
 
@@ -338,7 +338,7 @@ class AppState(QObject):
         merged = ParamSet()
         merged.update(eng.solve_perspective(list(self.quads.values())))
         merged.update(eng.curve_params(self.all_curves()))
-        merged.update(eng.spacing_params(self.dot_pairs, extra_h=self.row_spacings))
+        merged.update(eng.spacing_params(self.dot_sequences, extra_h=self.row_spacings))
         self.set_params(merged)
         self.samplesChanged.emit()
 
@@ -356,13 +356,74 @@ class AppState(QObject):
             self.paramsChanged.emit(changed)
 
     def set_param(self, key: str, field: str, value: float) -> None:
+        """Move one handle of one bar.  This is the *user* editing a parameter.
+
+        Engines never come through here -- they arrive via :meth:`set_params` --
+        so this is the one place that can honestly mark a bar as hand-set, which
+        is what keeps the next recomputation from undoing it.
+        """
         p = self.params.get(key)
 
         if p is None:
             return
 
         p.set_field(field, value)
+        p.user_set = True
         self.paramsChanged.emit([key])
+
+    def load_param_edits(self, edits: ParamSet, keys: Iterable[str]) -> list[str]:
+        """Commit Tab 3's staged bar values -- what its *Load* button does.
+
+        Tab 3 edits a copy so the two preview frames can follow the handles
+        while the user is still deciding; nothing downstream sees a number until
+        it arrives here.  Each committed bar is marked hand-set for the same
+        reason :meth:`set_param` does it: the value is now a choice, and the
+        next measurement in Tab 1 must not quietly take it back.
+
+        Only ``keys`` are committed, so a bar the user never touched keeps
+        following its measurement instead of being frozen at whatever the draft
+        happened to hold.
+        """
+        changed: list[str] = []
+
+        for key in keys:
+            src = edits.get(key)
+            dst = self.params.get(key)
+
+            if src is None or dst is None:
+                continue
+
+            dst.mean, dst.min, dst.max = src.mean, src.min, src.max
+            dst.clamp()
+            dst.user_set = True
+            changed.append(key)
+
+        if changed:
+            self.paramsChanged.emit(changed)
+
+        return changed
+
+    def reset_params(self, keys: Iterable[str] | None = None) -> None:
+        """Drop hand-set values and put the measurements back.
+
+        ``keys`` defaults to every parameter.  Clearing the flag alone would
+        leave the old numbers on screen until something happened to trigger a
+        recompute, so the measurements are re-run here.
+        """
+        wanted = set(self.params) if keys is None else {k for k in keys if k in self.params}
+        cleared = [k for k in wanted if self.params[k].user_set]
+
+        if not cleared:
+            return
+
+        for key in cleared:
+            self.params[key].user_set = False
+
+        # Both engines write into the same ParamSet, and a bar that neither one
+        # produces (there is no measurement behind it) simply keeps its value.
+        self.rebuild_dot_model()
+        self._recompute_geometry()
+        self.paramsChanged.emit(cleared)
 
     def set_param_enabled(self, key: str, enabled: bool) -> None:
         p = self.params.get(key)
@@ -653,7 +714,7 @@ class AppState(QObject):
         self.dot_model = None
         self.quads.clear()
         self.curves.clear()
-        self.dot_pairs.clear()
+        self.dot_sequences.clear()
         self.char_formats.clear()
         self.backgrounds.clear()
         self.lines.clear()

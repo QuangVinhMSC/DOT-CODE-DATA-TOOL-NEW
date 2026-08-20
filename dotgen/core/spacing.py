@@ -5,11 +5,18 @@ one"), never pixels, so the whole generator is anchored on two numbers:
 ``dist.h`` and ``dist.v``.  They come from here, by two routes that end in the
 same statistics:
 
-* the user clicks pairs of dots on a photograph -- each pair contributes one
-  measurement of its own axis;
+* the user clicks a run of dots on a photograph -- each run contributes one
+  measurement of its own axis, ``L = D / (n - 1)`` over its two farthest
+  points;
 * the user drags a box around a single dot row and the autocorrelation
   detector reads the pitch straight off the image, which is folded in as one
   more sample of ``dist.h``.
+
+A run of three dots or more measures a second thing.  Once ``L`` is known, each
+adjacent gap ``l`` in the run should equal it; ``|L - l|`` is how far one of the
+two dots sits from where the print meant to put it.  The largest such number
+over every run on an axis becomes ``dist.dev_h`` / ``dist.dev_v``, and
+:mod:`render_char` scatters each generated dot by that much.
 
 The detector is the ``test2.py`` prototype's spacing stage, with one change:
 the prototype returned the integer lag of the autocorrelation peak, and a
@@ -27,7 +34,7 @@ import cv2
 import numpy as np
 
 from .ink import estimate_background, to_ink
-from .models import DotPair
+from .models import DotSequence
 from .params import ParamSet, RangeParam
 
 # Autocorrelation lags searched for the row pitch, in pixels.  Anything below
@@ -55,6 +62,7 @@ SMOOTH_KERNEL = 5
 _DIST_HARD_MIN = 0
 _DIST_HARD_MAX = 500
 _DIST_STEP = 0.1
+_DEV_HARD_MAX = 100
 
 # A parabola through the three samples around the peak only describes a
 # maximum when its curvature is negative and not numerically flat.
@@ -62,17 +70,23 @@ _CURVATURE_EPS = 1e-12
 
 
 def spacing_params(
-    pairs: list[DotPair],
+    sequences: list[DotSequence],
     extra_h: Iterable[float] = (),
     extra_v: Iterable[float] = (),
 ) -> ParamSet:
-    """``dist.h`` / ``dist.v`` from measured dot pairs.
+    """``dist.h`` / ``dist.v`` and their deviations, from measured dot runs.
 
-    Each pair contributes ``axis_distance`` -- the span along its own axis, not
-    the euclidean distance -- because a horizontal pair clicked a couple of
-    pixels off-level still measures a horizontal unit.  ``extra_h`` / ``extra_v``
-    are loose scalar measurements (the autocorrelation detector's output) folded
-    in as if they had been clicked.
+    Each sequence contributes one ``unit_spacing`` -- ``D / (n - 1)`` over the
+    span along its own axis, not the euclidean distance -- because a run clicked
+    a couple of pixels off-level still measures a horizontal unit.  ``extra_h`` /
+    ``extra_v`` are loose scalar measurements (the autocorrelation detector's
+    output) folded in as if they had been clicked.
+
+    ``dist.dev_*`` is the largest ``|L - l|`` found anywhere on that axis, where
+    ``L`` is the *mean* spacing above -- the one the dots should have -- and
+    ``l`` is one measured gap.  It rides on the sequences alone: a detected
+    pitch is already an average and has no gaps of its own to disagree with it.
+    Only the maximum is kept, so the bar is a point.
 
     A key is emitted only when its axis has at least one measurement: the caller
     merges this into the global ParamSet, so an absent key leaves the
@@ -85,11 +99,14 @@ def spacing_params(
         "h": [float(v) for v in extra_h],
         "v": [float(v) for v in extra_v],
     }
+    runs: dict[str, list[DotSequence]] = {"h": [], "v": []}
 
-    for pair in pairs:
-        values[pair.axis].append(float(pair.axis_distance))
+    for seq in sequences:
+        values[seq.axis].append(float(seq.unit_spacing))
+        runs[seq.axis].append(seq)
 
     labels = {"h": "Horizontal distance", "v": "Vertical distance"}
+    dev_labels = {"h": "Horizontal deviation", "v": "Vertical deviation"}
 
     for axis in ("h", "v"):
         measured = values[axis]
@@ -97,16 +114,39 @@ def spacing_params(
         if not measured:
             continue
 
+        expected = float(np.mean(measured))
+
         p.add(
             RangeParam(
                 f"dist.{axis}",
                 labels[axis],
                 "px",
-                float(np.mean(measured)),
+                expected,
                 float(np.min(measured)),
                 float(np.max(measured)),
                 _DIST_HARD_MIN,
                 _DIST_HARD_MAX,
+                step=_DIST_STEP,
+            )
+        )
+
+        if not runs[axis]:
+            continue
+
+        deviation = max(
+            (d for seq in runs[axis] for d in seq.deviations(expected)), default=0.0
+        )
+
+        p.add(
+            RangeParam(
+                f"dist.dev_{axis}",
+                dev_labels[axis],
+                "px",
+                deviation,
+                deviation,
+                deviation,
+                _DIST_HARD_MIN,
+                _DEV_HARD_MAX,
                 step=_DIST_STEP,
             )
         )

@@ -29,7 +29,7 @@ from .models import (
     CurveSpec,
     DefectSpec,
     DotModel,
-    DotPair,
+    DotSequence,
     DotSample,
     ExportSpec,
     Job,
@@ -43,7 +43,10 @@ from .params import ParamSet
 if TYPE_CHECKING:
     from .state import AppState
 
-SCHEMA = 1
+# 2: the ruler's "dot_pairs" became "dot_sequences" of two points or more.
+# Reading back is unchanged -- a schema-1 file still loads -- but a build that
+# predates sequences would silently drop them, so it is told to refuse instead.
+SCHEMA = 2
 CONFIG_FILTER = "DotGen configuration (*.dotcfg);;All files (*)"
 JOBS_FILTER = "DotGen jobs (*.dotjobs);;All files (*)"
 
@@ -133,7 +136,7 @@ def save_config(state: "AppState", path: str) -> None:
         "curves": {
             str(k): [c.to_dict() for c in v] for k, v in state.curves.items()
         },
-        "dot_pairs": [p.to_dict() for p in state.dot_pairs],
+        "dot_sequences": [q.to_dict() for q in state.dot_sequences],
         "sample_images": [
             {"path": s.path, "file": f"images/sample_{i}.png"}
             for i, s in enumerate(state.sample_images)
@@ -228,7 +231,9 @@ def load_config(state: "AppState", path: str) -> None:
             int(k): [CurveSpec.from_dict(c) for c in v]
             for k, v in meta.get("curves", {}).items()
         }
-        state.dot_pairs = [DotPair.from_dict(d) for d in meta.get("dot_pairs", [])]
+        # "dot_pairs" is the pre-sequence key; DotSequence.from_dict reads both forms.
+        stored = meta.get("dot_sequences") or meta.get("dot_pairs", [])
+        state.dot_sequences = [DotSequence.from_dict(d) for d in stored]
         state.test_panel_bg = (
             _decode(zf.read("images/test_bg.png")) if "images/test_bg.png" in names else None
         )

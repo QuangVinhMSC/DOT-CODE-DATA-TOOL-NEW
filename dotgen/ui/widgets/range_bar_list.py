@@ -1,14 +1,25 @@
 """RangeBarList -- a scrollable, filterable, collapsible list of RangeBars.
 
 Tab 1 uses it with group-level enable checkboxes for the optional parameter
-groups; Tab 3 uses it read-only with per-bar compare checkboxes.
+groups; Tab 3 uses it in *draft* mode with per-bar compare checkboxes.
+
+Draft mode is what puts Tab 3's Load button in charge.  The bars then edit a
+private copy of the parameters instead of the live ones, so the two preview
+frames can follow a handle while nothing downstream has moved yet; the copy
+reaches :class:`AppState` only when the tab asks it to.  A bar the user has not
+touched keeps tracking its measurement, exactly as ``ParamSet.merge`` does with
+``user_set`` -- the draft is that same rule, one step earlier.
+
+Only the three *values* are staged.  ``enabled`` and ``compare`` go straight to
+the state: whether a group is used at all is not a number being tuned, and the
+compare ticks are a property of the preview itself.
 """
 
 from __future__ import annotations
 
 from typing import Iterable
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QFrame,
@@ -86,6 +97,8 @@ class _Section(QFrame):
 
 
 class RangeBarList(QWidget):
+    draftEdited = Signal(str)  # key -- draft mode only
+
     def __init__(
         self,
         state: AppState,
@@ -96,6 +109,7 @@ class RangeBarList(QWidget):
         group_enable: bool = False,
         show_filter: bool = True,
         label_width: int = 128,
+        draft: bool = False,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -106,6 +120,9 @@ class RangeBarList(QWidget):
         self.editable = editable
         self.group_enable = group_enable
         self.label_width = label_width
+
+        self.draft: ParamSet | None = state.params.deep_copy() if draft else None
+        self._edited: set[str] = set()
 
         self.bars: dict[str, RangeBar] = {}
         self.sections: dict[str, _Section] = {}
@@ -147,13 +164,94 @@ class RangeBarList(QWidget):
         self._extra.append((title, widget))
         self.rebuild()
 
+    def source_params(self) -> ParamSet:
+        """What the bars are drawn from -- the draft when there is one."""
+        return self.state.params if self.draft is None else self.draft
+
     def visible_params(self) -> ParamSet:
-        params = self.state.params
+        params = self.source_params()
 
         if self.keys is None:
             return params
 
         return ParamSet([params[k] for k in self.keys if k in params])
+
+    # ------------------------------------------------------------------
+    # draft mode
+    # ------------------------------------------------------------------
+
+    def edited_keys(self) -> list[str]:
+        """The bars the user has dragged since the last :meth:`reseed`."""
+        return sorted(self._edited)
+
+    def reseed(self) -> None:
+        """Forget the edits and take the live parameters back.
+
+        Called after a commit, and by whoever wants a Revert: with nothing
+        marked edited, the next state change flows through untouched.
+        """
+        if self.draft is None:
+            return
+
+        self._edited.clear()
+        self.refresh()
+
+    def set_compare_all(self, compare: bool) -> None:
+        for key in list(self.state.params):
+            self.state.set_param_compare(key, compare)
+
+    def _reseed_draft(self) -> None:
+        """Pull the live parameters into the draft, holding the edited values back.
+
+        Done in place, because every bar holds a reference to the draft's
+        :class:`RangeParam`: replacing the object would leave each bar that
+        :meth:`refresh` was not told about pointing at the previous copy.
+
+        Everything except min/mean/max is taken from the state even on an edited
+        bar -- the label, the bounds and the enabled flag are not what the user
+        staged, and a bar frozen against its own group's checkbox would be a lie.
+        """
+        if self.draft is None:
+            return
+
+        live_params = self.state.params
+
+        for key, live in live_params.items():
+            old = self.draft.get(key)
+
+            if old is None:
+                self.draft[key] = live.copy()
+                continue
+
+            staged = (old.mean, old.min, old.max) if key in self._edited else None
+
+            for name, value in live.to_dict().items():
+                setattr(old, name, value)
+
+            if staged is not None:
+                old.mean, old.min, old.max = staged
+
+            old.clamp()
+
+        for key in [k for k in self.draft if k not in live_params]:
+            del self.draft[key]
+            self._edited.discard(key)
+
+    def _edit_value(self, key: str, field: str, value: float) -> None:
+        p = self.draft.get(key) if self.draft is not None else None
+
+        if p is None:
+            return
+
+        p.set_field(field, value)
+        self._edited.add(key)
+
+        bar = self.bars.get(key)
+
+        if bar is not None:
+            bar.refresh()
+
+        self.draftEdited.emit(key)
 
     # ------------------------------------------------------------------
     def rebuild(self) -> None:
@@ -198,7 +296,9 @@ class RangeBarList(QWidget):
                     label_width=self.label_width,
                 )
                 bar.setEditable(self.editable)
-                bar.valueChanged.connect(self.state.set_param)
+                bar.valueChanged.connect(
+                    self.state.set_param if self.draft is None else self._edit_value
+                )
                 bar.enabledToggled.connect(self.state.set_param_enabled)
                 bar.compareToggled.connect(self.state.set_param_compare)
                 self.bars[p.key] = bar
@@ -219,7 +319,8 @@ class RangeBarList(QWidget):
 
     # ------------------------------------------------------------------
     def refresh(self, keys: list[str] | None = None) -> None:
-        params = self.state.params
+        self._reseed_draft()
+        params = self.source_params()
 
         # A key we have never shown means the visible set changed.
         wanted = set(self.visible_params())

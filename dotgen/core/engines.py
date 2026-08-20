@@ -18,7 +18,7 @@ from .models import (
     CharFormat,
     CurveSpec,
     DotModel,
-    DotPair,
+    DotSequence,
     DotSample,
     Job,
     Quad,
@@ -63,7 +63,7 @@ class Engines(Protocol):
 
     def spacing_params(
         self,
-        pairs: list[DotPair],
+        sequences: list[DotSequence],
         extra_h: Iterable[float] = (),
         extra_v: Iterable[float] = (),
     ) -> ParamSet: ...
@@ -171,8 +171,8 @@ class StubEngines:
         spread = 0.0 if len(samples) < 2 else 1.0
 
         p.add(RangeParam("dot.area", "Dot area", "px", 48, 48 - 7 * spread, 48 + 7 * spread, 0, 5000, step=1))
-        p.add(RangeParam("dot.max_ink", "Dot max ink", "", 0.88, 0.88 - 0.06 * spread, 0.88 + 0.05 * spread, 0, 1))
-        p.add(RangeParam("dot.mean_ink", "Dot mean ink", "", 0.31, 0.31 - 0.04 * spread, 0.31 + 0.04 * spread, 0, 1))
+        p.add(RangeParam("dot.max_ink", "Dot max darkness", "", 0.88, 0.88 - 0.06 * spread, 0.88 + 0.05 * spread, 0, 1))
+        p.add(RangeParam("dot.mean_ink", "Dot mean darkness", "", 0.31, 0.31 - 0.04 * spread, 0.31 + 0.04 * spread, 0, 1))
         p.add(
             RangeParam(
                 "dot.radius_eq",
@@ -216,20 +216,22 @@ class StubEngines:
 
     def spacing_params(
         self,
-        pairs: list[DotPair],
+        sequences: list[DotSequence],
         extra_h: Iterable[float] = (),
         extra_v: Iterable[float] = (),
     ) -> ParamSet:
         p = ParamSet()
 
-        hs = [q for q in pairs if q.axis == "h"] + list(extra_h)
-        vs = [q for q in pairs if q.axis == "v"] + list(extra_v)
+        hs = [q for q in sequences if q.axis == "h"] + list(extra_h)
+        vs = [q for q in sequences if q.axis == "v"] + list(extra_v)
 
         if hs:
             p.add(RangeParam("dist.h", "Horizontal distance", "px", 12.0, 11.2, 12.9, 0, 500, step=0.1))
+            p.add(RangeParam("dist.dev_h", "Horizontal deviation", "px", 0.4, 0.4, 0.4, 0, 100, step=0.1))
 
         if vs:
             p.add(RangeParam("dist.v", "Vertical distance", "px", 15.5, 14.8, 16.3, 0, 500, step=0.1))
+            p.add(RangeParam("dist.dev_v", "Vertical deviation", "px", 0.5, 0.5, 0.5, 0, 100, step=0.1))
 
         return p
 

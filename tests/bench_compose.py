@@ -361,7 +361,7 @@ _PROBE_TARGETS: tuple[tuple[str, object, str], ...] = (
     ("render_char", layout_mod, "render_char"),
     ("generate_pca_dot", render_char_mod, "generate_pca_dot"),
     ("shift_image", render_char_mod, "shift_image"),
-    ("_paste_max", render_char_mod, "_paste_max"),
+    ("_paste_dark", render_char_mod, "_paste_dark"),
     ("paste_ink_rect", compose_mod, "paste_ink_rect"),
 )
 
@@ -371,7 +371,7 @@ _NESTING: dict[str, str] = {
     "render_char": "layout_job",
     "generate_pca_dot": "render_char",
     "shift_image": "render_char",
-    "_paste_max": "render_char",
+    "_paste_dark": "render_char",
 }
 
 

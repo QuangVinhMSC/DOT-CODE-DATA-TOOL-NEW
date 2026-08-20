@@ -498,6 +498,15 @@ def shift_image(img, dx, dy, interp) -> np.ndarray          # warpAffine, BORDER
 These are lifted verbatim from `test1.py::estimate_background / paste_dot / shift_image`. Keep the
 multiplicative ink model — it is what prevents the source background bleeding into the target.
 
+> **Superseded by `bug.md` (2026-08-17).** The multiplicative model is gone. Darkness is now
+> absolute — `D = B - L` on sampling, `L = B - D` on pasting — and patches carry `D / 255`, so
+> `to_ink` divides by 255 rather than by `bg` and `paste_ink` subtracts rather than multiplies.
+> It still prevents the source background bleeding into the target, and additionally keeps a dot's
+> bite the same on a background darker or lighter than the paper it was sampled from. `B` is now
+> measured from the Background Of Dot (`background_of_dot`) rather than the crop's border ring,
+> which is only the fallback. Overlapping dots add their darkness, floored at the darkest pixel of
+> the dots involved, in `render_char`; they no longer combine with `max`.
+
 ### 3.3 `core/dot_extract.py`
 
 ```python

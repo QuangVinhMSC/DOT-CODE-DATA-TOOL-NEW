@@ -8,8 +8,9 @@ pass against the stub engines.
 import numpy as np
 import pytest
 from PySide6.QtCore import QEvent, QPointF, Qt
+from PySide6.QtGui import QMouseEvent
 
-from dotgen.core.models import CharFormat, DotLink, DotPair, Quad
+from dotgen.core.models import CharFormat, DotLink, DotSequence, Quad
 from dotgen.core.registry import get_engines
 from dotgen.ui.main_window import MainWindow
 from dotgen.ui.tabs.tab1_sample import Tab1Sample
@@ -20,6 +21,21 @@ from dotgen.ui.tabs.tab5_class import Tab5Class
 from dotgen.ui.tabs.tab6_export import Tab6Export
 from dotgen.ui.widgets.image_canvas import ImageCanvas, ToolMode
 from dotgen.ui.widgets.range_bar import RangeBar
+
+
+def click(canvas, scene_pt: QPointF, button=Qt.LeftButton) -> None:
+    """One press on a canvas, in scene (image pixel) coordinates."""
+    pos = QPointF(canvas.mapFromScene(scene_pt))
+    canvas.mousePressEvent(
+        QMouseEvent(
+            QEvent.MouseButtonPress,
+            pos,
+            canvas.viewport().mapToGlobal(pos.toPoint()),
+            button,
+            button,
+            Qt.NoModifier,
+        )
+    )
 
 
 # ======================================================================
@@ -74,12 +90,31 @@ def test_tab1_quad_and_pairs_fill_the_bars(state, dotted_image):
     state.add_sample_image("x.png", dotted_image)
 
     tab._on_roi("quad", Quad([(2, 2), (60, 4), (61, 40), (3, 38)]))
-    tab._on_roi("pair", DotPair((30, 40), (42, 40), "h"))
-    tab._on_roi("pair", DotPair((30, 40), (30, 56), "v"))
+    tab._on_roi("sequence", DotSequence.pair((30, 40), (42, 40), "h"))
+    tab._on_roi("sequence", DotSequence.pair((30, 40), (30, 56), "v"))
 
     assert "tilt.x" in tab.bars.bars
     assert tab.bars.bars["dist.h"].param.mean > 0
     assert state.has_distance_units()
+
+
+def test_tab1_a_ruler_run_fills_the_distance_and_its_deviation(state, dotted_image):
+    """dotted_image is a row of dots 12 px apart from x=30; one is nudged."""
+    tab = Tab1Sample(state)
+    state.add_sample_image("x.png", dotted_image)
+
+    messages = []
+    tab.statusMessage.connect(messages.append)
+
+    tab._on_roi(
+        "sequence",
+        DotSequence([(30, 40), (42, 40), (56, 40), (66, 40)], "h"),
+    )
+
+    assert state.params["dist.h"].mean == pytest.approx(12.0)
+    assert state.params["dist.dev_h"].mean == pytest.approx(2.0)
+    assert "4 dots" in messages[-1]
+    assert len(tab.canvas.overlays) == 1
 
 
 def test_tab1_shift_rect_measures_a_whole_dot_row(state, dotted_image):
@@ -213,13 +248,13 @@ def test_rebuilding_panels_leaves_no_floating_windows(app, state, dotted_image, 
     assert len(tops) <= before + 2  # the tab itself, and Qt's own helpers
 
 
-def test_tab1_rejects_a_diagonal_pair(state, dotted_image):
+def test_tab1_rejects_a_diagonal_run(state, dotted_image):
     tab = Tab1Sample(state)
     state.add_sample_image("x.png", dotted_image)
 
     messages = []
     tab.statusMessage.connect(messages.append)
-    tab._on_roi("pair_rejected", None)
+    tab._on_roi("sequence_rejected", None)
 
     assert messages and "diagonal" in messages[-1]
 
@@ -576,7 +611,7 @@ def test_canvas_quad_tool_emits_corners_in_tl_tr_br_bl_order(qtbot, dotted_image
     assert quad.pts == [(10.0, 20.0), (60.0, 20.0), (60.0, 50.0), (10.0, 50.0)]
 
 
-def test_canvas_pair_tool_classifies_the_axis(qtbot, dotted_image):
+def test_canvas_ruler_classifies_the_axis(qtbot, dotted_image):
     c = ImageCanvas()
     qtbot.addWidget(c)
     c.set_image(dotted_image)
@@ -585,16 +620,60 @@ def test_canvas_pair_tool_classifies_the_axis(qtbot, dotted_image):
     c.roiFinished.connect(lambda kind, payload: received.append((kind, payload)))
 
     c._points = [QPointF(10, 10), QPointF(30, 11)]
-    c._finish_pair()
+    c._finish_sequence()
     assert received[-1][1].axis == "h"
 
     c._points = [QPointF(10, 10), QPointF(11, 30)]
-    c._finish_pair()
+    c._finish_sequence()
     assert received[-1][1].axis == "v"
 
     c._points = [QPointF(10, 10), QPointF(30, 30)]
-    c._finish_pair()
-    assert received[-1][0] == "pair_rejected"
+    c._finish_sequence()
+    assert received[-1][0] == "sequence_rejected"
+
+
+def test_canvas_ruler_collects_until_the_right_button(qtbot, dotted_image):
+    """Left clicks accumulate; only the right button closes the run."""
+    c = ImageCanvas()
+    qtbot.addWidget(c)
+    c.set_image(dotted_image)
+    c.set_tool(ToolMode.RULER)
+    c.zoom_to(1.0)  # 1 scene unit == 1 screen px, so the clicks land exactly
+
+    received = []
+    c.roiFinished.connect(lambda kind, payload: received.append((kind, payload)))
+
+    for x in (10, 22, 34, 46):
+        click(c, QPointF(x, 40))
+
+    assert received == []  # four dots in, nothing measured yet
+    assert len(c._points) == 4
+
+    click(c, QPointF(0, 0), button=Qt.RightButton)
+
+    kind, seq = received[-1]
+    assert kind == "sequence"
+    assert seq.axis == "h"
+    assert seq.n_dots == 4
+    assert seq.unit_spacing == pytest.approx(12.0)
+    assert c._points == []
+
+
+def test_canvas_ruler_drops_a_run_of_one_point(qtbot, dotted_image):
+    """A single click then a right click is a mis-click, not a measurement."""
+    c = ImageCanvas()
+    qtbot.addWidget(c)
+    c.set_image(dotted_image)
+    c.set_tool(ToolMode.RULER)
+
+    received = []
+    c.roiFinished.connect(lambda kind, payload: received.append((kind, payload)))
+
+    click(c, QPointF(10, 40))
+    click(c, QPointF(0, 0), button=Qt.RightButton)
+
+    assert received == []
+    assert c._points == []
 
 
 # ======================================================================
@@ -628,6 +707,144 @@ def test_read_only_bar_ignores_drags(qtbot, state):
     bar.setEditable(False)
 
     assert bar.track.editable is False
+
+
+def test_tab1_bars_are_read_only(qtbot, state):
+    """They are measurements; Tab 1 recomputes and merges them constantly."""
+    tab = Tab1Sample(state)
+    qtbot.addWidget(tab)
+
+    assert tab.bars.bars
+    assert all(not b.track.editable for b in tab.bars.bars.values())
+
+
+def test_a_click_on_a_tab1_bar_moves_nothing(qtbot, state):
+    """Not merely undrawn -- the press has to be ignored where it lands."""
+    tab = Tab1Sample(state)
+    qtbot.addWidget(tab)
+
+    track = tab.bars.bars["dist.h"].track
+    before = state.params["dist.h"].to_dict()
+
+    pos = QPointF(track.x_of(state.params["dist.h"].mean), 11.0)
+    track.mousePressEvent(
+        QMouseEvent(
+            QEvent.MouseButtonPress,
+            pos,
+            track.mapToGlobal(pos.toPoint()),
+            Qt.LeftButton,
+            Qt.LeftButton,
+            Qt.NoModifier,
+        )
+    )
+
+    assert state.params["dist.h"].to_dict() == before
+
+
+def test_tab4_no_longer_carries_a_parameter_panel(qtbot, state):
+    """The bars moved to Tab 3, beside the frames that show what they do."""
+    tab = Tab4Job(state)
+    qtbot.addWidget(tab)
+
+    assert not hasattr(tab, "bars")
+
+
+def test_tab3_bars_are_editable_and_cover_every_group(qtbot, state):
+    tab = Tab3Summary(state)
+    qtbot.addWidget(tab)
+
+    assert all(b.track.editable for b in tab.bars.bars.values())
+
+    groups = {k.split(".", 1)[0] for k in tab.bars.bars}
+    assert {"dot", "dist", "persp", "tilt", "curve"} <= groups
+
+
+def test_a_tab3_drag_stays_out_of_the_state_until_load(qtbot, state):
+    """The whole point of the Load button: previewing is not committing."""
+    tab = Tab3Summary(state)
+    qtbot.addWidget(tab)
+
+    tab.bars.bars["dist.h"].track.dragged.emit("max", 33.0)
+
+    assert tab.bars.draft["dist.h"].max == 33.0
+    assert state.params["dist.h"].max != 33.0
+    assert tab.bars.edited_keys() == ["dist.h"]
+
+    tab._load_params()
+
+    assert state.params["dist.h"].max == 33.0
+    assert state.params["dist.h"].user_set is True
+    assert tab.bars.edited_keys() == []
+
+
+def test_a_tab3_edit_is_previewed_before_it_is_loaded(qtbot, state):
+    """Both frames must follow the handle while the state still holds back."""
+    tab = prepare_tab3(state)
+    qtbot.addWidget(tab)
+
+    before = tab.min_canvas.pixmap_item.pixmap().toImage()
+
+    tab.bars.bars["dist.h"].track.dragged.emit("mean", 40.0)
+
+    assert tab.min_canvas.pixmap_item.pixmap().toImage() != before
+    assert state.params["dist.h"].mean != 40.0
+
+
+def test_a_tab3_revert_throws_the_unloaded_edit_away(qtbot, state):
+    tab = Tab3Summary(state)
+    qtbot.addWidget(tab)
+
+    measured = state.params["dist.h"].max
+    tab.bars.bars["dist.h"].track.dragged.emit("max", 33.0)
+    tab._revert_params()
+
+    assert tab.bars.edited_keys() == []
+    assert tab.bars.draft["dist.h"].max == measured
+
+
+def test_a_loaded_tab3_adjustment_survives_a_tab1_recompute(qtbot, state):
+    """What merge() had to learn: a committed value is a choice, not a reading.
+
+    Adding a ruler run in Tab 1 recomputes every ``dist.*`` bar and merges the
+    result over the top; before ``user_set`` that silently threw the user's
+    range away.
+    """
+    tab = Tab3Summary(state)
+    qtbot.addWidget(tab)
+
+    tab.bars.bars["dist.h"].track.dragged.emit("max", 33.0)
+    tab._load_params()
+    state.add_dot_sequence(DotSequence.pair((10, 10), (24, 10), "h"))
+
+    assert state.params["dist.h"].max == 33.0
+    assert tab.bars.draft["dist.h"].max == 33.0
+
+    state.reset_params()
+
+    assert state.params["dist.h"].max != 33.0
+    assert state.params["dist.h"].user_set is False
+
+
+def test_an_unloaded_tab3_edit_survives_a_tab1_recompute(qtbot, state):
+    """The draft needs the same protection the state got, one step earlier."""
+    tab = Tab3Summary(state)
+    qtbot.addWidget(tab)
+
+    tab.bars.bars["dist.h"].track.dragged.emit("max", 33.0)
+    state.add_dot_sequence(DotSequence.pair((10, 10), (24, 10), "h"))
+
+    assert tab.bars.draft["dist.h"].max == 33.0
+    assert tab.bars.edited_keys() == ["dist.h"]
+
+    # All three numbers are held, not just the handle that was dragged: that is
+    # ParamSet.merge's rule for a hand-set bar, and the draft is the same rule
+    # one step earlier.  Everything else is the fresh measurement.
+    assert tab.bars.draft["dist.h"].mean != state.params["dist.h"].mean
+    assert tab.bars.draft["dist.h"].label == state.params["dist.h"].label
+    assert tab.bars.draft["dist.h"].enabled == state.params["dist.h"].enabled
+
+    # An untouched bar follows the measurement with nothing held back.
+    assert tab.bars.draft["dist.v"].to_dict() == state.params["dist.v"].to_dict()
 
 
 # ======================================================================
@@ -737,8 +954,8 @@ def test_tab2_keeps_each_character_independent(state):
 
 def test_tab2_preview_uses_the_distance_units(state):
     tab = Tab2Matrix(state)
-    state.add_dot_pair(DotPair((0, 0), (12, 0), "h"))
-    state.add_dot_pair(DotPair((0, 0), (0, 16), "v"))
+    state.add_dot_sequence(DotSequence.pair((0, 0), (12, 0), "h"))
+    state.add_dot_sequence(DotSequence.pair((0, 0), (0, 16), "v"))
     build_char(tab)
 
     assert "width" in tab.preview.text()
@@ -753,14 +970,59 @@ def test_tab2_preview_uses_the_distance_units(state):
 def test_tab2_preview_follows_a_changed_distance_unit(state):
     """Plan 5.4: changing dist.v in Tab 1 changes Tab 2's dimensions at once."""
     tab = Tab2Matrix(state)
-    state.add_dot_pair(DotPair((0, 0), (12, 0), "h"))
-    state.add_dot_pair(DotPair((0, 0), (0, 16), "v"))
+    state.add_dot_sequence(DotSequence.pair((0, 0), (12, 0), "h"))
+    state.add_dot_sequence(DotSequence.pair((0, 0), (0, 16), "v"))
     build_char(tab)
 
     state.set_param("dist.v", "mean", 32.0)
 
     assert "pitch_v = 16.00" in tab.preview.text()
     assert "height = 32.00" in tab.preview.text()
+
+
+def test_tab2_adds_characters_typed_by_hand(state):
+    tab = Tab2Matrix(state)
+
+    tab.new_char_edit.setText("a b 0 %")  # blanks and known characters ignored
+    tab._add_chars()
+
+    assert tab._charset[-3:] == ["a", "b", "%"]
+    assert {"a", "b", "%"} <= set(tab.char_buttons)
+    assert tab.new_char_edit.text() == ""
+
+    # the first new character is selected, and keeps its own format
+    assert state.active_char == "a"
+    build_char(tab)
+    tab._save()
+
+    assert len(state.char_formats["a"].links) == 2
+    assert tab.char_buttons["a"].isChecked() is True
+
+
+def test_tab2_removes_a_hand_added_character_only(state):
+    tab = Tab2Matrix(state)
+
+    assert tab.remove_char_button.isEnabled() is False
+    tab._remove_char()
+    assert "0" in tab._charset  # built-ins stay put
+
+    tab.new_char_edit.setText("%")
+    tab._add_chars()
+    assert tab.remove_char_button.isEnabled() is True
+
+    tab._remove_char()
+
+    assert "%" not in tab._charset
+    assert "%" not in tab.char_buttons
+    assert state.active_char == "0"
+
+
+def test_tab2_restores_characters_of_a_loaded_job(state):
+    tab = Tab2Matrix(state)
+    state.save_char_format(CharFormat("%"))
+
+    assert "%" in tab._charset
+    assert "%" in tab.char_buttons
 
 
 def test_tab2_removing_a_dot_drops_its_links(state):
@@ -780,10 +1042,10 @@ def test_tab2_removing_a_dot_drops_its_links(state):
 def prepare_tab3(state) -> Tab3Summary:
     # Two pairs per axis: one measurement gives a point range, and a point
     # range cannot show a Min/Max difference.
-    state.add_dot_pair(DotPair((0, 0), (12, 0), "h"))
-    state.add_dot_pair(DotPair((0, 0), (14, 0), "h"))
-    state.add_dot_pair(DotPair((0, 0), (0, 16), "v"))
-    state.add_dot_pair(DotPair((0, 0), (0, 20), "v"))
+    state.add_dot_sequence(DotSequence.pair((0, 0), (12, 0), "h"))
+    state.add_dot_sequence(DotSequence.pair((0, 0), (14, 0), "h"))
+    state.add_dot_sequence(DotSequence.pair((0, 0), (0, 16), "v"))
+    state.add_dot_sequence(DotSequence.pair((0, 0), (0, 20), "v"))
     state.save_char_format(
         CharFormat(
             "1",
@@ -834,7 +1096,7 @@ def test_tab3_lists_every_parameter_with_a_compare_box(state):
 
     assert set(tab.bars.bars) == set(state.params)
     assert all(bar.compare_box is not None for bar in tab.bars.bars.values())
-    assert all(bar.track.editable is False for bar in tab.bars.bars.values())
+    assert all(bar.track.editable is True for bar in tab.bars.bars.values())
 
 
 # ======================================================================
@@ -1166,8 +1428,8 @@ def test_gating_opens_tabs_as_the_definition_progresses(state, backgrounds, dott
     assert w.tabs.isTabEnabled(1) is False
     assert w.tabs.isTabEnabled(3) is True
 
-    state.add_dot_pair(DotPair((0, 0), (12, 0), "h"))
-    state.add_dot_pair(DotPair((0, 0), (0, 16), "v"))
+    state.add_dot_sequence(DotSequence.pair((0, 0), (12, 0), "h"))
+    state.add_dot_sequence(DotSequence.pair((0, 0), (0, 16), "v"))
     assert w.tabs.isTabEnabled(1) is True
 
     # Tab 3 renders from the links, so the gate wants a format that validates:

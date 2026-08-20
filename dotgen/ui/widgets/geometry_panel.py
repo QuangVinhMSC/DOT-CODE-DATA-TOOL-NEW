@@ -72,7 +72,7 @@ class GeometryPanel(QWidget):
         params: ParamSet,
         curve_reason: str = "",
         n_curves: int = 0,
-        n_pairs: int = 0,
+        n_runs: int = 0,
         n_rows: int = 0,
     ) -> None:
         lines: list[str] = []
@@ -111,10 +111,14 @@ class GeometryPanel(QWidget):
                 f"phase {params.value_for('curve.phase', 'mean'):+.2f} rad"
             )
 
-        lines.append(f"dot pairs: {n_pairs}   row scans: {n_rows}")
+        lines.append(f"ruler runs: {n_runs}   row scans: {n_rows}")
         lines.append(
             f"  dist.h = {params.value_for('dist.h', 'mean'):.2f} px   "
             f"dist.v = {params.value_for('dist.v', 'mean'):.2f} px"
+        )
+        lines.append(
+            f"  deviation h = {params.value_for('dist.dev_h', 'mean'):.2f} px   "
+            f"v = {params.value_for('dist.dev_v', 'mean'):.2f} px"
         )
 
         self.readout.setText("\n".join(lines))

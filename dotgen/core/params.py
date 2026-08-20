@@ -12,6 +12,7 @@ Visual convention (see ``ui/widgets/range_bar.py``):
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from dataclasses import fields as dataclass_fields
 from typing import Iterable, Literal
 
 import numpy as np
@@ -32,6 +33,10 @@ class RangeParam:
     enabled: bool = True
     compare: bool = False
     step: float = 0.01
+    # Set once the user has dragged this bar by hand.  Everything else about a
+    # bar is *measured*, and a measurement is free to be taken again; a number
+    # a person chose is not, so :meth:`ParamSet.merge` stops overwriting it.
+    user_set: bool = False
 
     def __post_init__(self) -> None:
         self.clamp()
@@ -120,11 +125,19 @@ class RangeParam:
             "enabled": self.enabled,
             "compare": self.compare,
             "step": self.step,
+            "user_set": self.user_set,
         }
 
     @staticmethod
     def from_dict(d: dict) -> "RangeParam":
-        return RangeParam(**d)
+        # ``user_set`` arrived after the first configs were written, so a file
+        # from before it existed must still load rather than raise.
+        return RangeParam(**{k: v for k, v in d.items() if k in _FIELDS})
+
+
+# Every field name of RangeParam, so a config written by a newer build loads on
+# an older one instead of dying on a keyword it has never heard of.
+_FIELDS = {f.name for f in dataclass_fields(RangeParam)}
 
 
 class ParamSet(dict):
@@ -154,7 +167,16 @@ class ParamSet(dict):
 
         ``keep_user_edits`` preserves the ``enabled`` and ``compare`` flags of an
         existing param, because those are user choices while mean/min/max are
-        computed by an engine.
+        computed by an engine -- *unless* the user has dragged the bar, in which
+        case min/mean/max are a choice too and survive as well.
+
+        That exception is the whole reason the Min/Mean/Max handles in Tab 4 are
+        worth anything.  Every incoming ParamSet here is a fresh measurement:
+        collect one more dot sample, or nudge one corner of the quadrilateral,
+        and Tab 1 recomputes and merges the lot.  Without ``user_set`` an
+        adjustment made in Tab 4 would live until the next time the user touched
+        Tab 1 and then vanish with no message -- the bar would appear editable
+        and quietly not be.
         """
         changed: list[str] = []
 
@@ -165,6 +187,13 @@ class ParamSet(dict):
             if old is not None and keep_user_edits:
                 new.enabled = old.enabled
                 new.compare = old.compare
+                new.user_set = old.user_set
+
+                if old.user_set:
+                    # Bounds and label still come from the measurement; only the
+                    # three numbers the user placed are held back.
+                    new.mean, new.min, new.max = old.mean, old.min, old.max
+                    new.clamp()
 
             if old is None or old.to_dict() != new.to_dict():
                 changed.append(key)
@@ -230,8 +259,8 @@ def default_params() -> ParamSet:
 
     # --- dot appearance (filled by Phase 3) ---------------------------
     p.add(RangeParam("dot.area", "Dot area", "px", 0, 0, 0, 0, 5000, step=1))
-    p.add(RangeParam("dot.max_ink", "Dot max ink", "", 0, 0, 0, 0, 1))
-    p.add(RangeParam("dot.mean_ink", "Dot mean ink", "", 0, 0, 0, 0, 1))
+    p.add(RangeParam("dot.max_ink", "Dot max darkness", "", 0, 0, 0, 0, 1))
+    p.add(RangeParam("dot.mean_ink", "Dot mean darkness", "", 0, 0, 0, 0, 1))
     p.add(RangeParam("dot.radius_eq", "Dot equivalent radius", "px", 0, 0, 0, 0, 60, step=0.1))
     p.add(RangeParam("dot.pca_sigma", "PCA variation", "x", 1.0, 1.0, 1.0, 0, 3, step=0.05))
 
@@ -250,6 +279,10 @@ def default_params() -> ParamSet:
     # --- dot-to-dot distance (filled by Phase 4) ----------------------
     p.add(RangeParam("dist.h", "Horizontal distance", "px", 0, 0, 0, 0, 500, step=0.1))
     p.add(RangeParam("dist.v", "Vertical distance", "px", 0, 0, 0, 0, 500, step=0.1))
+    # How far a printed dot strays from the spacing it should have had.  Zero by
+    # default, which makes the generated grid exact -- see render_char.
+    p.add(RangeParam("dist.dev_h", "Horizontal deviation", "px", 0, 0, 0, 0, 100, step=0.1))
+    p.add(RangeParam("dist.dev_v", "Vertical deviation", "px", 0, 0, 0, 0, 100, step=0.1))
 
     # --- background separation (filled by Phase 9) --------------------
     p.add(RangeParam("bg.brightness", "BG brightness", "", 0, 0, 0, 0, 255, step=1))

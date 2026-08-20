@@ -3,7 +3,12 @@ import numpy as np
 import pytest
 
 from dotgen.core.dot_extract import ExtractConfig, extract_dot, extract_dot_ex
-from dotgen.core.ink import estimate_background, paste_ink, to_ink
+from dotgen.core.ink import (
+    background_of_dot,
+    estimate_background,
+    paste_ink,
+    to_ink,
+)
 from dotgen.core.models import ROI
 
 CFG = ExtractConfig()
@@ -265,14 +270,62 @@ def test_an_empty_mask_falls_back_to_the_whole_image():
     )
 
 
-def test_to_ink_maps_paper_to_zero_and_black_to_one():
+def test_the_bod_is_the_outline_minus_the_dot():
+    """B is the paper *inside* the shape the user drew, with the dot taken out."""
+    gray = np.full((40, 40), 200, np.uint8)
+    gray[18:22, 18:22] = 20
+
+    roi = np.zeros((40, 40), np.uint8)
+    roi[10:30, 10:30] = 255
+
+    dot = np.zeros((40, 40), bool)
+    dot[16:24, 16:24] = True
+
+    assert background_of_dot(gray, roi, dot) == pytest.approx(200.0)
+    # Leaving the dot in makes the paper look darker than it is, and every
+    # sampled darkness is then short by the difference.
+    assert background_of_dot(gray, roi, None) < 200.0
+
+
+def test_a_bod_with_no_paper_in_it_falls_back_to_the_border_ring():
+    """A tight outline leaves nothing to average; the ring outside it does."""
+    gray = np.full((40, 40), 180, np.uint8)
+    gray[0, :] = gray[-1, :] = gray[:, 0] = gray[:, -1] = 210
+
+    roi = np.zeros((40, 40), np.uint8)
+    roi[20:22, 20:22] = 255
+
+    dot = np.zeros((40, 40), bool)
+    dot[19:23, 19:23] = True
+
+    assert background_of_dot(gray, roi, dot) == pytest.approx(
+        estimate_background(gray)
+    )
+
+
+def test_to_ink_is_the_absolute_darkness_b_minus_l():
+    """``D = B - L``, in units of 1/255 -- not a fraction of the paper."""
     gray = np.array([[200, 100, 0]], np.uint8)
     ink = to_ink(gray, 200.0)
 
     assert ink.dtype == np.float32
     assert ink[0, 0] == pytest.approx(0.0)
-    assert ink[0, 1] == pytest.approx(0.5)
-    assert ink[0, 2] == pytest.approx(1.0)
+    assert ink[0, 1] == pytest.approx(100.0 / 255.0)
+    assert ink[0, 2] == pytest.approx(200.0 / 255.0)
+
+
+def test_to_ink_gives_the_same_darkness_on_light_and_dark_paper():
+    """The point of an absolute D: identical bite, whatever B was.
+
+    The old proportional model made the darker sample read as *more* ink for
+    the same 80 levels of bite, and a dot sampled off a shaded photograph then
+    came out heavier than the same dot sampled off a bright one.
+    """
+    light = to_ink(np.array([[220 - 80]], np.uint8), 220.0)
+    dark = to_ink(np.array([[120 - 80]], np.uint8), 120.0)
+
+    assert float(light[0, 0]) == pytest.approx(float(dark[0, 0]))
+    assert float(light[0, 0]) == pytest.approx(80.0 / 255.0)
 
 
 def test_to_ink_never_goes_negative_on_pixels_brighter_than_paper():
@@ -281,26 +334,59 @@ def test_to_ink_never_goes_negative_on_pixels_brighter_than_paper():
     assert ink[0, 0] == 0.0
 
 
-def test_paste_ink_darkens_multiplicatively_and_spares_zero_pixels():
+def test_paste_ink_subtracts_darkness_and_spares_zero_pixels():
+    """``L = B - D``: 0.5 takes 127 levels off, not half the pixel."""
     canvas = np.full((20, 20, 3), 200, np.uint8)
     ink = np.zeros((5, 5), np.float32)
     ink[2, 2] = 0.5
 
     paste_ink(canvas, 10, 10, ink)
 
-    assert tuple(canvas[10, 10]) == (100, 100, 100)
+    assert tuple(canvas[10, 10]) == (72, 72, 72)  # 200 - 127.5, truncated
     assert tuple(canvas[10, 11]) == (200, 200, 200)
     assert tuple(canvas[0, 0]) == (200, 200, 200)
 
 
+def test_paste_ink_removes_the_same_levels_from_any_background():
+    """The same dot bites equally hard into light and dark paper."""
+    light = np.full((9, 9), 240, np.uint8)
+    dark = np.full((9, 9), 120, np.uint8)
+    ink = np.full((3, 3), 40.0 / 255.0, np.float32)
+
+    paste_ink(light, 4, 4, ink)
+    paste_ink(dark, 4, 4, ink)
+
+    assert int(light[4, 4]) == 200
+    assert int(dark[4, 4]) == 80
+
+
 def test_paste_ink_works_on_a_grayscale_target():
     canvas = np.full((20, 20), 200, np.uint8)
-    ink = np.full((3, 3), 0.25, np.float32)
+    ink = np.full((3, 3), 0.2, np.float32)
 
     paste_ink(canvas, 10, 10, ink)
 
-    assert canvas[10, 10] == 150
+    assert canvas[10, 10] == 149
     assert canvas[0, 0] == 200
+
+
+def test_paste_ink_never_drives_a_pixel_past_black():
+    canvas = np.full((9, 9), 60, np.uint8)
+
+    paste_ink(canvas, 4, 4, np.full((3, 3), 1.0, np.float32))
+
+    assert canvas[4, 4] == 0
+
+
+def test_two_pastes_on_one_pixel_add_their_darkness():
+    """Characters that overlap on the page sum, exactly as dots do."""
+    canvas = np.full((9, 9), 200, np.uint8)
+    ink = np.full((3, 3), 30.0 / 255.0, np.float32)
+
+    paste_ink(canvas, 4, 4, ink)
+    paste_ink(canvas, 4, 4, ink)
+
+    assert canvas[4, 4] == 140
 
 
 def test_paste_ink_clips_at_the_image_edge():

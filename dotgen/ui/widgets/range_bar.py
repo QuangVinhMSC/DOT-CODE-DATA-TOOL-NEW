@@ -21,6 +21,12 @@ from .. import theme
 
 _FIELDS = ("min", "mean", "max")
 
+# Enough for ``12.4 [11.2 - 12.9] px`` in the monospace readout font.  It is a
+# minimum, not a fixed width: where the column is wide the label grows with it,
+# and where it is narrow this is what keeps the numbers on screen instead of
+# behind a horizontal scrollbar.
+READOUT_WIDTH = 140
+
 
 class _Track(QWidget):
     """The painted part: track, span, three draggable handles."""
@@ -34,7 +40,9 @@ class _Track(QWidget):
         self._drag: str | None = None
         self._hover: str | None = None
         self.setMinimumHeight(22)
-        self.setMinimumWidth(120)
+        # Small enough that a bar still fits a narrow parameter column beside
+        # its label and its readout; the track expands into whatever is left.
+        self.setMinimumWidth(80)
         self.setMouseTracking(True)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
@@ -182,7 +190,7 @@ class RangeBar(QWidget):
         lay.addWidget(self.track, 1)
 
         self.readout = QLabel(format_value(param))
-        self.readout.setMinimumWidth(140)
+        self.readout.setMinimumWidth(READOUT_WIDTH)
         self.readout.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.readout.setStyleSheet("font-family: Consolas, monospace;")
         lay.addWidget(self.readout)

@@ -66,6 +66,14 @@ DEFAULT_DIST_H = 12.0
 DEFAULT_DIST_V = 15.0
 DEFAULT_PCA_SIGMA = 1.0
 
+# ``dist.dev_*`` records the *largest* deviation the ruler saw between a
+# measured gap and the spacing it should have had, and every generated dot is
+# then scattered independently around its ideal position.  A normal draw has no
+# maximum, so the recorded number is read as a three-sigma bound: about one dot
+# in 370 strays past what was measured, and none of the distribution's shape is
+# thrown away by clipping it.
+DEVIATION_SIGMAS = 3.0
+
 # The stand-in dot when there is no model.  Deliberately a copy of the stub
 # engine's blob rather than an import: importing engines.py from here would
 # close a cycle, since engines.py is what calls this module.
@@ -130,6 +138,45 @@ def _distance(
     value = _resolve(params, key, mode, rng, default)
 
     return value if value > 0.0 else default
+
+
+def _deviation(
+    params: ParamSet, key: str, mode: Mode | None, rng: np.random.Generator
+) -> float:
+    """A ``dist.dev_*`` magnitude, in pixels, or zero.
+
+    Zero for a missing *or disabled* bar: unticking the distance group means
+    "draw the exact grid", and :meth:`RangeParam.value_for` would otherwise hand
+    back the mean of a bar the user has just switched off.
+    """
+    p = params.get(key)
+
+    if p is None or not p.enabled:
+        return 0.0
+
+    return max(0.0, p.sample(rng) if mode is None else p.value_for(mode))
+
+
+def _position_noise(
+    n: int, dev_x: float, dev_y: float, rng: np.random.Generator
+) -> np.ndarray:
+    """Each dot's own offset from its ideal position, ``(n, 2)`` pixels.
+
+    Independent per dot and per axis, as the print is: neighbouring dots on a
+    real label do not stray together.  With both deviations at zero -- the
+    default, and every job built before the ruler measured them -- the generator
+    is not touched at all, so an existing seed keeps producing what it did.
+    """
+    if dev_x <= 0.0 and dev_y <= 0.0:
+        return np.zeros((n, 2), dtype=np.float64)
+
+    out = np.zeros((n, 2), dtype=np.float64)
+
+    for col, dev in ((0, dev_x), (1, dev_y)):
+        if dev > 0.0:
+            out[:, col] = rng.normal(0.0, dev / DEVIATION_SIGMAS, size=n)
+
+    return out
 
 
 def _geometry_params(params: ParamSet, mode: Mode) -> tuple[ParamSet, bool]:
@@ -312,12 +359,20 @@ def _deform(patch: np.ndarray, scale: tuple[float, float]) -> np.ndarray:
     return out
 
 
-def _paste_max(canvas: np.ndarray, cx: int, cy: int, patch: np.ndarray) -> None:
-    """Composite one patch into the ink map with ``max``, clipping at the edges.
+def _paste_dark(
+    acc: np.ndarray, cap: np.ndarray, cx: int, cy: int, patch: np.ndarray
+) -> None:
+    """Add one dot's darkness to the map, and record the floor it comes with.
 
-    Ink is not additive: two overlapping dots make one darker blob, not a pixel
-    past 1.0.  Anything outside the canvas is dropped rather than raising --
-    a jittered dot at the border is normal, not an error.
+    Overlapping dots add: ``Dab = Da + Db``, so a pixel two dots both reach is
+    darker than either made it alone.  What it may *not* be is darker than the
+    darkest pixel of the dots involved -- ink saturates, and a printed dot has
+    a blackest value it simply does not go past.  ``cap`` carries that limit
+    per pixel as the largest peak of any dot covering it, and :func:`_combine`
+    applies it once every dot has been laid down.
+
+    Anything outside the canvas is dropped rather than raising -- a jittered
+    dot at the border is normal, not an error.
     """
     r = patch.shape[0] // 2
     x1, y1 = cx - r, cy - r
@@ -326,13 +381,24 @@ def _paste_max(canvas: np.ndarray, cx: int, cy: int, patch: np.ndarray) -> None:
     px1 = max(0, -x1)
     py1 = max(0, -y1)
     x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(canvas.shape[1], x2), min(canvas.shape[0], y2)
+    x2, y2 = min(acc.shape[1], x2), min(acc.shape[0], y2)
 
     if x2 <= x1 or y2 <= y1:
         return
 
     sub = patch[py1 : py1 + (y2 - y1), px1 : px1 + (x2 - x1)]
-    canvas[y1:y2, x1:x2] = np.maximum(canvas[y1:y2, x1:x2], sub)
+
+    acc[y1:y2, x1:x2] += sub
+    np.maximum(cap[y1:y2, x1:x2], float(sub.max(initial=0.0)), out=cap[y1:y2, x1:x2])
+
+
+def _combine(acc: np.ndarray, cap: np.ndarray) -> np.ndarray:
+    """``Dab = min(Da + Db, floor)`` -- the summed darkness, saturated.
+
+    Away from an overlap this changes nothing: a lone dot's pixels are all at
+    or under its own peak, which is exactly what ``cap`` holds there.
+    """
+    return np.clip(np.minimum(acc, cap), 0.0, 1.0).astype(np.float32)
 
 
 def _measure_bbox(ink: np.ndarray) -> tuple[float, float, float, float]:
@@ -375,14 +441,16 @@ def render_char(
     across a dataset.  Geometry is always read at the mean, since the warp
     describes the page rather than the character.
 
-    The returned ``ink`` is float32 in 0..1 with no background in it -- Phase 7
-    is what multiplies it onto a photograph.
+    The returned ``ink`` is the darkness map ``D / 255``, float32 in 0..1 with
+    no background in it -- Phase 7 is what subtracts it from a photograph.
     """
     mode_str: Mode = "mean" if mode is None else mode
 
     dist_h = _distance(params, "dist.h", mode, rng, DEFAULT_DIST_H)
     dist_v = _distance(params, "dist.v", mode, rng, DEFAULT_DIST_V)
     sigma = _resolve(params, "dot.pca_sigma", mode, rng, DEFAULT_PCA_SIGMA)
+    dev_h = _deviation(params, "dist.dev_h", mode, rng)
+    dev_v = _deviation(params, "dist.dev_v", mode, rng)
 
     metrics = matrix.solve_metrics(fmt, dist_h, dist_v)
 
@@ -421,7 +489,9 @@ def render_char(
     plan = _plan_defects(n, defects, rng)
 
     # Jitter before the canvas is sized, so a displaced dot is framed rather
-    # than clipped.
+    # than clipped.  The measured deviation moves every dot a little; the
+    # jitter defect moves a chosen few a lot.
+    pts[:n] += _position_noise(n, dev_h, dev_v, rng)
     pts[:n] += plan.jitter
 
     centres = pts[:n]
@@ -436,7 +506,8 @@ def render_char(
     width = int(np.ceil(max_x - min_x)) + margin * 2
     height = int(np.ceil(max_y - min_y)) + margin * 2
 
-    ink = np.zeros((height, width), dtype=np.float32)
+    acc = np.zeros((height, width), dtype=np.float32)
+    cap = np.zeros((height, width), dtype=np.float32)
     fallback = None if model is not None else _gaussian_blob(radius)
 
     dot_centers: list[tuple[float, float]] = []
@@ -461,8 +532,9 @@ def render_char(
         ix = int(round(x))
         iy = int(round(y))
 
-        _paste_max(ink, ix, iy, shift_image(patch, x - ix, y - iy))
+        _paste_dark(acc, cap, ix, iy, shift_image(patch, x - ix, y - iy))
 
+    ink = _combine(acc, cap)
     origin = (float(pts[n, 0] + off_x), float(pts[n, 1] + off_y))
 
     return RenderedChar(

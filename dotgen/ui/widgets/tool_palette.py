@@ -20,7 +20,7 @@ TOOLS: list[tuple[ToolMode, str, str]] = [
     (ToolMode.LASSO, "⬯", "Closed outline sample (Tab 1.2)"),
     (ToolMode.QUAD, "▱", "Quadrilateral: perspective rule + tilt (Tab 1.5)"),
     (ToolMode.CURVE, "∿", "Curve: line waviness (Tab 1.6)"),
-    (ToolMode.PAIR, "↔", "Measure distance between two dots (Tab 1.8)"),
+    (ToolMode.RULER, "↔", "Ruler: click a run of dots, right click to end it (Tab 1.8)"),
 ]
 
 SEPARATE_TOOL = "separate"

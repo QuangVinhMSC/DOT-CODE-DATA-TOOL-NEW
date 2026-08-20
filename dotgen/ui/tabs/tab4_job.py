@@ -3,12 +3,18 @@
 Left: the background set, its common size, and the base quadrilateral that every
 background must carry before Tab 5 unlocks.
 Right: lines, characters, replacements, spacings and the defective-dot settings.
+
+The Min / Mean / Max bars used to have a third column here.  They live in Tab 3
+now, next to the two frames that show what moving them does -- a handle you drag
+in one tab while its effect is drawn in another is a handle you tune by memory.
+What is left here is the *job*: what to print, on what, and how badly.  The
+preview still redraws on ``paramsChanged``, which is how a Tab 3 Load shows up.
 """
 
 from __future__ import annotations
 
 import numpy as np
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
@@ -37,6 +43,9 @@ from ..widgets.overlay_items import QuadItem
 IMAGE_FILTER = "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff);;All files (*)"
 PREVIEW_SEED = 7
 
+# How long a parameter drag has to be still before the preview recomposes.
+PREVIEW_DELAY_MS = 200
+
 
 class Tab4Job(QWidget):
     statusMessage = Signal(str)
@@ -51,7 +60,7 @@ class Tab4Job(QWidget):
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._build_background_column())
         splitter.addWidget(self._build_content_column())
-        splitter.setSizes([880, 700])
+        splitter.setSizes([900, 660])
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(theme.PAD, theme.PAD, theme.PAD, theme.PAD)
@@ -59,6 +68,14 @@ class Tab4Job(QWidget):
 
         state.backgroundsChanged.connect(self.refresh)
         state.linesChanged.connect(self.refresh)
+
+        # A bar emits on every mouse move of a drag and the preview composes a
+        # full-size photograph, so the redraw waits for the hand to stop.
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(PREVIEW_DELAY_MS)
+        self._preview_timer.timeout.connect(self.refresh)
+        state.paramsChanged.connect(lambda *_: self._preview_timer.start())
 
         self.refresh()
 

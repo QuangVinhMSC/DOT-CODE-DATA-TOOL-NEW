@@ -12,7 +12,7 @@ from dotgen.core.io_config import (
     save_config,
     save_jobs,
 )
-from dotgen.core.models import CharFormat, CurveSpec, DotLink, DotPair, LineSpec, Quad
+from dotgen.core.models import CharFormat, CurveSpec, DotLink, DotSequence, LineSpec, Quad
 from dotgen.core.registry import get_engines
 from dotgen.core.state import AppState
 
@@ -27,8 +27,8 @@ def populate(state: AppState, dotted_image, circle_roi, backgrounds) -> None:
 
     state.set_quad(0, Quad([(2, 2), (40, 3), (41, 30), (3, 29)]))
     state.add_curve(0, CurveSpec([(0, 0), (10, 3), (20, 0), (30, -3)]))
-    state.add_dot_pair(DotPair((0, 0), (12, 0), "h"))
-    state.add_dot_pair(DotPair((0, 0), (0, 16), "v"))
+    state.add_dot_sequence(DotSequence.pair((0, 0), (12, 0), "h"))
+    state.add_dot_sequence(DotSequence([(0, 0), (0, 16), (0, 33)], "v"))
     state.set_param("dot.area", "max", 60.0)
     state.set_param_compare("dist.h", True)
     state.set_group_enabled(("persp", "tilt"), True)
@@ -74,7 +74,8 @@ def test_config_roundtrip_restores_every_tab(app, tmp_path, dotted_image, circle
     np.testing.assert_allclose(dst.dot_samples[0].ink, src.dot_samples[0].ink)
     assert dst.quads[0].pts == src.quads[0].pts
     assert len(dst.curves[0]) == 1
-    assert [p.axis for p in dst.dot_pairs] == ["h", "v"]
+    assert [q.axis for q in dst.dot_sequences] == ["h", "v"]
+    assert [q.pts for q in dst.dot_sequences] == [q.pts for q in src.dot_sequences]
 
     # params, including the user's flags
     assert dst.params.to_dict() == src.params.to_dict()
@@ -153,6 +154,30 @@ def test_loading_emits_every_signal(app, tmp_path, dotted_image):
     load_config(dst, path)
 
     assert {"samples", "chars", "backgrounds", "classes"} <= set(seen)
+
+
+def test_a_schema_one_config_still_loads_its_dot_pairs(app, tmp_path):
+    """The ruler's runs used to be stored as two endpoints under "dot_pairs"."""
+    src = AppState()
+    path = str(tmp_path / "old.dotcfg")
+    save_config(src, path)
+
+    with zipfile.ZipFile(path) as zf:
+        meta = json.loads(zf.read("config.json"))
+
+    meta["schema"] = 1
+    del meta["dot_sequences"]
+    meta["dot_pairs"] = [{"a": [0, 0], "b": [12, 0], "axis": "h"}]
+
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("config.json", json.dumps(meta))
+
+    dst = AppState()
+    load_config(dst, path)
+
+    assert len(dst.dot_sequences) == 1
+    assert dst.dot_sequences[0].pts == [(0.0, 0.0), (12.0, 0.0)]
+    assert dst.dot_sequences[0].unit_spacing == 12.0
 
 
 def test_a_newer_schema_is_refused(app, tmp_path, dotted_image):

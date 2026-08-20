@@ -29,7 +29,7 @@ from ...core import perspective, registry, spacing
 from ...core.dot_extract import ExtractConfig
 from ...core.imageops import load_image, white_canvas
 from ...core.ink import paste_ink
-from ...core.models import CurveSpec, DotPair, Quad, ROI
+from ...core.models import CurveSpec, DotSequence, Quad, ROI
 from ...core.state import MAX_DOT_SAMPLES, AppState
 from .. import theme
 from ..dialogs.bg_separate_dialog import BgSeparateDialog
@@ -39,10 +39,10 @@ from ..widgets.image_canvas import ImageCanvas, ToolMode, build_roi
 from ..widgets.mini_tab_bar import MiniTabBar
 from ..widgets.overlay_items import (
     CurveItem,
-    PairItem,
     PolylineOverlayItem,
     QuadItem,
     RoiMarkerItem,
+    SequenceItem,
 )
 from ..widgets.range_bar_list import RangeBarList
 from ..widgets.thumb_strip import ThumbStrip
@@ -83,7 +83,7 @@ class Tab1Sample(QWidget):
         splitter.setStretchFactor(0, 55)
         splitter.setStretchFactor(1, 20)
         splitter.setStretchFactor(2, 25)
-        splitter.setSizes([880, 320, 400])
+        splitter.setSizes([820, 300, 440])
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(theme.PAD, theme.PAD, theme.PAD, theme.PAD)
@@ -148,7 +148,7 @@ class Tab1Sample(QWidget):
         bl.addWidget(load)
 
         clear = QPushButton("Clear ROIs")
-        clear.setToolTip("Remove the quad, curves and pairs drawn on this image")
+        clear.setToolTip("Remove the quad, curves and ruler runs drawn on this image")
         clear.clicked.connect(self._clear_overlays)
         bl.addWidget(clear)
 
@@ -207,8 +207,25 @@ class Tab1Sample(QWidget):
         box = QGroupBox("Sample set parameters")
         bl = QVBoxLayout(box)
 
-        self.bars = RangeBarList(self.state, group_enable=True)
+        # Read-only on purpose.  Every bar here is the *result* of a
+        # measurement -- of the dot samples, the quadrilateral, the curves, the
+        # ruler runs -- and each of those recomputes and merges the whole
+        # set whenever the user touches the image.  A handle you can drag and
+        # that is silently overwritten by the next sample is worse than no
+        # handle; the ranges are adjusted in Tab 3, where they are staged
+        # behind a Load button rather than recomputed.  The group checkboxes
+        # stay live: using a group or not is a choice, not a measurement.
+        self.bars = RangeBarList(
+            self.state, group_enable=True, editable=False, label_width=100
+        )
         bl.addWidget(self.bars, 1)
+
+        measured = QLabel(
+            "Measured from the samples. Adjust Min / Mean / Max in Tab 3."
+        )
+        measured.setObjectName("hint")
+        measured.setWordWrap(True)
+        bl.addWidget(measured)
 
         # Extraction tuning is not a RangeParam group -- nothing randomises it --
         # so it rides in the list's extension slot rather than as bars.
@@ -309,7 +326,7 @@ class Tab1Sample(QWidget):
             ToolMode.LASSO: "Draw a closed outline around one dot to sample it.",
             ToolMode.QUAD: "Drag a rectangle, then drag its corners onto the printed rectangle.",
             ToolMode.CURVE: "Draw along a wavy line. Two curves are used for the waviness fit.",
-            ToolMode.PAIR: "Click two dots to measure their horizontal or vertical distance.",
+            ToolMode.RULER: "Left click each dot of a row or column; right click to end the run.",
             ToolMode.SELECT: "Click a drawn shape to select it. " + SELECT_HINT,
             ToolMode.NONE: "",
         }
@@ -392,18 +409,31 @@ class Tab1Sample(QWidget):
             if self.state.add_curve(i, payload):
                 self._rebuild_overlays()
 
-        elif kind == "pair":
-            self.state.add_dot_pair(payload)
+        elif kind == "sequence":
+            self.state.add_dot_sequence(payload)
             self._rebuild_overlays()
+            self.statusMessage.emit(self._sequence_message(payload))
+
+        elif kind == "sequence_rejected":
             self.statusMessage.emit(
-                f"{'Horizontal' if payload.axis == 'h' else 'Vertical'} pair: "
-                f"{payload.axis_distance:.2f} px"
+                "That run is too close to the diagonal to classify. Pick dots in one row or one column."
             )
 
-        elif kind == "pair_rejected":
-            self.statusMessage.emit(
-                "That pair is too close to the diagonal to classify. Pick two dots in the same row or column."
-            )
+    def _sequence_message(self, seq: DotSequence) -> str:
+        """What the ruler just measured, and what it now means for both bars.
+
+        The deviation is read back off the merged ParamSet rather than off this
+        run alone: it is the largest disagreement across *every* run on the
+        axis, and a message quoting only the newest one would contradict the bar
+        sitting next to it.
+        """
+        axis = "Horizontal" if seq.axis == "h" else "Vertical"
+        deviation = self.state.params.value_for(f"dist.dev_{seq.axis}", "mean", 0.0)
+
+        return (
+            f"{axis} run: {seq.n_dots} dots, spacing {seq.unit_spacing:.2f} px, "
+            f"largest deviation so far {deviation:.2f} px."
+        )
 
     def _collect_sample(self, kind: str, roi: ROI) -> None:
         if not self.state.can_add_dot_sample():
@@ -500,8 +530,8 @@ class Tab1Sample(QWidget):
         elif kind == "curve":
             self.state.update_curve(i, n, item.spec())
 
-        elif kind == "pair":
-            self.state.update_dot_pair(n, item.pair)  # the item kept its axis
+        elif kind == "sequence":
+            self.state.update_dot_sequence(n, item.seq)  # the item kept its axis
 
         elif kind == "marker":
             self._reextract_marker(item, n)
@@ -521,8 +551,8 @@ class Tab1Sample(QWidget):
         elif kind == "curve":
             self._drop_curve(i, n)
 
-        elif kind == "pair":
-            self.state.remove_dot_pair(n)
+        elif kind == "sequence":
+            self.state.remove_dot_sequence(n)
 
         elif kind == "marker":
             k = self._sample_index(n)
@@ -647,7 +677,7 @@ class Tab1Sample(QWidget):
             self.state.params,
             curve_reason=getattr(registry.get_engines(), "last_curve_reason", ""),
             n_curves=len(self.state.curves.get(i, [])),
-            n_pairs=len(self.state.dot_pairs),
+            n_runs=len(self.state.dot_sequences),
             n_rows=len(self.state.row_spacings),
         )
 
@@ -745,10 +775,10 @@ class Tab1Sample(QWidget):
             self.canvas.add_overlay(item)
             self._overlay_refs.append((item, "curve", n))
 
-        for n, pair in enumerate(self.state.dot_pairs):
-            item = PairItem(pair, n + 1)
+        for n, seq in enumerate(self.state.dot_sequences):
+            item = SequenceItem(seq, n + 1)
             self.canvas.add_overlay(item)
-            self._overlay_refs.append((item, "pair", n))
+            self._overlay_refs.append((item, "sequence", n))
 
         if self._show_warp and quad is not None:
             self.canvas.add_overlay(

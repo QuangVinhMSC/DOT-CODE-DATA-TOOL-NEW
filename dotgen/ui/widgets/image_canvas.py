@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QLabel,
 )
 
-from ...core.models import CurveSpec, DotPair, Quad, ROI, classify_pair_axis
+from ...core.models import CurveSpec, DotSequence, Quad, ROI, classify_sequence_axis
 from .. import theme
 from .overlay_items import Handle, RubberItem
 
@@ -35,7 +35,7 @@ class ToolMode(Enum):
     LASSO = "lasso"
     QUAD = "quad"
     CURVE = "curve"
-    PAIR = "pair"
+    RULER = "ruler"
 
 
 SAMPLE_TOOLS = (ToolMode.CIRCLE, ToolMode.RECT, ToolMode.LASSO)
@@ -137,7 +137,7 @@ def build_roi(
 
 
 class ImageCanvas(QGraphicsView):
-    roiFinished = Signal(str, object)  # kind, payload (ROI | Quad | CurveSpec | DotPair)
+    roiFinished = Signal(str, object)  # kind, payload (ROI | Quad | CurveSpec | DotSequence)
     clicked = Signal(QPointF)  # left click with no active tool
     zoomChanged = Signal(float)
 
@@ -451,6 +451,18 @@ class ImageCanvas(QGraphicsView):
             super().mousePressEvent(event)
             return
 
+        # The ruler is the one tool with two buttons: left adds a dot to the
+        # run, right says the run is finished.  It has to be answered before the
+        # left-button-only guard below.
+        if (
+            event.button() == Qt.RightButton
+            and self._tool is ToolMode.RULER
+            and self.has_image()
+        ):
+            self._finish_sequence()
+            event.accept()
+            return
+
         if event.button() != Qt.LeftButton or not self.has_image():
             super().mousePressEvent(event)
             return
@@ -473,13 +485,9 @@ class ImageCanvas(QGraphicsView):
             event.accept()
             return
 
-        if self._tool is ToolMode.PAIR:
+        if self._tool is ToolMode.RULER:
             self._points.append(p)
-            self.rubber.set_points("pair", self._points)
-
-            if len(self._points) == 2:
-                self._finish_pair()
-
+            self.rubber.set_points("ruler", self._points)
             event.accept()
             return
 
@@ -611,18 +619,27 @@ class ImageCanvas(QGraphicsView):
 
         self.roiFinished.emit("curve", CurveSpec(pts))
 
-    def _finish_pair(self) -> None:
-        a, b = self._points[0], self._points[1]
+    def _finish_sequence(self) -> None:
+        """Right button: close the run the left button has been collecting.
+
+        A run of one point is a mis-click rather than a measurement, so it is
+        dropped without a word; two or more are classified as a whole and the
+        near-diagonal ones are still refused, exactly as a pair was.
+        """
+        pts = [(p.x(), p.y()) for p in self._points]
         self._points = []
         self.rubber.clear()
 
-        axis = classify_pair_axis((a.x(), a.y()), (b.x(), b.y()))
-
-        if axis is None:
-            self.roiFinished.emit("pair_rejected", None)
+        if len(pts) < 2:
             return
 
-        self.roiFinished.emit("pair", DotPair((a.x(), a.y()), (b.x(), b.y()), axis))
+        axis = classify_sequence_axis(pts)
+
+        if axis is None:
+            self.roiFinished.emit("sequence_rejected", None)
+            return
+
+        self.roiFinished.emit("sequence", DotSequence(pts, axis))
 
     # ==================================================================
 

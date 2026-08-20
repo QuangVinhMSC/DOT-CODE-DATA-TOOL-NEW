@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from dotgen.core.models import CharFormat, CurveSpec, DotLink, DotPair, Quad
+from dotgen.core.models import CharFormat, CurveSpec, DotLink, DotSequence, Quad
 from dotgen.core.state import (
     MAX_DOT_SAMPLES,
     MAX_IMAGE_UNDO,
@@ -228,11 +228,11 @@ def test_clearing_samples_drops_the_model(state, dotted_image, circle_roi):
 # ----------------------------------------------------------------------
 
 
-def test_dot_pairs_fill_the_distance_units(state):
+def test_dot_sequences_fill_the_distance_units(state):
     assert state.has_distance_units() is False
 
-    state.add_dot_pair(DotPair((0, 0), (12, 0), "h"))
-    state.add_dot_pair(DotPair((0, 0), (0, 16), "v"))
+    state.add_dot_sequence(DotSequence.pair((0, 0), (12, 0), "h"))
+    state.add_dot_sequence(DotSequence.pair((0, 0), (0, 16), "v"))
 
     assert state.has_distance_units() is True
     assert state.params["dist.h"].mean > 0
@@ -403,3 +403,47 @@ def test_load_job_restores_the_tabs(state, backgrounds):
 
     assert state.lines[0].chars[0].char == "5"
     assert len(state.backgrounds) == 1
+
+
+# ----------------------------------------------------------------------
+# load_param_edits -- Tab 3's Load button
+# ----------------------------------------------------------------------
+
+
+def test_load_param_edits_commits_only_the_named_keys(state):
+    edits = state.params.deep_copy()
+    edits["dist.h"].set_field("max", 33.0)
+    edits["dist.v"].set_field("max", 44.0)
+
+    changed = state.load_param_edits(edits, ["dist.h"])
+
+    assert changed == ["dist.h"]
+    assert state.params["dist.h"].max == 33.0
+    assert state.params["dist.h"].user_set is True
+    assert state.params["dist.v"].max != 44.0
+    assert state.params["dist.v"].user_set is False
+
+
+def test_load_param_edits_announces_what_it_changed(state):
+    seen = []
+    state.paramsChanged.connect(seen.append)
+
+    edits = state.params.deep_copy()
+    edits["dot.pca_sigma"].set_field("max", 2.5)
+    state.load_param_edits(edits, ["dot.pca_sigma"])
+
+    assert seen == [["dot.pca_sigma"]]
+
+
+def test_load_param_edits_ignores_a_key_that_no_longer_exists(state):
+    assert state.load_param_edits(state.params.deep_copy(), ["nope"]) == []
+
+
+def test_a_committed_edit_survives_the_next_measurement(state):
+    edits = state.params.deep_copy()
+    edits["dist.h"].set_field("max", 33.0)
+    state.load_param_edits(edits, ["dist.h"])
+
+    state.add_dot_sequence(DotSequence.pair((0, 0), (12, 0), "h"))
+
+    assert state.params["dist.h"].max == 33.0

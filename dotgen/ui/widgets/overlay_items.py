@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QGraphicsSimpleTextItem,
 )
 
-from ...core.models import CurveSpec, DotPair, Quad
+from ...core.models import CurveSpec, DotSequence, Quad
 from .. import theme
 
 HANDLE_R = 5.0
@@ -511,14 +511,21 @@ class CurveItem(SelectableItem, QGraphicsObject):
 
 
 # ======================================================================
-# Dot pair -- distance measurement (Tab 1)
+# Dot sequence -- the ruler's distance measurement (Tab 1)
 # ======================================================================
 
 
-class PairItem(SelectableItem, QGraphicsObject):
-    def __init__(self, pair: DotPair, index: int):
+class SequenceItem(SelectableItem, QGraphicsObject):
+    """A clicked run of dots, drawn as a polyline with a dot on every click.
+
+    Every point is part of the geometry, so a nudge or a rescale moves the whole
+    run rigidly and the gaps between the dots -- which is what the deviation is
+    measured from -- keep their relative sizes.
+    """
+
+    def __init__(self, seq: DotSequence, index: int):
         super().__init__()
-        self.pair = pair
+        self.seq = seq
         self.index = index
         self.setZValue(12)
 
@@ -527,13 +534,13 @@ class PairItem(SelectableItem, QGraphicsObject):
         self.capture_original()
 
     def _mid(self) -> QPointF:
-        a, b = self.pair.a, self.pair.b
+        a, b = self.seq.a, self.seq.b
         return QPointF((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
 
     # ------------------------------------------------------------------
     def _label_text(self) -> str:
-        head = "H" if self.pair.axis == "h" else "V"
-        return f"{head}{self.index}  {self.pair.axis_distance:.1f}px"
+        head = "H" if self.seq.axis == "h" else "V"
+        return f"{head}{self.index}  {self.seq.n_dots}x{self.seq.unit_spacing:.1f}px"
 
     def _sync_children(self) -> None:
         mid = self._mid()
@@ -541,36 +548,34 @@ class PairItem(SelectableItem, QGraphicsObject):
         self.label.setPos(mid.x() + 6, mid.y() - 16)
 
     def _geom_points(self) -> list[QPointF]:
-        return [QPointF(*self.pair.a), QPointF(*self.pair.b)]
+        return [QPointF(x, y) for x, y in self.seq.pts]
 
     def _set_geom_points(self, points: Sequence[QPointF]) -> None:
         self.prepareGeometryChange()
-        a, b = points[0], points[1]
-        # The axis was classified when the pair was drawn; a nudge or a rescale
+        # The axis was classified when the run was drawn; a nudge or a rescale
         # must never re-classify it, or the measurement changes meaning.
-        self.pair = DotPair((a.x(), a.y()), (b.x(), b.y()), self.pair.axis)
+        self.seq = DotSequence([(p.x(), p.y()) for p in points], self.seq.axis)
         self._sync_children()
         self.update()
 
     def contains_point(self, p: QPointF, tol: float) -> bool:
-        a, b = self._geom_points()
-        return dist_to_segment(p, a, b) <= tol
+        return dist_to_polyline(p, self._geom_points()) <= tol
 
     def boundingRect(self) -> QRectF:
-        a, b = self.pair.a, self.pair.b
-        x0, x1 = min(a[0], b[0]), max(a[0], b[0])
-        y0, y1 = min(a[1], b[1]), max(a[1], b[1])
+        xs = [x for x, _ in self.seq.pts]
+        ys = [y for _, y in self.seq.pts]
+        x0, x1 = min(xs), max(xs)
+        y0, y1 = min(ys), max(ys)
         return QRectF(x0 - 8, y0 - 8, x1 - x0 + 16, y1 - y0 + 16)
 
     def paint(self, painter, option, widget=None) -> None:
-        a = QPointF(*self.pair.a)
-        b = QPointF(*self.pair.b)
+        pts = self._geom_points()
 
         painter.setPen(cosmetic_pen(theme.PAIR_COLOR, 1.4))
         painter.setBrush(QBrush(theme.PAIR_COLOR))
-        painter.drawLine(a, b)
+        painter.drawPolyline(QPolygonF(pts))
 
-        for p in (a, b):
+        for p in pts:
             painter.drawEllipse(p, 2.0, 2.0)
 
         self._paint_selection(painter)
@@ -683,7 +688,7 @@ class RubberItem(QGraphicsObject):
         elif self.kind in ("rect", "quad") and len(self.points) == 2:
             painter.drawRect(QRectF(self.points[0], self.points[1]).normalized())
 
-        elif self.kind == "pair":
+        elif self.kind == "ruler":
             painter.setPen(cosmetic_pen(theme.PAIR_COLOR, 1.4, Qt.DashLine))
 
             if len(self.points) >= 2:

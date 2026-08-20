@@ -144,28 +144,93 @@ class CurveSpec:
 
 
 @dataclass
-class DotPair:
-    a: tuple[float, float]
-    b: tuple[float, float]
+class DotSequence:
+    """A run of dots the user clicked along one axis -- the ruler's measurement.
+
+    Two points is the smallest sequence and is exactly what the tool used to
+    produce.  A longer run carries more than a distance: its *gaps* can be
+    compared against the spacing the dots should have had, and the difference is
+    how far a dot strayed from its printed position.  A single gap cannot show
+    that, because on its own it defines the very spacing it would be measured
+    against -- which is why the tool now keeps collecting until the right button
+    ends the run.
+    """
+
+    pts: list[tuple[float, float]]
     axis: Axis
+
+    def __post_init__(self) -> None:
+        self.pts = [(float(x), float(y)) for x, y in self.pts]
+
+        if len(self.pts) < 2:
+            raise ValueError("A dot sequence needs at least 2 points")
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def pair(a: Sequence[float], b: Sequence[float], axis: Axis) -> "DotSequence":
+        """The two-point case, named for how it reads at a call site."""
+        return DotSequence([(a[0], a[1]), (b[0], b[1])], axis)
+
+    @property
+    def a(self) -> tuple[float, float]:
+        return self.pts[0]
+
+    @property
+    def b(self) -> tuple[float, float]:
+        return self.pts[-1]
+
+    @property
+    def n_dots(self) -> int:
+        return len(self.pts)
 
     @property
     def distance(self) -> float:
-        return math.dist(self.a, self.b)
+        return math.dist(self.pts[0], self.pts[-1])
+
+    def coords(self) -> list[float]:
+        """Each point's position along the sequence's own axis."""
+        i = 0 if self.axis == "h" else 1
+        return [p[i] for p in self.pts]
 
     @property
     def axis_distance(self) -> float:
-        """Distance along the pair's own axis -- what the unit is measured on."""
-        if self.axis == "h":
-            return abs(self.b[0] - self.a[0])
-        return abs(self.b[1] - self.a[1])
+        """``D`` -- the span between the two farthest points, along the axis.
+
+        The axis span rather than the euclidean distance, because a run clicked
+        a couple of pixels off-level still measures a horizontal unit.
+        """
+        c = self.coords()
+        return max(c) - min(c)
+
+    @property
+    def unit_spacing(self) -> float:
+        """``L = D / (n - 1)`` -- the spacing these dots *should* have."""
+        return self.axis_distance / float(self.n_dots - 1)
+
+    def gaps(self) -> list[float]:
+        """``l`` for every adjacent pair, taken in order along the axis.
+
+        Sorted rather than click order: the measurement is of the print, and a
+        user who doubles back mid-run has not changed where the dots are.
+        """
+        c = sorted(self.coords())
+        return [b - a for a, b in zip(c, c[1:])]
+
+    def deviations(self, expected: float) -> list[float]:
+        """``|L - l|`` per adjacent pair -- how far the second dot strayed."""
+        return [abs(expected - g) for g in self.gaps()]
 
     def to_dict(self) -> dict:
-        return {"a": list(self.a), "b": list(self.b), "axis": self.axis}
+        return {"pts": [list(p) for p in self.pts], "axis": self.axis}
 
     @staticmethod
-    def from_dict(d: dict) -> "DotPair":
-        return DotPair(tuple(d["a"]), tuple(d["b"]), d["axis"])
+    def from_dict(d: dict) -> "DotSequence":
+        # Configs written before the ruler collected more than two points store
+        # the run as its two endpoints, and must still load.
+        if "pts" in d:
+            return DotSequence([tuple(p) for p in d["pts"]], d["axis"])
+
+        return DotSequence.pair(tuple(d["a"]), tuple(d["b"]), d["axis"])
 
 
 DIAGONAL_REJECT_DEG = 30.0
@@ -185,6 +250,22 @@ def classify_pair_axis(a: Sequence[float], b: Sequence[float]) -> Axis | None:
         return None
 
     return "h" if dx >= dy else "v"
+
+
+def classify_sequence_axis(pts: Sequence[Sequence[float]]) -> Axis | None:
+    """:func:`classify_pair_axis` for a whole run, on its overall extent.
+
+    The extent rather than first-to-last: the two farthest points are what the
+    spacing is computed from, so they are also what decides the direction, and a
+    run clicked out of order still reads as the row it is.
+    """
+    if len(pts) < 2:
+        return None
+
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+
+    return classify_pair_axis((0.0, 0.0), (max(xs) - min(xs), max(ys) - min(ys)))
 
 
 # ======================================================================

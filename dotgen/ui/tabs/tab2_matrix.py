@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QSpinBox,
@@ -36,7 +37,9 @@ from ..widgets.range_bar import RangeBar
 
 CHARSET = list("0123456789") + list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
-MIN_CELL = 18
+CHARS_PER_ROW = 10
+
+MIN_CELL = 10
 MAX_CELL = 54
 HIT_RADIUS = 7.0
 
@@ -377,6 +380,7 @@ class Tab2Matrix(QWidget):
         super().__init__(parent)
         self.state = state
         self._working: dict[str, CharFormat] = {}
+        self._charset: list[str] = list(CHARSET)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._build_left())
@@ -391,6 +395,7 @@ class Tab2Matrix(QWidget):
         state.paramsChanged.connect(self._refresh_units)
         state.charFormatsChanged.connect(self._on_state_formats)
 
+        self._sync_charset()
         self._load_char(self.state.active_char)
 
     # ==================================================================
@@ -404,37 +409,36 @@ class Tab2Matrix(QWidget):
         box = QGroupBox("Character")
         bl = QVBoxLayout(box)
 
-        grid = QWidget()
-        gl = QHBoxLayout(grid)
-        gl.setContentsMargins(0, 0, 0, 0)
-        gl.setSpacing(2)
-
         self.char_buttons: dict[str, QPushButton] = {}
-        rows = QVBoxLayout()
-        rows.setSpacing(2)
+        self.char_rows = QVBoxLayout()
+        self.char_rows.setSpacing(2)
+        bl.addLayout(self.char_rows)
+        self._rebuild_char_buttons()
 
-        row_widget = None
+        add_row = QWidget()
+        al = QHBoxLayout(add_row)
+        al.setContentsMargins(0, 0, 0, 0)
+        al.setSpacing(4)
 
-        for i, ch in enumerate(CHARSET):
-            if i % 10 == 0:
-                row_widget = QWidget()
-                rl = QHBoxLayout(row_widget)
-                rl.setContentsMargins(0, 0, 0, 0)
-                rl.setSpacing(2)
-                rows.addWidget(row_widget)
+        self.new_char_edit = QLineEdit()
+        self.new_char_edit.setPlaceholderText("new characters")
+        self.new_char_edit.setMaxLength(32)
+        self.new_char_edit.setToolTip(
+            "Type one or more characters to add to the palette, then press Enter."
+        )
+        self.new_char_edit.returnPressed.connect(self._add_chars)
+        al.addWidget(self.new_char_edit, 1)
 
-            b = QPushButton(ch)
-            b.setCheckable(True)
-            b.setFixedSize(26, 24)
-            b.clicked.connect(lambda _c=False, c=ch: self._select_char(c))
-            self.char_buttons[ch] = b
-            row_widget.layout().addWidget(b)
+        add_button = QPushButton("Add")
+        add_button.clicked.connect(self._add_chars)
+        al.addWidget(add_button)
 
-        if len(CHARSET) % 10:
-            row_widget.layout().addStretch(1)
+        self.remove_char_button = QPushButton("Remove")
+        self.remove_char_button.setToolTip("Remove the selected character from the palette")
+        self.remove_char_button.clicked.connect(self._remove_char)
+        al.addWidget(self.remove_char_button)
 
-        gl.addLayout(rows)
-        bl.addWidget(grid)
+        bl.addWidget(add_row)
 
         size_row = QWidget()
         sl = QHBoxLayout(size_row)
@@ -442,14 +446,14 @@ class Tab2Matrix(QWidget):
 
         sl.addWidget(QLabel("Grid"))
         self.grid_w = QSpinBox()
-        self.grid_w.setRange(1, 20)
+        self.grid_w.setRange(1, 30)
         self.grid_w.setValue(5)
         self.grid_w.valueChanged.connect(self._on_grid_changed)
         sl.addWidget(self.grid_w)
 
         sl.addWidget(QLabel("x"))
         self.grid_h = QSpinBox()
-        self.grid_h.setRange(1, 20)
+        self.grid_h.setRange(1, 30)
         self.grid_h.setValue(7)
         self.grid_h.valueChanged.connect(self._on_grid_changed)
         sl.addWidget(self.grid_h)
@@ -548,15 +552,126 @@ class Tab2Matrix(QWidget):
     # character switching
     # ==================================================================
 
+    def _rebuild_char_buttons(self) -> None:
+        """Repaint the palette from ``self._charset`` -- rows of CHARS_PER_ROW."""
+        self.char_buttons.clear()
+
+        while self.char_rows.count():
+            item = self.char_rows.takeAt(0)
+            widget = item.widget()
+
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+
+        row_layout = None
+
+        for i, ch in enumerate(self._charset):
+            if i % CHARS_PER_ROW == 0:
+                row_widget = QWidget()
+                row_layout = QHBoxLayout(row_widget)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                row_layout.setSpacing(2)
+                self.char_rows.addWidget(row_widget)
+
+            b = QPushButton(ch)
+            b.setCheckable(True)
+            b.setChecked(ch == self.state.active_char)
+            b.setFixedSize(26, 24)
+            b.clicked.connect(lambda _c=False, c=ch: self._select_char(c))
+            self.char_buttons[ch] = b
+            row_layout.addWidget(b)
+
+        if row_layout is not None and len(self._charset) % CHARS_PER_ROW:
+            row_layout.addStretch(1)
+
+    def _sync_charset(self) -> None:
+        """Make sure every character the session knows about has a button.
+
+        Rebuilds only when something is missing: this runs on every
+        ``charFormatsChanged``, and tearing the palette down while one of its
+        buttons is delivering a click is asking for trouble.
+        """
+        missing = [
+            c for c in sorted(self.state.char_formats) + [self.state.active_char]
+            if c not in self._charset
+        ]
+
+        if not missing:
+            return
+
+        for char in missing:
+            if char not in self._charset:
+                self._charset.append(char)
+
+        self._rebuild_char_buttons()
+
+    def _add_chars(self) -> None:
+        added: list[str] = []
+        known: list[str] = []
+
+        for ch in self.new_char_edit.text():
+            if ch.isspace():
+                continue
+
+            if ch in self._charset or ch in added:
+                known.append(ch)
+                continue
+
+            added.append(ch)
+
+        if not added:
+            self.statusMessage.emit(
+                f"'{' '.join(known)}' already in the palette." if known
+                else "Type the character(s) to add first."
+            )
+            return
+
+        self._charset.extend(added)
+        self.new_char_edit.clear()
+        self._rebuild_char_buttons()
+        self._select_char(added[0])
+        self.statusMessage.emit(f"Added {' '.join(added)} to the palette.")
+
+    def _remove_char(self) -> None:
+        char = self.canvas.fmt.char
+
+        if char in CHARSET:
+            self.statusMessage.emit(f"'{char}' is built in and cannot be removed.")
+            return
+
+        if char in self.state.char_formats:
+            answer = QMessageBox.question(
+                self,
+                "Remove character",
+                f"'{char}' has a saved format. Remove the character and discard it?",
+            )
+
+            if answer != QMessageBox.Yes:
+                return
+
+        self._charset.remove(char)
+        self._working.pop(char, None)
+        self._rebuild_char_buttons()
+        self._select_char(self._charset[0])
+        self.state.delete_char_format(char)
+        self.statusMessage.emit(f"Removed '{char}' from the palette.")
+
     def _select_char(self, char: str) -> None:
         self.state.set_active_char(char)
         self._load_char(char)
 
     def _load_char(self, char: str) -> None:
+        if char not in self._charset:
+            self._charset.append(char)
+            self._rebuild_char_buttons()
+
         for c, b in self.char_buttons.items():
             b.blockSignals(True)
             b.setChecked(c == char)
             b.blockSignals(False)
+
+        self.remove_char_button.setEnabled(char not in CHARSET)
 
         if char not in self._working:
             saved = self.state.char_formats.get(char)
@@ -594,6 +709,8 @@ class Tab2Matrix(QWidget):
     # ==================================================================
 
     def _on_state_formats(self) -> None:
+        self._sync_charset()
+
         if self.state.active_char != self.canvas.fmt.char:
             self._load_char(self.state.active_char)
 

@@ -21,7 +21,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from .ink import estimate_background, shift_image, to_ink
+from .ink import background_of_dot, shift_image, to_ink
 from .models import ROI, DotSample
 
 
@@ -93,7 +93,12 @@ def extract_dot_ex(
 
     support = _support_mask(core_mask, cfg)
 
-    bg = estimate_background(gray)
+    # B comes from the Background Of Dot: what is inside the outline the user
+    # drew and outside the dot itself.  The support mask, not the thresholded
+    # core, marks the dot -- the faint rim of a printed dot is part of the dot,
+    # and averaging it into the paper would bias B downwards and flatten every
+    # sample by the same amount.
+    bg = background_of_dot(gray, mask_win, support > 0.0)
 
     if bg < 1:
         return None, BAD_BACKGROUND

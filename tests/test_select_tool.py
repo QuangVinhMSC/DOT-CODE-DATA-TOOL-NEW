@@ -11,10 +11,10 @@ from PySide6.QtCore import QEvent, QPointF, Qt
 from PySide6.QtGui import QKeyEvent, QMouseEvent
 from PySide6.QtWidgets import QGraphicsView
 
-from dotgen.core.models import CurveSpec, DotPair, Quad
+from dotgen.core.models import CurveSpec, DotSequence, Quad
 from dotgen.ui.tabs.tab1_sample import Tab1Sample
 from dotgen.ui.widgets.image_canvas import ImageCanvas, ToolMode, build_roi
-from dotgen.ui.widgets.overlay_items import CurveItem, PairItem, QuadItem, RoiMarkerItem
+from dotgen.ui.widgets.overlay_items import CurveItem, QuadItem, RoiMarkerItem, SequenceItem
 
 QUAD_PTS = [(100.0, 100.0), (160.0, 100.0), (160.0, 150.0), (100.0, 150.0)]
 
@@ -43,7 +43,7 @@ def tab_with_all(state, dotted_image, circle_roi) -> Tab1Sample:
     tab._on_roi("circle", circle_roi((30, 40)))
     tab._on_roi("quad", Quad(list(QUAD_PTS)))
     tab._on_roi("curve", straight_curve(180))
-    tab._on_roi("pair", DotPair((200.0, 40.0), (212.0, 40.0), "h"))
+    tab._on_roi("sequence", DotSequence.pair((200.0, 40.0), (212.0, 40.0), "h"))
 
     tab.canvas.set_tool(ToolMode.SELECT)
     tab.canvas.zoom_to(1.0)  # 1 scene unit == 1 screen px, so the tolerance is 6
@@ -88,7 +88,7 @@ def test_select_picks_each_overlay_kind(state, dotted_image, circle_roi):
     assert isinstance(c._hit_test(ON_MARKER), RoiMarkerItem)
     assert isinstance(c._hit_test(ON_QUAD), QuadItem)
     assert isinstance(c._hit_test(ON_CURVE), CurveItem)
-    assert isinstance(c._hit_test(ON_PAIR), PairItem)
+    assert isinstance(c._hit_test(ON_PAIR), SequenceItem)
     assert c._hit_test(ON_NOTHING) is None
 
 
@@ -166,11 +166,11 @@ def test_delete_the_last_curve_empties_the_image(state, dotted_image, circle_roi
 def test_delete_removes_the_pair_from_the_state(state, dotted_image, circle_roi):
     tab = tab_with_all(state, dotted_image, circle_roi)
     c = tab.canvas
-    c.select_item(only(c, PairItem))
+    c.select_item(only(c, SequenceItem))
 
     send_key(c, Qt.Key_Delete)
 
-    assert state.dot_pairs == []
+    assert state.dot_sequences == []
 
 
 def test_delete_removes_the_dot_sample_and_its_marker(state, dotted_image, circle_roi):
@@ -308,38 +308,38 @@ def test_a_nudged_pair_keeps_its_stored_axis(state, dotted_image, circle_roi):
     """
     tab = Tab1Sample(state)
     state.add_sample_image("x.png", dotted_image)
-    tab._on_roi("pair", DotPair((30.0, 40.0), (30.5, 90.0), "h"))
+    tab._on_roi("sequence", DotSequence.pair((30.0, 40.0), (30.5, 90.0), "h"))
     tab.canvas.set_tool(ToolMode.SELECT)
     tab.canvas.zoom_to(1.0)
 
     c = tab.canvas
-    item = only(c, PairItem)
+    item = only(c, SequenceItem)
     c.select_item(item)
 
     send_key(c, Qt.Key_Right)
     send_key(c, Qt.Key_Down)
     send_key(c, Qt.Key_S)
 
-    assert state.dot_pairs[0].axis == "h"
-    assert item.pair.axis == "h"
-    assert state.dot_pairs[0].a != (30.0, 40.0)
+    assert state.dot_sequences[0].axis == "h"
+    assert item.seq.axis == "h"
+    assert state.dot_sequences[0].a != (30.0, 40.0)
 
     send_key(c, Qt.Key_L)
-    assert state.dot_pairs[0].a == (31.0, 41.0)
-    assert state.dot_pairs[0].b == (31.5, 91.0)
+    assert state.dot_sequences[0].a == (31.0, 41.0)
+    assert state.dot_sequences[0].b == (31.5, 91.0)
 
 
 def test_a_pair_scales_about_its_midpoint(state, dotted_image, circle_roi):
     tab = Tab1Sample(state)
     state.add_sample_image("x.png", dotted_image)
-    tab._on_roi("pair", DotPair((30.0, 40.0), (30.0, 90.0), "v"))
+    tab._on_roi("sequence", DotSequence.pair((30.0, 40.0), (30.0, 90.0), "v"))
     tab.canvas.set_tool(ToolMode.SELECT)
 
     c = tab.canvas
-    c.select_item(only(c, PairItem))
+    c.select_item(only(c, SequenceItem))
     send_key(c, Qt.Key_S)
 
-    pair = state.dot_pairs[0]
+    pair = state.dot_sequences[0]
     assert (pair.a[1] + pair.b[1]) / 2 == pytest.approx(65.0)
     assert pair.axis_distance == pytest.approx(50.0 * 0.95)
 
@@ -505,3 +505,29 @@ def test_drawing_tools_still_work_after_using_select(state, dotted_image, circle
 
     tab._on_roi("circle", circle_roi((54, 40)))
     assert len(state.dot_samples) == 2
+
+
+def test_a_multi_dot_run_moves_rigidly(state, dotted_image, circle_roi):
+    """Every clicked point is geometry: a nudge must not change the gaps.
+
+    The gaps are what the deviation is measured from, so a run that stretched
+    when it was dragged would quietly rewrite ``dist.dev_h``.
+    """
+    tab = Tab1Sample(state)
+    state.add_sample_image("x.png", dotted_image)
+    tab._on_roi("sequence", DotSequence([(30.0, 40.0), (42.0, 40.0), (56.0, 40.0)], "h"))
+    tab.canvas.set_tool(ToolMode.SELECT)
+    tab.canvas.zoom_to(1.0)
+
+    c = tab.canvas
+    before = state.dot_sequences[0].gaps()
+    c.select_item(only(c, SequenceItem))
+
+    send_key(c, Qt.Key_Right)
+    send_key(c, Qt.Key_Down)
+
+    seq = state.dot_sequences[0]
+
+    assert seq.pts == [(31.0, 41.0), (43.0, 41.0), (57.0, 41.0)]
+    assert seq.gaps() == before
+    assert seq.axis == "h"

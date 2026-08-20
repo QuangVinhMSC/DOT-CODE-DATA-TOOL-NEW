@@ -24,7 +24,7 @@ from .models import (
     CurveSpec,
     DefectSpec,
     DotModel,
-    DotPair,
+    DotSequence,
     DotSample,
     Job,
     Quad,
@@ -83,11 +83,11 @@ class RealGeometryEngines(RealDotEngines):
 
     def spacing_params(
         self,
-        pairs: list[DotPair],
+        sequences: list[DotSequence],
         extra_h: Iterable[float] = (),
         extra_v: Iterable[float] = (),
     ) -> ParamSet:
-        return spacing.spacing_params(pairs, extra_h, extra_v)
+        return spacing.spacing_params(sequences, extra_h, extra_v)
 
 
 class RealRenderEngines(RealGeometryEngines):
