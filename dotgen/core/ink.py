@@ -1,22 +1,25 @@
 """The ink model shared by sampling, rendering and composition.
 
-A dot is stored as *darkness* -- how many grey levels darker than its own
-background a pixel is -- rather than as pixels.  That is what lets a dot
-sampled off one photograph be pasted onto a completely different background
-without dragging the original paper colour along with it.
+A dot is stored as *ink* -- the fraction of its own paper a pixel takes away --
+rather than as pixels.  That is what lets a dot sampled off one photograph be
+pasted onto a completely different background without dragging the original
+paper colour along with it.
 
 The rule the whole program is built on, for a pixel of brightness ``L`` sitting
 on a background of brightness ``B``::
 
-    D = B - L          when the dot is sampled
-    L = B - D          when it is drawn again somewhere else
+    I = (B - L) / B    when the dot is sampled
+    L = B * (1 - I)    when it is drawn again somewhere else
 
-so darkness is *absolute*, not a fraction of the paper it was measured on.  A
-dot photographed on light paper keeps the same 170 grey levels of bite when it
-is stamped onto a darker background; it does not fade in proportion.  Arrays
-carry ``D / 255`` so every patch stays a float32 in 0..1 and the PCA model,
-the thumbnails and the ``dot.*`` bars all keep working on the same numbers --
-:data:`LEVELS` is the one place that scale is written down.
+so ink is *proportional*, not an absolute count of grey levels: a dot that took
+80% of the light off the paper it was photographed on takes 80% off whatever
+paper it lands on.  Patches are float32 in 0..1 already, which is what the PCA
+model, the thumbnails and the ``dot.*`` bars all read.
+
+Two dots landing on the same pixel compose by the same rule -- the second takes
+its share of what the first left, ``1 - (1 - Ia)(1 - Ib)`` -- which is what
+fills the join between two overlapping dots instead of leaving the pale notch
+a ``max`` puts there.  Lifted from ``test1.py::extract_dot / paste_dot``.
 
 Nothing here imports Qt or knows about the GUI: phases 6, 7 and 9 all call
 these functions from headless code.
@@ -28,9 +31,6 @@ import cv2
 import numpy as np
 
 BRIGHT_FRACTION = 0.20
-
-# Grey levels in a full-range image.  Patches hold ``D / LEVELS``.
-LEVELS = 255.0
 
 # A BOD with fewer pixels than this is not an average, it is a coincidence --
 # the border ring is a better estimate than three stray pixels.
@@ -103,27 +103,29 @@ def _bright_median(flat: np.ndarray) -> float:
 
 
 def to_ink(gray: np.ndarray, bg: float) -> np.ndarray:
-    """``D = B - L`` in units of 1/255: 0 = untouched paper, 1 = 255 levels.
+    """``I = (B - L) / B``: 0 = untouched paper, 1 = all the light taken.
 
-    Absolute, not proportional.  Dividing by ``bg`` instead would store the
-    *fraction* of the paper a dot removes, and re-pasting that fraction onto a
-    darker background would silently make the dot fainter -- the same printed
-    dot would come out different on every photograph in the set.
+    Proportional, not absolute.  The division by ``bg`` is what makes the patch
+    a property of the dot rather than of the photograph it came off: a pixel
+    that sat at 20% of its paper is stored as 0.8, and pasting 0.8 onto any
+    other paper puts it at 20% of that one too.  ``bg`` is floored at 1 so a
+    black crop cannot divide by zero -- callers reject that case first anyway.
     """
     return np.clip(
-        (bg - gray.astype(np.float32)) / LEVELS, 0.0, 1.0
+        (bg - gray.astype(np.float32)) / max(float(bg), 1.0), 0.0, 1.0
     ).astype(np.float32)
 
 
 def paste_ink(img: np.ndarray, cx: int, cy: int, ink: np.ndarray) -> None:
     """Stamp a square ``ink`` patch onto ``img`` in place, centred on ``(cx, cy)``.
 
-    Subtractive model: ``L = B - D``.  ink = 0 keeps the target pixel exactly,
-    ink = 1 removes 255 levels and drives it to black, so the source background
-    is never carried across.  Works on 2-D grayscale and 3-channel BGR targets;
-    on colour the same darkness comes off every channel, which darkens the
-    paper without tinting it.  Anything falling outside the image is clipped
-    away silently; a fully out-of-bounds paste is a no-op.
+    Multiplicative model: ``L = B * (1 - I)``.  ink = 0 keeps the target pixel
+    exactly, ink = 1 drives it to black, and everything between takes its share
+    of whatever was there -- so the source background is never carried across.
+    Works on 2-D grayscale and 3-channel BGR targets; on colour the same
+    fraction comes off every channel, which darkens the paper without tinting
+    it.  Anything falling outside the image is clipped away silently; a fully
+    out-of-bounds paste is a no-op.
     """
     r = ink.shape[0] // 2
 
@@ -135,14 +137,14 @@ def paste_ink_rect(img: np.ndarray, x: int, y: int, ink: np.ndarray) -> None:
 
     The rectangular form of :func:`paste_ink`, and the one composition uses: a
     character is placed by the box that bounds its ink, which is not square and
-    so has no centre *pixel* to round to.  Same subtractive model, same silent
-    clipping.
+    so has no centre *pixel* to round to.  Same multiplicative model, same
+    silent clipping.
 
-    Two characters landing on the same pixel therefore *add* their darkness,
-    which is the overlap rule; the floor that keeps the sum from running past
-    the darkest dot involved is applied per dot, back in
-    :mod:`~dotgen.core.render_char`, where the dots that produced it are still
-    known.
+    Two characters landing on the same pixel therefore compose rather than
+    fight: the second takes its share of what the first left, so the join is
+    darker than either alone and still cannot pass black.  Dots inside one
+    character are combined the same way, back in
+    :mod:`~dotgen.core.render_char`.
     """
     h, w = ink.shape[:2]
 
@@ -162,7 +164,7 @@ def paste_ink_rect(img: np.ndarray, x: int, y: int, ink: np.ndarray) -> None:
     if roi.ndim == 3:
         sub = sub[:, :, None]
 
-    img[y1:y2, x1:x2] = np.clip(roi - sub * LEVELS, 0, 255).astype(img.dtype)
+    img[y1:y2, x1:x2] = np.clip(roi * (1.0 - sub), 0, 255).astype(img.dtype)
 
 
 def shift_image(

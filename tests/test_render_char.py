@@ -112,17 +112,18 @@ def relative_centers(result) -> np.ndarray:
 
 
 # ----------------------------------------------------------------------
-# Overlapping dots: Dab = Da + Db, floored at the darkest dot
+# Overlapping dots: Iab = 1 - (1 - Ia)(1 - Ib)
 # ----------------------------------------------------------------------
 
 
-def test_overlapping_dots_add_their_darkness():
-    """``Dab = Da + Db``.
+def test_overlapping_dots_compose_their_ink():
+    """``Iab = 1 - (1 - Ia)(1 - Ib)``.
 
     Two dots eight pixels apart both reach the pixel between them, four from
-    each centre.  Under the old ``max`` rule that pixel was as dark as one dot
-    made it and the join between two touching dots read as a valley; it is now
-    the sum, which is what a second layer of ink actually does.
+    each centre.  Under a ``max`` that pixel was only as dark as one dot made
+    it and the join between two touching dots read as a pale notch; the second
+    dot now takes its share of what the first left, which is what a second
+    layer of ink actually does.
     """
     patch = blob(amplitude=0.5)
     model = build_pca_model([sample(patch) for _ in range(6)])
@@ -135,16 +136,17 @@ def test_overlapping_dots_add_their_darkness():
 
     alone = float(patch[RADIUS, RADIUS - 4])
 
-    assert join == pytest.approx(2.0 * alone, rel=1e-5)
-    assert 2.0 * alone < float(patch.max())  # the cap is not what is under test
+    assert join == pytest.approx(1.0 - (1.0 - alone) ** 2, rel=1e-5)
+    assert join > alone          # no pale notch where the two rims meet
 
 
-def test_overlap_never_gets_darker_than_the_darkest_dot():
-    """``Lab = max(Lfloor, La + Lb - B)``.
+def test_overlap_saturates_at_the_darkest_dot():
+    """Ink has a blackest value and a second layer does not beat it.
 
-    Three dots two pixels apart sum to well over the blob's own peak; ink
-    saturates instead, so the darkest pixel of the character is the darkest
-    pixel of a dot -- no blacker.
+    Three dots two pixels apart compose to well past the blob's own peak, and
+    are held at it.  Measured off ``4dot.png``: a pair of dots 6 px apart has a
+    darkest pixel of grey 21 where the isolated dot beside it reads 23 -- two
+    levels, not the seventeen unchecked composition would have produced.
     """
     patch = blob(amplitude=0.5)
     model = build_pca_model([sample(patch) for _ in range(6)])
@@ -152,6 +154,26 @@ def test_overlap_never_gets_darker_than_the_darkest_dot():
     res = render_char(row_format(3), model, dist_params(h=2.0), "mean", rng(32))
 
     assert float(res.ink.max()) == pytest.approx(float(patch.max()), rel=1e-6)
+
+
+def test_the_cap_does_not_bite_where_dots_merely_touch():
+    """It bounds an intersection; it must not flatten an ordinary join.
+
+    Eight pixels apart the composed join is well under the dots' own peak, so
+    the clamp is inert and the filled join of the test above survives.
+    """
+    patch = blob(amplitude=0.5)
+    model = build_pca_model([sample(patch) for _ in range(6)])
+
+    res = render_char(row_format(2), model, dist_params(h=8.0), "mean", rng(31))
+
+    x0, y0 = res.dot_centers[0]
+    x1, _ = res.dot_centers[1]
+    join = float(res.ink[int(round(y0)), int(round((x0 + x1) / 2.0))])
+    alone = float(patch[RADIUS, RADIUS - 4])
+
+    assert join == pytest.approx(1.0 - (1.0 - alone) ** 2, rel=1e-5)
+    assert join < float(patch.max())
 
 
 def test_a_lone_dot_is_untouched_by_the_overlap_rule():

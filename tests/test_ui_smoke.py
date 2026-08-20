@@ -271,6 +271,44 @@ def test_tab1_test_panel_paints_a_dot(state, dotted_image, circle_roi):
     assert tab._test_image[80, 120].mean() < before[80, 120].mean()
 
 
+def test_tab1_test_panel_saturates_where_dots_overlap(state, dotted_image, circle_roi):
+    """The panel obeys the dataset's intersection rule, not one of its own.
+
+    Two clicks on the same spot compose and are then held at the dot's own
+    peak, because the panel builds its ink through ``compose_dots`` -- the same
+    function the renderer uses.  Pasting twice into the image instead, as it
+    used to, went on darkening without a limit.
+    """
+    tab = Tab1Sample(state)
+    state.add_sample_image("x.png", dotted_image)
+    tab._on_roi("circle", circle_roi((30, 40)))
+
+    tab._on_test_click(QPointF(120, 80))
+    once = int(tab._test_image.min())
+
+    tab._on_test_click(QPointF(120, 80))
+    twice = int(tab._test_image.min())
+
+    assert abs(twice - once) <= 1
+
+
+def test_tab1_test_panel_keeps_the_background_it_started_from(
+    state, dotted_image, circle_roi
+):
+    """Redrawing from the pristine background: an old dot is not re-darkened."""
+    tab = Tab1Sample(state)
+    state.add_sample_image("x.png", dotted_image)
+    tab._on_roi("circle", circle_roi((30, 40)))
+
+    tab._on_test_click(QPointF(40, 40))
+    first = tab._test_image[40, 40].copy()
+
+    for x in (100, 140, 180):
+        tab._on_test_click(QPointF(x, 40))
+
+    assert np.array_equal(tab._test_image[40, 40], first)
+
+
 def test_tab1_test_panel_reset_restores_white(state, dotted_image, circle_roi):
     tab = Tab1Sample(state)
     state.add_sample_image("x.png", dotted_image)

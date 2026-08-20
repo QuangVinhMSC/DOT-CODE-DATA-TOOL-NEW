@@ -28,8 +28,9 @@ from ...core import curve as curve_engine
 from ...core import perspective, registry, spacing
 from ...core.dot_extract import ExtractConfig
 from ...core.imageops import load_image, white_canvas
-from ...core.ink import paste_ink
+from ...core.ink import paste_ink_rect
 from ...core.models import CurveSpec, DotSequence, Quad, ROI
+from ...core.render_char import DEFAULT_PCA_SIGMA, compose_dots
 from ...core.state import MAX_DOT_SAMPLES, AppState
 from .. import theme
 from ..dialogs.bg_separate_dialog import BgSeparateDialog
@@ -73,6 +74,17 @@ class Tab1Sample(QWidget):
         # the select tool hands back an item and this is how it becomes state.
         self._overlay_refs: list[tuple[object, str, int]] = []
         self._test_image: np.ndarray | None = None
+
+        # The panel is redrawn from scratch on every click, so the untouched
+        # background has to survive: pasting ink is destructive, and the
+        # saturation cap needs the whole ink map, not a half-darkened image.
+        self._test_bg: np.ndarray | None = None
+
+        # (x, y, patch) per dot placed.  The *patch* is kept, not just the
+        # click: re-generating it on each redraw would reshuffle every dot
+        # already on the panel.
+        self._test_dots: list[tuple[float, float, np.ndarray]] = []
+        self._test_rng = np.random.default_rng()
         self._show_warp = False
         self._show_curve_fit = False
 
@@ -687,7 +699,9 @@ class Tab1Sample(QWidget):
 
     def _reset_test_panel(self) -> None:
         w, h = TEST_PANEL_SIZE
-        self._test_image = white_canvas(w, h)
+        self._test_bg = white_canvas(w, h)
+        self._test_dots = []
+        self._test_image = self._test_bg.copy()
         self.state.test_panel_bg = None
         self.test_canvas.set_image(self._test_image)
 
@@ -704,11 +718,22 @@ class Tab1Sample(QWidget):
             return
 
         self.state.test_panel_bg = img
+        self._test_bg = img
+        self._test_dots = []
         self._test_image = img.copy()
         self.test_canvas.set_image(self._test_image)
 
     def _on_test_click(self, pos) -> None:
-        if self._test_image is None:
+        """Place one dot the way the exporter would, then redraw the panel.
+
+        Three things follow the dataset rather than the old preview: the PCA
+        sigma is *drawn* from its bar instead of pinned to the mean (the export
+        path resolves it with ``mode=None``), the click keeps its fractional
+        position instead of being rounded onto the pixel grid, and the dots are
+        composed through :func:`~dotgen.core.render_char.compose_dots`, the same
+        function the renderer uses -- cap and all.
+        """
+        if self._test_bg is None:
             return
 
         model = self.state.dot_model
@@ -717,9 +742,24 @@ class Tab1Sample(QWidget):
             self.statusMessage.emit("Collect at least one dot sample first.")
             return
 
-        sigma = self.state.params.value_for("dot.pca_sigma", "mean", 1.0)
-        ink = registry.get_engines().render_dot(model, np.random.default_rng(), sigma)
-        paste_ink(self._test_image, int(round(pos.x())), int(round(pos.y())), ink)
+        p = self.state.params.get("dot.pca_sigma")
+        sigma = float(p.sample(self._test_rng)) if p is not None else DEFAULT_PCA_SIGMA
+
+        patch = registry.get_engines().render_dot(model, self._test_rng, sigma)
+
+        self._test_dots.append((float(pos.x()), float(pos.y()), patch))
+        self._redraw_test_panel()
+
+    def _redraw_test_panel(self) -> None:
+        """Rebuild the panel from the untouched background and every dot on it."""
+        if self._test_bg is None:
+            return
+
+        h, w = self._test_bg.shape[:2]
+        ink = compose_dots((h, w), self._test_dots)
+
+        self._test_image = self._test_bg.copy()
+        paste_ink_rect(self._test_image, 0, 0, ink)
         self.test_canvas.set_image(self._test_image, keep_view=True)
 
     # ==================================================================

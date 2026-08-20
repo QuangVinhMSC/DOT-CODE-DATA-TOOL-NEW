@@ -29,7 +29,7 @@ character through this same function.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Iterable, Literal
 
 import cv2
 import numpy as np
@@ -360,16 +360,26 @@ def _deform(patch: np.ndarray, scale: tuple[float, float]) -> np.ndarray:
 
 
 def _paste_dark(
-    acc: np.ndarray, cap: np.ndarray, cx: int, cy: int, patch: np.ndarray
+    keep: np.ndarray, cap: np.ndarray, cx: int, cy: int, patch: np.ndarray
 ) -> None:
-    """Add one dot's darkness to the map, and record the floor it comes with.
+    """Lay one dot's ink over what is there, and record the ceiling it brings.
 
-    Overlapping dots add: ``Dab = Da + Db``, so a pixel two dots both reach is
-    darker than either made it alone.  What it may *not* be is darker than the
-    darkest pixel of the dots involved -- ink saturates, and a printed dot has
-    a blackest value it simply does not go past.  ``cap`` carries that limit
-    per pixel as the largest peak of any dot covering it, and :func:`_combine`
-    applies it once every dot has been laid down.
+    ``keep`` is the fraction of the paper still showing -- 1 where nothing has
+    been drawn.  Each dot multiplies it by ``1 - I``, exactly as
+    :func:`~dotgen.core.ink.paste_ink` does to a photograph, so laying dots one
+    after another composes them: two dots reaching the same pixel leave
+    ``(1 - Ia)(1 - Ib)`` of the paper, i.e. ``I = Ia + Ib - Ia*Ib``.  That is
+    what closes the join between two overlapping dots; under a ``max`` the join
+    was only as dark as the darker rim, the pale notch between two dots that
+    visibly touch.
+
+    Composing alone would run away where dots properly intersect, though.
+    Measured off ``4dot.png`` -- an isolated dot beside a pair 6 px apart on
+    157-grey paper -- the pair's darkest pixel is 21 against the lone dot's 23:
+    real ink saturates, a second layer of it does not go blacker than the first
+    can.  Unchecked composition reaches grey 4 by the time the centres are 3 px
+    apart.  ``cap`` therefore carries, per pixel, the peak of the darkest dot
+    covering it, and :func:`compose_dots` clamps to it at the end.
 
     Anything outside the canvas is dropped rather than raising -- a jittered
     dot at the border is normal, not an error.
@@ -381,24 +391,41 @@ def _paste_dark(
     px1 = max(0, -x1)
     py1 = max(0, -y1)
     x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(acc.shape[1], x2), min(acc.shape[0], y2)
+    x2, y2 = min(keep.shape[1], x2), min(keep.shape[0], y2)
 
     if x2 <= x1 or y2 <= y1:
         return
 
     sub = patch[py1 : py1 + (y2 - y1), px1 : px1 + (x2 - x1)]
 
-    acc[y1:y2, x1:x2] += sub
+    keep[y1:y2, x1:x2] *= 1.0 - sub
     np.maximum(cap[y1:y2, x1:x2], float(sub.max(initial=0.0)), out=cap[y1:y2, x1:x2])
 
 
-def _combine(acc: np.ndarray, cap: np.ndarray) -> np.ndarray:
-    """``Dab = min(Da + Db, floor)`` -- the summed darkness, saturated.
+def compose_dots(
+    shape: tuple[int, int], dots: Iterable[tuple[float, float, np.ndarray]]
+) -> np.ndarray:
+    """Ink map for a set of placed dots: composed, then saturated.
 
-    Away from an overlap this changes nothing: a lone dot's pixels are all at
-    or under its own peak, which is exactly what ``cap`` holds there.
+    ``dots`` are ``(x, y, patch)`` at float positions -- the fractional part is
+    handed to :func:`~dotgen.core.ink.shift_image`, so a dot is not quantised to
+    the pixel grid it happens to land near.
+
+    This is the *only* place dots become an ink map.  Tab 1's test panel calls
+    it as well as the renderer does, because the two used to implement the rule
+    separately and quietly drifted apart: the panel was showing joins the
+    dataset would never contain.
     """
-    return np.clip(np.minimum(acc, cap), 0.0, 1.0).astype(np.float32)
+    h, w = shape
+    keep = np.ones((h, w), dtype=np.float32)
+    cap = np.zeros((h, w), dtype=np.float32)
+
+    for x, y, patch in dots:
+        ix = int(round(x))
+        iy = int(round(y))
+        _paste_dark(keep, cap, ix, iy, shift_image(patch, x - ix, y - iy))
+
+    return np.clip(np.minimum(1.0 - keep, cap), 0.0, 1.0).astype(np.float32)
 
 
 def _measure_bbox(ink: np.ndarray) -> tuple[float, float, float, float]:
@@ -506,11 +533,10 @@ def render_char(
     width = int(np.ceil(max_x - min_x)) + margin * 2
     height = int(np.ceil(max_y - min_y)) + margin * 2
 
-    acc = np.zeros((height, width), dtype=np.float32)
-    cap = np.zeros((height, width), dtype=np.float32)
     fallback = None if model is not None else _gaussian_blob(radius)
 
     dot_centers: list[tuple[float, float]] = []
+    placed: list[tuple[float, float, np.ndarray]] = []
 
     for i in range(n):
         if i in plan.missing:
@@ -528,13 +554,9 @@ def render_char(
         x = float(centres[i, 0]) + off_x
         y = float(centres[i, 1]) + off_y
         dot_centers.append((x, y))
+        placed.append((x, y, patch))
 
-        ix = int(round(x))
-        iy = int(round(y))
-
-        _paste_dark(acc, cap, ix, iy, shift_image(patch, x - ix, y - iy))
-
-    ink = _combine(acc, cap)
+    ink = compose_dots((height, width), placed)
     origin = (float(pts[n, 0] + off_x), float(pts[n, 1] + off_y))
 
     return RenderedChar(

@@ -303,29 +303,29 @@ def test_a_bod_with_no_paper_in_it_falls_back_to_the_border_ring():
     )
 
 
-def test_to_ink_is_the_absolute_darkness_b_minus_l():
-    """``D = B - L``, in units of 1/255 -- not a fraction of the paper."""
+def test_to_ink_is_the_fraction_of_the_paper_taken():
+    """``I = (B - L) / B`` -- a share of the paper, not a count of levels."""
     gray = np.array([[200, 100, 0]], np.uint8)
     ink = to_ink(gray, 200.0)
 
     assert ink.dtype == np.float32
     assert ink[0, 0] == pytest.approx(0.0)
-    assert ink[0, 1] == pytest.approx(100.0 / 255.0)
-    assert ink[0, 2] == pytest.approx(200.0 / 255.0)
+    assert ink[0, 1] == pytest.approx(0.5)
+    assert ink[0, 2] == pytest.approx(1.0)
 
 
-def test_to_ink_gives_the_same_darkness_on_light_and_dark_paper():
-    """The point of an absolute D: identical bite, whatever B was.
+def test_to_ink_reads_the_same_share_off_light_and_dark_paper():
+    """The point of a proportional I: the same *share*, whatever B was.
 
-    The old proportional model made the darker sample read as *more* ink for
-    the same 80 levels of bite, and a dot sampled off a shaded photograph then
-    came out heavier than the same dot sampled off a bright one.
+    A dot sitting at 40% of its paper reads 0.6 whether that paper was
+    photographed bright or shaded, which is what makes patches collected off
+    different images comparable enough to fit one PCA model to.
     """
-    light = to_ink(np.array([[220 - 80]], np.uint8), 220.0)
-    dark = to_ink(np.array([[120 - 80]], np.uint8), 120.0)
+    light = to_ink(np.array([[int(220 * 0.4)]], np.uint8), 220.0)
+    dark = to_ink(np.array([[int(120 * 0.4)]], np.uint8), 120.0)
 
-    assert float(light[0, 0]) == pytest.approx(float(dark[0, 0]))
-    assert float(light[0, 0]) == pytest.approx(80.0 / 255.0)
+    assert float(light[0, 0]) == pytest.approx(float(dark[0, 0]), abs=0.01)
+    assert float(light[0, 0]) == pytest.approx(0.6, abs=0.01)
 
 
 def test_to_ink_never_goes_negative_on_pixels_brighter_than_paper():
@@ -334,30 +334,30 @@ def test_to_ink_never_goes_negative_on_pixels_brighter_than_paper():
     assert ink[0, 0] == 0.0
 
 
-def test_paste_ink_subtracts_darkness_and_spares_zero_pixels():
-    """``L = B - D``: 0.5 takes 127 levels off, not half the pixel."""
+def test_paste_ink_takes_its_share_and_spares_zero_pixels():
+    """``L = B * (1 - I)``: 0.5 takes half the pixel, whatever it was."""
     canvas = np.full((20, 20, 3), 200, np.uint8)
     ink = np.zeros((5, 5), np.float32)
     ink[2, 2] = 0.5
 
     paste_ink(canvas, 10, 10, ink)
 
-    assert tuple(canvas[10, 10]) == (72, 72, 72)  # 200 - 127.5, truncated
+    assert tuple(canvas[10, 10]) == (100, 100, 100)
     assert tuple(canvas[10, 11]) == (200, 200, 200)
     assert tuple(canvas[0, 0]) == (200, 200, 200)
 
 
-def test_paste_ink_removes_the_same_levels_from_any_background():
-    """The same dot bites equally hard into light and dark paper."""
+def test_paste_ink_removes_the_same_share_from_any_background():
+    """The same dot takes the same *proportion* off light and dark paper."""
     light = np.full((9, 9), 240, np.uint8)
     dark = np.full((9, 9), 120, np.uint8)
-    ink = np.full((3, 3), 40.0 / 255.0, np.float32)
+    ink = np.full((3, 3), 0.25, np.float32)
 
     paste_ink(light, 4, 4, ink)
     paste_ink(dark, 4, 4, ink)
 
-    assert int(light[4, 4]) == 200
-    assert int(dark[4, 4]) == 80
+    assert int(light[4, 4]) == 180
+    assert int(dark[4, 4]) == 90
 
 
 def test_paste_ink_works_on_a_grayscale_target():
@@ -366,7 +366,7 @@ def test_paste_ink_works_on_a_grayscale_target():
 
     paste_ink(canvas, 10, 10, ink)
 
-    assert canvas[10, 10] == 149
+    assert canvas[10, 10] == 160
     assert canvas[0, 0] == 200
 
 
@@ -378,15 +378,20 @@ def test_paste_ink_never_drives_a_pixel_past_black():
     assert canvas[4, 4] == 0
 
 
-def test_two_pastes_on_one_pixel_add_their_darkness():
-    """Characters that overlap on the page sum, exactly as dots do."""
+def test_two_pastes_on_one_pixel_compose_their_ink():
+    """Characters that overlap on the page compose, exactly as dots do.
+
+    The second takes its share of what the first left, so the pixel is darker
+    than either paste alone and still cannot run past black.
+    """
     canvas = np.full((9, 9), 200, np.uint8)
-    ink = np.full((3, 3), 30.0 / 255.0, np.float32)
+    ink = np.full((3, 3), 0.5, np.float32)
 
     paste_ink(canvas, 4, 4, ink)
-    paste_ink(canvas, 4, 4, ink)
+    assert canvas[4, 4] == 100
 
-    assert canvas[4, 4] == 140
+    paste_ink(canvas, 4, 4, ink)
+    assert canvas[4, 4] == 50
 
 
 def test_paste_ink_clips_at_the_image_edge():
