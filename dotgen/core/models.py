@@ -290,6 +290,18 @@ class DotLink:
         return DotLink(int(d["a"]), int(d["b"]), d["axis"], float(d["coeff"]))
 
 
+# A space puts no ink on the page, so its size cannot be read off dots and
+# links the way every other character's is.  It carries one coefficient
+# instead and measures ``space_coeff * dist.h`` across -- the same "n units of
+# the horizontal distance" the connectors elsewhere in Tab 2 mean.
+SPACE_CHAR = " "
+
+# What a fresh space starts at: the five columns of a 5x7 character plus the
+# blank column that separates it from the next one, which is the advance a
+# printed space has always had.  The user retunes it against their own print.
+DEFAULT_SPACE_COEFF = 6.0
+
+
 @dataclass
 class CharFormat:
     char: str
@@ -297,6 +309,32 @@ class CharFormat:
     grid_h: int = 7
     dots: list[tuple[int, int]] = field(default_factory=list)  # (col, row)
     links: list[DotLink] = field(default_factory=list)
+    # Not None turns this format into a space of that many horizontal units.
+    space_coeff: float | None = None
+
+    # ------------------------------------------------------------------
+    @property
+    def is_space(self) -> bool:
+        """Whether this format is a declared blank rather than a drawing."""
+        return self.space_coeff is not None
+
+    def space_width(self, dist_h: float) -> float:
+        """How far this space moves the line cursor, in pixels.
+
+        Zero for a format that is not a space, because a drawn character does
+        not advance the cursor by its own width -- the line's character spacing
+        does that, and mixing the two would silently re-space every job.
+        """
+        if not self.is_space:
+            return 0.0
+
+        return max(0.0, float(self.space_coeff or 0.0) * float(dist_h))
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def space(char: str = SPACE_CHAR, coeff: float = DEFAULT_SPACE_COEFF) -> "CharFormat":
+        """The pre-configured space Tab 2 offers, ready to save."""
+        return CharFormat(char, space_coeff=float(coeff))
 
     # ------------------------------------------------------------------
     def index_of(self, col: int, row: int) -> int | None:
@@ -339,17 +377,51 @@ class CharFormat:
     def links_on(self, axis: Axis) -> list[DotLink]:
         return [l for l in self.links if l.axis == axis]
 
+    def spans(self) -> tuple[bool, bool]:
+        """Whether the painted dots extend along (horizontal, vertical).
+
+        ':' occupies one column and two rows, so it spans the vertical axis
+        only; '-' is the mirror case; a lone '.' spans neither.  An axis with
+        no extent has no pitch to fix, which is what decides how many
+        constraints the character needs.
+        """
+        if not self.dots:
+            return (False, False)
+
+        cols = {c for c, _ in self.dots}
+        rows = {r for _, r in self.dots}
+
+        return (len(cols) > 1, len(rows) > 1)
+
+    def dimension(self) -> int:
+        """0 for a single dot, 1 for a pure row or column, 2 for a real shape."""
+        span_h, span_v = self.spans()
+
+        return int(span_h) + int(span_v)
+
     # ------------------------------------------------------------------
     def validate(self) -> list[str]:
-        """Draft rule: exactly one vertical and one horizontal constraint.
+        """One constraint per axis the character actually spans.
 
-        Not fewer, not more.  Returns human-readable errors; empty means the
-        format may be saved.
+        A 2-D character needs both, a 1-D one (':', '-') needs only the
+        constraint along the axis it extends -- the flat axis has no pitch to
+        fix, and a link there could not even be drawn -- and a single dot needs
+        none.  Extra constraints stay an error either way: two links on one
+        axis can disagree about the pitch.
+
+        A space is the one format that has no dots to constrain: it is a width
+        and nothing else, so it is checked against its own single rule and the
+        drawing rules are skipped rather than failed.
+
+        Returns human-readable errors; empty means the format may be saved.
         """
+        if self.is_space:
+            return self._validate_space()
+
         errors: list[str] = []
 
-        if len(self.dots) < 2:
-            errors.append("A character needs at least 2 dots.")
+        if not self.dots:
+            errors.append("A character needs at least 1 dot.")
 
         n = len(self.dots)
 
@@ -375,14 +447,22 @@ class CharFormat:
                 elif ca == cb:
                     errors.append("A horizontal constraint must join dots in different columns.")
 
-        nv = len(self.links_on("v"))
-        nh = len(self.links_on("h"))
+        span_h, span_v = self.spans()
 
-        if nv != 1:
-            errors.append(f"Needs exactly 1 vertical constraint (has {nv}).")
+        for axis, spans, name, flat in (
+            ("h", span_h, "horizontal", "column"),
+            ("v", span_v, "vertical", "row"),
+        ):
+            count = len(self.links_on(axis))
 
-        if nh != 1:
-            errors.append(f"Needs exactly 1 horizontal constraint (has {nh}).")
+            if spans:
+                if count != 1:
+                    errors.append(f"Needs exactly 1 {name} constraint (has {count}).")
+            elif count:
+                errors.append(
+                    f"All dots share one {flat}: no {name} constraint is needed "
+                    f"(has {count})."
+                )
 
         # de-duplicate while preserving order
         seen: set[str] = set()
@@ -395,6 +475,23 @@ class CharFormat:
 
         return out
 
+    def _validate_space(self) -> list[str]:
+        """The space's own rules: a positive width, and nothing drawn."""
+        errors: list[str] = []
+
+        if float(self.space_coeff or 0.0) <= 0:
+            errors.append(
+                f"The space width must be > 0 units (got {self.space_coeff:g})."
+            )
+
+        if self.dots or self.links:
+            errors.append(
+                "A space is blank: remove its dots, or clear its width to draw "
+                "an ordinary character."
+            )
+
+        return errors
+
     def copy(self) -> "CharFormat":
         return CharFormat(
             self.char,
@@ -402,6 +499,7 @@ class CharFormat:
             self.grid_h,
             list(self.dots),
             [DotLink(l.a, l.b, l.axis, l.coeff) for l in self.links],
+            self.space_coeff,
         )
 
     def to_dict(self) -> dict:
@@ -411,17 +509,54 @@ class CharFormat:
             "grid_h": self.grid_h,
             "dots": [list(d) for d in self.dots],
             "links": [l.to_dict() for l in self.links],
+            "space_coeff": self.space_coeff,
         }
 
     @staticmethod
     def from_dict(d: dict) -> "CharFormat":
+        # Absent in every config written before spaces existed, where it means
+        # "an ordinary character" -- which is what None already says.
+        coeff = d.get("space_coeff")
+        char = d["char"]
+        dots = [tuple(x) for x in d["dots"]]
+
+        # The one migration: before Tab 2 could describe a space, the only way
+        # to put one on a line was to save whitespace with nothing drawn on it.
+        # That format has always been *invalid* -- "a character needs at least 1
+        # dot" -- so it locked Tab 3 while still being the only blank available.
+        # It is unambiguously a space, so it is read back as one.
+        if coeff is None and char.isspace() and not dots:
+            coeff = DEFAULT_SPACE_COEFF
+
         return CharFormat(
-            d["char"],
+            char,
             int(d["grid_w"]),
             int(d["grid_h"]),
-            [tuple(x) for x in d["dots"]],
+            dots,
             [DotLink.from_dict(x) for x in d["links"]],
+            None if coeff is None else float(coeff),
         )
+
+
+def is_blank_char(char: str, formats: dict[str, CharFormat]) -> bool:
+    """Whether ``char`` puts no ink on the page.
+
+    A character Tab 2 marked as a space is one, and so is any whitespace that
+    has no format at all -- which is what a line holds while the user is still
+    typing it.  Used to keep spaces out of the class list: a blank has nothing
+    to detect, so asking Tab 5 to give it a class would only produce an error
+    the user cannot fix.
+    """
+    fmt = formats.get(char)
+
+    if fmt is not None:
+        # A format with nothing drawn on it puts no ink on the page whether or
+        # not it calls itself a space, and :func:`compose` gives it no box.
+        # Asking Tab 5 for a class it can never earn would only produce an
+        # error the user cannot fix, and an empty class in the dataset.
+        return fmt.is_space or not fmt.dots
+
+    return char.isspace()
 
 
 # ======================================================================
@@ -564,7 +699,11 @@ class ClassDef:
 
 @dataclass
 class ExportSpec:
-    fmt: Literal["yolo"] = "yolo"
+    # "yolo" is the axis-aligned detection format (one box per line, five
+    # numbers); "yolo-obb" is ultralytics' oriented format (four corners, eight
+    # numbers).  Both share the same ``data.yaml`` and the same class indices,
+    # so the choice is only about the shape of a label line.
+    fmt: Literal["yolo", "yolo-obb"] = "yolo"
     out_dir: str = ""
     images_per_job: int = 100
     seed: int = 1234
@@ -604,13 +743,17 @@ class Job:
     classes: list[ClassDef] = field(default_factory=list)
 
     def characters(self) -> list[str]:
-        """Every character that can be drawn, replacements included."""
+        """Every character that can be *drawn*, replacements included.
+
+        Spaces are left out: they put no ink on the page, so they get no
+        bounding box, and a class for them would be a class with nothing in it.
+        """
         out: list[str] = []
 
         for line in self.lines:
             for spec in line.chars:
                 for c in spec.alphabet():
-                    if c not in out:
+                    if c not in out and not is_blank_char(c, self.char_formats):
                         out.append(c)
 
         return sorted(out)
@@ -665,6 +808,19 @@ class RenderedChar:
 
 @dataclass
 class ComposedImage:
+    """One rendered sample and the labels that describe it.
+
+    ``quads`` is the oriented form of ``boxes``: same classes, same order, one
+    entry each, ``(name, x1, y1, x2, y2, x3, y3, x4, y4)`` normalised.  Keeping
+    the two lists parallel is what lets the exporter switch between ``yolo`` and
+    ``yolo-obb`` without changing which objects get labelled or how the report
+    counts them.  A producer that only knows axis-aligned boxes may leave it
+    empty; the exporter then derives the corners from the boxes.
+    """
+
     image: np.ndarray  # BGR uint8
     boxes: list[tuple[str, float, float, float, float]] = field(default_factory=list)
+    quads: list[tuple[str, float, float, float, float, float, float, float, float]] = field(
+        default_factory=list
+    )
     meta: dict = field(default_factory=dict)

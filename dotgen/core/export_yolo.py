@@ -1,8 +1,15 @@
 """The YOLO dataset writer.
 
 Everything that knows what a YOLO folder looks like lives here: the directory
-layout, ``data.yaml``, the five numbers of a label line, the split assignment
-and the report.  :mod:`exporter` drives it; the GUI drives :mod:`exporter`.
+layout, ``data.yaml``, the numbers of a label line, the split assignment and the
+report.  :mod:`exporter` drives it; the GUI drives :mod:`exporter`.
+
+Two label formats share all of that.  ``yolo`` writes the axis-aligned
+``<cls> cx cy w h``; ``yolo-obb`` writes ultralytics' oriented
+``<cls> x1 y1 x2 y2 x3 y3 x4 y4``.  Only the label line differs: same folders,
+same ``data.yaml``, same class indices, same images -- so a dataset can be
+re-exported in the other format without renumbering anything, and the report
+counts the same objects either way.
 
 Three properties this module exists to guarantee:
 
@@ -45,6 +52,11 @@ from .models import ExportSpec, Job
 
 SPLITS = ("train", "val", "test")
 
+# What ``spec.fmt`` may be.  The GUI's format list and the pre-flight both read
+# this, so adding a format here is the only place it has to be named.
+FORMATS = ("yolo", "yolo-obb")
+OBB = "yolo-obb"
+
 # The golden-ratio sequence spreads image indices over the splits evenly even
 # for a handful of images; a plain ``index % 100`` would put a 6-image export
 # entirely in train and leave val/test empty.
@@ -54,10 +66,15 @@ Progress = Callable[[int, int], bool]
 
 __all__ = [
     "ExportReport",
+    "FORMATS",
     "GOLDEN",
+    "OBB",
     "SPLITS",
     "image_seed",
     "label_lines",
+    "obb_label_lines",
+    "quad_from_box",
+    "quads_for",
     "split_of",
     "write_data_yaml",
     "write_dataset",
@@ -79,6 +96,7 @@ class ExportReport:
     """
 
     out_dir: str = ""
+    fmt: str = "yolo"
     classes: list[str] = field(default_factory=list)
     images: int = 0
     boxes: int = 0
@@ -101,6 +119,7 @@ class ExportReport:
     def to_dict(self) -> dict:
         return {
             "out_dir": self.out_dir,
+            "fmt": self.fmt,
             "seed": self.seed,
             "classes": list(self.classes),
             "images": self.images,
@@ -173,8 +192,52 @@ def label_lines(
     return out
 
 
+def quad_from_box(box: tuple[float, float, float, float]) -> tuple[float, ...]:
+    """``(cx, cy, w, h)`` as four corners, clockwise from the top-left.
+
+    The fallback for a producer that only reports axis-aligned boxes: an upright
+    rectangle *is* an oriented box, just an uninteresting one, so an OBB export
+    stays possible instead of failing on the engine that fed it.
+    """
+    cx, cy, bw, bh = box
+    x0, y0 = cx - bw / 2.0, cy - bh / 2.0
+    x1, y1 = cx + bw / 2.0, cy + bh / 2.0
+
+    return (x0, y0, x1, y0, x1, y1, x0, y1)
+
+
+def quads_for(composed) -> list[tuple]:
+    """The oriented labels of a composed image, derived if it has none."""
+    if composed.quads:
+        return list(composed.quads)
+
+    return [(name, *quad_from_box(box)) for name, *box in composed.boxes]
+
+
+def obb_label_lines(quads: Iterable[tuple], index: dict[str, int]) -> list[str]:
+    """``"<idx> x1 y1 x2 y2 x3 y3 x4 y4"`` per quad, in ultralytics' OBB format.
+
+    Same rule as :func:`label_lines` for a class that is not in the index: the
+    object stays drawn and goes unlabelled rather than shifting the numbering.
+    """
+    out: list[str] = []
+
+    for name, *coords in quads:
+        if name not in index:
+            continue
+
+        out.append(
+            f"{index[name]} " + " ".join(f"{_clip01(v):.6f}" for v in coords)
+        )
+
+    return out
+
+
 def write_data_yaml(out_dir: str, names: list[str]) -> str:
     """The dataset descriptor ``ultralytics`` reads.  Returns its path.
+
+    The same file serves both formats -- an OBB dataset is told apart by the
+    task, not the descriptor -- so nothing here depends on ``spec.fmt``.
 
     No ``path:`` key, deliberately.  ``ultralytics`` resolves a *relative*
     ``path`` against its own global datasets directory -- so the obvious
@@ -243,12 +306,16 @@ def write_dataset(
 ) -> ExportReport:
     """Write every job into one YOLO dataset under ``spec.out_dir``.
 
+    ``spec.fmt`` picks the label format -- ``"yolo"`` for axis-aligned boxes,
+    ``"yolo-obb"`` for oriented ones.  Everything else about the run, the images
+    included, is identical between the two.
+
     ``progress(done, total)`` is called once per attempted image and returns
     ``False`` to cancel; the partial directory left behind is consistent (every
     image has its label) and the report says ``cancelled``.
 
     Raises ``ValueError`` when there is nothing to write -- no output directory,
-    no jobs, or no enabled class in any job.
+    no jobs, no enabled class in any job -- or when the format is unknown.
     """
     out_dir = spec.out_dir
 
@@ -258,12 +325,16 @@ def write_dataset(
     if not jobs:
         raise ValueError("No jobs to export.")
 
+    if spec.fmt not in FORMATS:
+        raise ValueError(f"Unknown export format '{spec.fmt}'.")
+
     names = dataset_classes(jobs)
 
     if not names:
         raise ValueError("No enabled classes in any job.")
 
     index = class_index(names)
+    obb = spec.fmt == OBB
     started = time.perf_counter()
 
     for split in SPLITS:
@@ -274,6 +345,7 @@ def write_dataset(
 
     report = ExportReport(
         out_dir=out_dir,
+        fmt=str(spec.fmt),
         classes=names,
         requested=len(jobs) * max(int(spec.images_per_job), 0),
         class_counts={n: 0 for n in names},
@@ -333,7 +405,11 @@ def write_dataset(
 
             split = split_of(done, spec.split)
             name = f"{stem}_{bg_index}_{n:05d}"
-            lines = label_lines(composed.boxes, index)
+            lines = (
+                obb_label_lines(quads_for(composed), index)
+                if obb
+                else label_lines(composed.boxes, index)
+            )
 
             # Image first, then label, then the counters: nothing between these
             # two writes can cancel, so the pair is always complete.

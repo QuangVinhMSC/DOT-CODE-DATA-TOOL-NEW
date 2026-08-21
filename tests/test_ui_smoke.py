@@ -5,12 +5,21 @@ every tab, drive the widgets, and check the state that came out.  They must all
 pass against the stub engines.
 """
 
+import os
+
 import numpy as np
 import pytest
 from PySide6.QtCore import QEvent, QPointF, Qt
 from PySide6.QtGui import QMouseEvent
 
-from dotgen.core.models import CharFormat, DotLink, DotSequence, Quad
+from dotgen.core.models import (
+    DEFAULT_SPACE_COEFF,
+    SPACE_CHAR,
+    CharFormat,
+    DotLink,
+    DotSequence,
+    Quad,
+)
 from dotgen.core.registry import get_engines
 from dotgen.ui.main_window import MainWindow
 from dotgen.ui.tabs.tab1_sample import Tab1Sample
@@ -990,6 +999,55 @@ def test_tab2_keeps_each_character_independent(state):
     assert len(tab.canvas.fmt.dots) == 3
 
 
+def test_tab2_offers_a_pre_configured_space(state):
+    """Selecting it is enough: the space is valid and saveable straight away."""
+    tab = Tab2Matrix(state)
+    tab._select_char(SPACE_CHAR)
+
+    assert tab.canvas.fmt.is_space
+    assert tab.canvas.fmt.space_coeff == DEFAULT_SPACE_COEFF
+    assert tab.save_button.isEnabled() is True
+
+    tab._save()
+
+    assert state.char_formats[SPACE_CHAR].space_coeff == DEFAULT_SPACE_COEFF
+
+
+def test_tab2_swaps_the_grid_out_for_the_space_width(state):
+    tab = Tab2Matrix(state)
+
+    tab._select_char(SPACE_CHAR)
+    assert tab.pages.currentIndex() == 1
+    assert tab.grid_w.isEnabled() is False
+
+    tab._select_char("0")
+    assert tab.pages.currentIndex() == 0
+    assert tab.grid_w.isEnabled() is True
+
+
+def test_tab2_space_width_is_a_ratio_of_the_horizontal_unit(state):
+    tab = Tab2Matrix(state)
+    state.add_dot_sequence(DotSequence.pair((0, 0), (12, 0), "h"))
+    tab._select_char(SPACE_CHAR)
+
+    tab.space_spin.setValue(2.5)
+
+    assert tab.canvas.fmt.space_coeff == 2.5
+    assert "30.00 px" in tab.space_readout.text()
+    assert "x dist.h" in tab.preview.text()
+
+
+def test_tab2_clear_returns_the_space_to_its_default_width(state):
+    tab = Tab2Matrix(state)
+    tab._select_char(SPACE_CHAR)
+    tab.space_spin.setValue(1.5)
+
+    tab._clear()
+
+    assert tab.canvas.fmt.space_coeff == DEFAULT_SPACE_COEFF
+    assert tab.space_spin.value() == DEFAULT_SPACE_COEFF
+
+
 def test_tab2_preview_uses_the_distance_units(state):
     tab = Tab2Matrix(state)
     state.add_dot_sequence(DotSequence.pair((0, 0), (12, 0), "h"))
@@ -1194,6 +1252,20 @@ def test_tab4_line_editor_drives_the_state(state, backgrounds):
     assert state.job_characters() == ["1", "2", "7"]
     assert state.lines[0].char_spacing == 25.0
     assert state.line_gaps[0].coeff == 3.0
+
+
+def test_tab4_puts_a_space_on_a_line_without_giving_it_a_class(state, backgrounds):
+    tab = Tab4Job(state)
+    state.add_background("a.png", backgrounds[0])
+    state.save_char_format(CharFormat.space())
+
+    tab.line_editor.addLineRequested.emit()
+    tab.line_editor.addCharRequested.emit(0, "1")
+    tab.line_editor.addCharRequested.emit(0, SPACE_CHAR)
+    tab.line_editor.addCharRequested.emit(0, "2")
+
+    assert [c.char for c in state.lines[0].chars] == ["1", SPACE_CHAR, "2"]
+    assert state.job_characters() == ["1", "2"]
 
 
 def test_tab4_defect_spinboxes_push_into_the_state(state):
@@ -1507,3 +1579,35 @@ def test_gating_reason_is_reported_for_each_locked_tab(state):
     assert "character format" in reasons[2]
     assert "background" in reasons[4]
     assert "class list" in reasons[5]
+
+
+def test_tab6_updates_the_progress_dialog_on_the_gui_thread(state, tmp_path, make_job):
+    """The export freeze: a closure slot is not a QObject, so Qt called it in
+    the worker thread and every dialog.setValue() touched a widget from there.
+    """
+    from PySide6.QtCore import QThread
+    from PySide6.QtWidgets import QProgressDialog
+
+    gui = QThread.currentThread()
+    threads: set[str] = set()
+    original = QProgressDialog.setValue
+
+    def spy(self, value):
+        threads.add("gui" if QThread.currentThread() is gui else "worker")
+        return original(self, value)
+
+    state.jobs = [make_job(("12",)), make_job(("34",))]
+    state.set_export(out_dir=str(tmp_path), images_per_job=2)
+
+    tab = Tab6Export(state)
+    tab._show_report = lambda report: None
+
+    QProgressDialog.setValue = spy
+
+    try:
+        tab._export()
+    finally:
+        QProgressDialog.setValue = original
+
+    assert threads == {"gui"}
+    assert len(os.listdir(tmp_path / "images" / "train")) >= 1

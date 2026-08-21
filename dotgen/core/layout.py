@@ -40,7 +40,7 @@ from . import perspective
 from .classes import resolve_char_class, resolve_line_class
 from .models import BackgroundSpec, CharSpec, Job, Quad
 from .params import ParamSet
-from .render_char import DEFAULT_DIST_V, INK_FLOOR, render_char
+from .render_char import DEFAULT_DIST_H, DEFAULT_DIST_V, INK_FLOOR, render_char
 
 # Placement attempts before giving up.  Each one shrinks the block a little and
 # draws a fresh translation, so the two searches run together.
@@ -134,16 +134,46 @@ def _pick_char(spec: CharSpec, rng: np.random.Generator) -> str:
     return alphabet[int(rng.integers(len(alphabet)))]
 
 
-def _image_dist_v(params: ParamSet, rng: np.random.Generator) -> float:
-    """The vertical unit for this image, drawn once and shared by every gap.
+def _image_dist(
+    params: ParamSet, key: str, default: float, rng: np.random.Generator
+) -> float:
+    """One distance unit for this image, drawn once and shared by everything.
 
     Drawing it per line would make the same ``<----2----->`` mean a different
-    number of pixels between line 1-2 and line 2-3 of the same page.
+    number of pixels between line 1-2 and line 2-3 of the same page, and the
+    same space measure differently at each end of a line.
     """
-    p = params.get("dist.v")
-    value = DEFAULT_DIST_V if p is None else p.sample(rng)
+    p = params.get(key)
+    value = default if p is None else p.sample(rng)
 
-    return value if value > 0.0 else DEFAULT_DIST_V
+    return value if value > 0.0 else default
+
+
+def _image_dist_v(params: ParamSet, rng: np.random.Generator) -> float:
+    """The vertical unit, which every inter-line gap is a multiple of."""
+    return _image_dist(params, "dist.v", DEFAULT_DIST_V, rng)
+
+
+def _space_advances(job: Job, rng: np.random.Generator) -> dict[str, float]:
+    """How far each space character moves the line cursor, in pixels.
+
+    Empty -- and, crucially, costing no randomness at all -- unless a space is
+    actually *on* a line.  A job that never writes one draws the same numbers
+    out of the same seed as it always did and reproduces its old images
+    exactly, and that stays true after the user saves a space in Tab 2 without
+    having put it anywhere yet.
+    """
+    used = {c for line in job.lines for spec in line.chars for c in spec.alphabet()}
+    spaces = {
+        c: f for c, f in job.char_formats.items() if f.is_space and c in used
+    }
+
+    if not spaces:
+        return {}
+
+    dist_h = _image_dist(job.params, "dist.h", DEFAULT_DIST_H, rng)
+
+    return {c: f.space_width(dist_h) for c, f in spaces.items()}
 
 
 def _line_axes(params: ParamSet) -> tuple[tuple[float, float], tuple[float, float]]:
@@ -181,9 +211,10 @@ def _perspective_enabled(params: ParamSet) -> bool:
 def _render_one(job: Job, char: str, rng: np.random.Generator) -> tuple[np.ndarray, dict] | None:
     """Draw one character and crop it to its own ink, or ``None`` if blank.
 
-    Blank happens twice over: a character Tab 2 has no format for yet, and one
-    whose every dot was taken by the missing-dot defect.  Neither should get a
-    bounding box, and neither is an error -- the slot simply stays empty.
+    Blank happens three ways: a space, a character Tab 2 has no format for yet,
+    and one whose every dot was taken by the missing-dot defect.  None of them
+    should get a bounding box, and none is an error -- the slot simply stays
+    empty, and the caller still advances the cursor past it.
     """
     fmt = job.char_formats.get(char)
 
@@ -211,9 +242,16 @@ def _render_block(job: Job, rng: np.random.Generator) -> list[_Raw]:
     direction; line ``i+1`` sits ``gap.coeff * dist.v`` across from line ``i``.
     An empty slot still advances the cursor, so removing a character's format
     does not slide the rest of its line.
+
+    A space is the one slot that advances by something else: its own
+    ``space_coeff * dist.h``, which is what lets a line be broken into words
+    without the whole line having to change its character spacing.  A line of
+    ordinary characters lands exactly where ``j * char_spacing`` used to put
+    it, so nothing that predates spaces moves by a pixel.
     """
     along, across = _line_axes(job.params)
     dist_v = _image_dist_v(job.params, rng)
+    spaces = _space_advances(job, rng)
     gaps = {g.upper: g.coeff for g in job.line_gaps}
 
     out: list[_Raw] = []
@@ -223,25 +261,29 @@ def _render_block(job: Job, rng: np.random.Generator) -> list[_Raw]:
         if i > 0:
             v += float(gaps.get(job.lines[i - 1].index, DEFAULT_GAP_COEFF)) * dist_v
 
-        for j, spec in enumerate(line.chars):
+        t = 0.0
+
+        for spec in line.chars:
             char = _pick_char(spec, rng)
             drawn = _render_one(job, char, rng)
 
-            if drawn is None:
-                continue
+            if drawn is not None:
+                ink, defects = drawn
 
-            ink, defects = drawn
-            t = j * float(line.char_spacing)
-
-            out.append(
-                _Raw(
-                    char=char,
-                    ink=ink,
-                    offset=(t * along[0] + v * across[0], t * along[1] + v * across[1]),
-                    defects=defects,
-                    line=i,
+                out.append(
+                    _Raw(
+                        char=char,
+                        ink=ink,
+                        offset=(
+                            t * along[0] + v * across[0],
+                            t * along[1] + v * across[1],
+                        ),
+                        defects=defects,
+                        line=i,
+                    )
                 )
-            )
+
+            t += spaces.get(char, float(line.char_spacing))
 
     return out
 

@@ -46,7 +46,10 @@ if TYPE_CHECKING:
 # 2: the ruler's "dot_pairs" became "dot_sequences" of two points or more.
 # Reading back is unchanged -- a schema-1 file still loads -- but a build that
 # predates sequences would silently drop them, so it is told to refuse instead.
-SCHEMA = 2
+# 3: a CharFormat may carry "space_coeff" and be a blank of declared width.
+# Same reason for the bump: an older build ignores the key and lays the space
+# out as an ordinary slot, which moves every character after it on that line.
+SCHEMA = 3
 CONFIG_FILTER = "DotGen configuration (*.dotcfg);;All files (*)"
 JOBS_FILTER = "DotGen jobs (*.dotjobs);;All files (*)"
 

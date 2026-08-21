@@ -2,6 +2,10 @@
 
 The character on the left, a chip list of the characters allowed to appear in
 its place on the right.  One or several may be selected.
+
+A space is the exception: there is nothing to replace a blank *with* -- any
+replacement would put ink where the user asked for none -- so its bar says how
+wide it is instead of offering chips.
 """
 
 from __future__ import annotations
@@ -15,6 +19,8 @@ from PySide6.QtWidgets import (
     QToolButton,
     QWidget,
 )
+
+from ..qtutil import char_label
 
 DEFAULT_ALPHABET = list("0123456789") + list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
@@ -44,10 +50,15 @@ class ReplacementBar(QFrame):
         lay.setContentsMargins(4, 2, 4, 2)
         lay.setSpacing(6)
 
-        title = QLabel(f"'{char}'")
+        title = QLabel(f"'{char_label(char)}'")
         title.setFixedWidth(28)
         title.setStyleSheet("font-weight: 600; font-size: 13px;")
         lay.addWidget(title)
+
+        if char.isspace():
+            lay.addWidget(self._space_note(), 1)
+            lay.addWidget(self._remove_button())
+            return
 
         lay.addWidget(QLabel("may also be"))
 
@@ -82,13 +93,25 @@ class ReplacementBar(QFrame):
         scroll.setWidget(chips)
         lay.addWidget(scroll, 1)
 
+        lay.addWidget(self._remove_button())
+
+    # ------------------------------------------------------------------
+    def _remove_button(self) -> QToolButton:
         remove = QToolButton()
         remove.setText("x")
         remove.setToolTip("Remove this character from the line")
         remove.clicked.connect(
             lambda: self.removeRequested.emit(self.line_index, self.char_index)
         )
-        lay.addWidget(remove)
+
+        return remove
+
+    @staticmethod
+    def _space_note() -> QLabel:
+        note = QLabel("blank -- width set in Tab 2")
+        note.setObjectName("hint")
+
+        return note
 
     def _toggle(self, char: str, on: bool) -> None:
         if on and char not in self.replacements:

@@ -145,7 +145,7 @@ its bars in Phase 1 even though nothing computes them yet):
                                 char_formats:dict[str,CharFormat]; backgrounds:list[BackgroundSpec]
                                 lines:list[LineSpec]; line_gaps:list[LineGap]; defects:DefectSpec
                                 classes:list[ClassDef]
-@dataclass class ExportSpec:    fmt:Literal["yolo"]; out_dir:str; images_per_job:int; seed:int; split:tuple[float,float,float]
+@dataclass class ExportSpec:    fmt:Literal["yolo","yolo-obb"]; out_dir:str; images_per_job:int; seed:int; split:tuple[float,float,float]
 ```
 
 `CharFormat.validate() -> list[str]` returns human-readable errors. Rule from the draft: exactly one
@@ -288,6 +288,15 @@ Three columns inside a `QSplitter`:
    `Upload background…` and `Reset`; a left click calls `engines.render_dot` and pastes it at the
    click point using the multiplicative ink model. This panel is how the user verifies reconstruction.
 
+   > **Amended 2026-08-20.** A preview that makes its points differently from the exporter previews
+   > something the dataset does not contain, which is what had happened: the panel pinned
+   > `dot.pca_sigma` to the bar's mean, rounded the click onto the pixel grid, and pasted straight
+   > into the image, so it carried its own intersection behaviour. It now holds the pristine
+   > background plus the `(x, y, patch)` of every dot placed — the patch, so a redraw does not
+   > re-roll dots already on the panel — and rebuilds through §6.2's `compose_dots`, cap included.
+   > Sigma is drawn with `sample(rng)` as `mode=None` does, and the fractional click position is
+   > kept. `Reset` and `Upload background…` clear the placed dots.
+
 Wiring in Phase 1: `roiFinished` → `engines.extract_dot` → `state.add_dot_sample` → thumb strip
 refresh → `engines.build_dot_model` + `engines.dot_params` → `state.set_params` → bars update.
 All of that is real code; only the three engine calls are stubs.
@@ -307,8 +316,9 @@ All of that is real code; only the three engine calls are stubs.
     centred on it.
   - `Esc` clears the current selection so the user can pick again.
   - Clicking a connector selects it; `Delete` removes that link.
-- **Right** — validation panel showing `CharFormat.validate()` output live (exactly 1 vertical and 1
-  horizontal constraint), and a preview of the resulting metric size
+- **Right** — validation panel showing `CharFormat.validate()` output live (one constraint per axis
+  the character spans: both for a 2-D shape, one for `:`/`-`, none for `.`), and a preview of the
+  resulting metric size
   `w = coeff_h * dist.h`, `h = coeff_v * dist.v` (computed with mean values in Phase 1).
 - **Bottom** — `Save` button, writes into `state.char_formats[char]`, disabled while validation fails.
 
@@ -413,7 +423,8 @@ tests/test_ui_smoke.py                 # extended to tabs 4-6
 
 ### 2.4 Tab 6 — Save job and export (layout)
 
-- Format combo: `YOLO` (only entry for now, but read from `ExportSpec.fmt` so more can be added).
+- Format combo: `yolo` (axis-aligned) and `yolo-obb` (oriented), read from `ExportSpec.fmt`.
+  Both write the same images, folders and `data.yaml`; only the shape of a label line differs.
 - `Images per job`, `Seed`, `Train/Val/Test split`, `Output directory…`.
 - `Save job` — snapshots the current state of Tabs 1–5 into a `Job`, appends to `state.jobs`, then
   resets Tabs 1–5 to a clean slate so the user can define the next job. A confirmation dialog lists
@@ -489,6 +500,7 @@ tests/test_dot_pca.py
 ```python
 def estimate_background(gray: np.ndarray, mask: np.ndarray | None = None) -> float
     # median of the border ring (test1.py) or of the brightest 20% (test2.py) when a mask is given
+def background_of_dot(gray, roi_mask, dot_mask) -> float    # mean of ROI minus the dot; B for below
 def to_ink(gray: np.ndarray, bg: float) -> np.ndarray      # clip((bg-gray)/bg, 0, 1)
 def paste_ink(img: np.ndarray, cx: int, cy: int, ink: np.ndarray) -> None
     # multiplicative model: roi *= (1 - ink); clip to uint8; silently skip out-of-bounds
@@ -498,14 +510,20 @@ def shift_image(img, dx, dy, interp) -> np.ndarray          # warpAffine, BORDER
 These are lifted verbatim from `test1.py::estimate_background / paste_dot / shift_image`. Keep the
 multiplicative ink model — it is what prevents the source background bleeding into the target.
 
-> **Superseded by `bug.md` (2026-08-17).** The multiplicative model is gone. Darkness is now
-> absolute — `D = B - L` on sampling, `L = B - D` on pasting — and patches carry `D / 255`, so
-> `to_ink` divides by 255 rather than by `bg` and `paste_ink` subtracts rather than multiplies.
-> It still prevents the source background bleeding into the target, and additionally keeps a dot's
-> bite the same on a background darker or lighter than the paper it was sampled from. `B` is now
-> measured from the Background Of Dot (`background_of_dot`) rather than the crop's border ring,
-> which is only the fallback. Overlapping dots add their darkness, floored at the darkest pixel of
-> the dots involved, in `render_char`; they no longer combine with `max`.
+> **Superseded by `bug.md` (2026-08-17), restored (2026-08-20).** For three days darkness was
+> absolute — `D = B - L` on sampling, `L = B - D` on pasting, patches carrying `D / 255` — so that
+> one dot bit the same count of grey levels out of any paper. The block above is the rule again:
+> a dot photographed at 15% of its paper lands at 15% of whatever paper it is pasted onto, fading
+> with a darker page instead of punching the same hole through it. `to_ink` divides by `bg` again,
+> `paste_ink` multiplies by `1 - I`, and the `LEVELS` constant is gone with the subtraction.
+>
+> One half of the `bug.md` change stays: `B` is measured from the Background Of Dot
+> (`background_of_dot` — the outline the user drew, minus the dot inside it) rather than the crop's
+> border ring, which is now only the fallback below `MIN_BOD_PIXELS`.
+>
+> Dots meeting *inside* a character are §6.2's business, not this module's. Two **characters**
+> landing on the same pixel compose here, by that same `1 - I` product, and are deliberately not
+> capped — the cap belongs to a set of dots known to be one printed glyph.
 
 ### 3.3 `core/dot_extract.py`
 
@@ -738,11 +756,14 @@ def validate(fmt: CharFormat) -> list[str]
 
 `validate` rules, enforced at save time in Tab 2 (the UI already displays whatever this returns):
 
-1. exactly one link with `axis=="v"` and exactly one with `axis=="h"`;
+1. exactly one link per axis the dots actually span, and none on an axis they do not: a 2-D
+   character needs one `v` and one `h`, a single column (`:`) only the `v`, a single row (`-`) only
+   the `h`, and a lone dot (`.`) neither — an axis with no extent has no pitch to fix, and a link
+   there could not be drawn anyway;
 2. both endpoints of each link exist in `fmt.dots`;
 3. a vertical link's endpoints must share a column and differ in row (and the mirror for horizontal);
 4. `coeff > 0`;
-5. at least 2 dots.
+5. at least 1 dot.
 
 `solve_metrics` must be callable with min/mean/max values of `dist.h`/`dist.v` — that is how Tab 3's
 Min/Max comparison and the exporter's randomisation get different character sizes from one format.
@@ -800,9 +821,21 @@ Pipeline:
 3. If `persp.*` is enabled, warp the centres through the homography scaled to the character box; if
    `tilt.*` is enabled, rotate/shear by those angles; if `curve.*` is enabled, apply
    `curve.displace` along the line direction.
-4. Allocate a canvas sized to the transformed bbox plus `patch_radius + 2` margin, filled with 0 ink.
-5. For each centre, `render_dot(model, rng)` and `paste_ink` at the rounded position, with a sub-pixel
-   `shift_image` first so positions are not quantised to integers.
+4. Size the canvas to the transformed bbox plus `patch_radius + 2` margin; `compose_dots` allocates
+   it.
+5. Collect every surviving centre as `(x, y, patch)` from `render_dot(model, rng)` and hand the lot to
+   `compose_dots(shape, dots)` — the one place dots become an ink map. It applies the sub-pixel
+   `shift_image` so positions are not quantised to integers, composes each dot into the paper still
+   showing (`keep *= 1 - I`, i.e. `Iab = 1 - (1 - Ia)(1 - Ib)`), and clamps the result per pixel to
+   the peak of the darkest dot covering it.
+
+   > **Added 2026-08-20, measured off `4dot.png`.** Composing rather than taking a `max` is what
+   > fills the join between two touching dots: `max` leaves a pale notch there, putting grey 40 and
+   > 43 where that photograph has 27 and 25. The clamp is what stops composition running away where
+   > dots properly *intersect* — in the same photograph a pair 6 px apart has a darkest pixel of
+   > grey 21 against the isolated dot's 23, so real ink saturates, while unchecked composition
+   > reaches grey 4 by the time the centres are 3 px apart. The clamp costs one grey level at the
+   > separation the photograph can arbitrate, and is inert for a dot standing on its own.
 6. Defects (implemented here, exercised in Phase 7):
    - **missing** — draw `k ~ Binomial(n_dots, p_missing)` capped at `max_missing`, drop those dots;
    - **deformed** — for `k` capped at `max_deformed`, render the dot with PCA coefficients scaled ×3
@@ -959,17 +992,30 @@ Layout:
 <out>/
   data.yaml            # names: [...] in class_index order, nc, train/val/test paths
   images/train|val|test/<job>_<bg>_<n>.png
-  labels/train|val|test/<job>_<bg>_<n>.txt      # "<idx> <cx> <cy> <w> <h>" per line
+  labels/train|val|test/<job>_<bg>_<n>.txt      # one line per object, shape set by spec.fmt
   export_report.json
 ```
+
+Label line by format:
+
+```
+yolo       "<idx> <cx> <cy> <w> <h>"                       # axis-aligned
+yolo-obb   "<idx> <x1> <y1> <x2> <y2> <x3> <y3> <x4> <y4>" # ultralytics OBB, clockwise
+```
+
+- `compose` produces `boxes` and `quads` in one pass, parallel and same-order, so the format changes
+  the label line and nothing else -- same images, same objects, same class counts, same report.
+- Characters are pasted upright, so a character's quad is its rectangle's corners; a line's quad is
+  the minimum-area rectangle over the characters on it, which tilts once perspective puts the text on
+  a receding surface. A composer that reports only `boxes` gets its corners derived.
 
 - `spec.seed` seeds a `np.random.default_rng`; per-image seeds are `seed + hash(job.id) + n` so a
   re-export reproduces byte-identical images.
 - Split assignment is deterministic per image index, not random per call.
 - `progress(done, total)` returns `False` to cancel; the exporter must leave a consistent partial
   directory and say so in the report.
-- `ExportReport` records: images written, boxes written, per-class counts, skipped backgrounds with
-  reasons (e.g. `LayoutError`), elapsed time.
+- `ExportReport` records: format written, images written, boxes written, per-class counts, skipped
+  backgrounds with reasons (e.g. `LayoutError`), elapsed time.
 
 ### 8.4 Tab 6 wiring
 

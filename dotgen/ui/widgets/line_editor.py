@@ -3,6 +3,11 @@
 Character spacing is entered in a box outside the background frame (draft Tab 4
 section 6); the inter-line gap is the ``<----2----->`` connector (section 5) and
 is editable both here and on the preview.
+
+A space goes on a line through its own button rather than by typing one into
+the entry: a blank in a one-character box looks like an empty box, and there is
+no way to tell the two apart by looking.  How wide it is belongs to Tab 2, with
+the rest of the character formats.
 """
 
 from __future__ import annotations
@@ -21,9 +26,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ...core.models import LineGap, LineSpec
+from ...core.models import SPACE_CHAR, LineGap, LineSpec
 from .. import theme
-from ..qtutil import clear_layout
+from ..qtutil import char_label, clear_layout
 from .replacement_bar import ReplacementBar
 
 
@@ -93,7 +98,8 @@ class LineEditor(QWidget):
 
     # ------------------------------------------------------------------
     def _build_line(self, index: int, line: LineSpec) -> QWidget:
-        box = QGroupBox(f"Line {line.index}   ({line.text() or 'empty'})")
+        text = "".join(char_label(c.char) for c in line.chars)
+        box = QGroupBox(f"Line {line.index}   ({text or 'empty'})")
         lay = QVBoxLayout(box)
         lay.setSpacing(3)
 
@@ -126,6 +132,16 @@ class LineEditor(QWidget):
         hl.addWidget(add)
 
         entry.returnPressed.connect(lambda i=index, e=entry: self._add_char(i, e))
+
+        space = QPushButton("Space")
+        space.setToolTip(
+            "Add a space -- a blank slot whose width is set in Tab 2, as a "
+            "multiple of the horizontal distance unit"
+        )
+        space.clicked.connect(
+            lambda _c=False, i=index: self.addCharRequested.emit(i, SPACE_CHAR)
+        )
+        hl.addWidget(space)
 
         remove = QPushButton("Remove line")
         remove.clicked.connect(lambda _c=False, i=index: self.removeLineRequested.emit(i))

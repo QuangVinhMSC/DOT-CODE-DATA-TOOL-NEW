@@ -4,6 +4,13 @@ Left button places dots, right button selects a pair, a coefficient typed on
 the connector and committed with Enter becomes a constraint drawn as
 ``.<----2----->.``  Esc reselects, Delete removes the selected connector.
 
+The palette carries one character that is not drawn at all: the space.  It has
+no dots to paint and no pair of dots to connect, so the grid is swapped out for
+a single field -- its width, in horizontal distance units, the same coefficient
+the connectors elsewhere on this tab mean.  It comes pre-configured: selecting
+it in the palette already gives a valid format, and the only thing left to do is
+tune the number against the print.
+
 The matrix is a custom-painted QWidget rather than a QGraphicsView: the grid is
 small and fixed, so scene management would add machinery without buying
 anything.
@@ -16,6 +23,7 @@ import math
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
+    QDoubleSpinBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -25,17 +33,23 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from ...core.matrix import solve_metrics
-from ...core.models import CharFormat, DotLink
+from ...core.models import DEFAULT_SPACE_COEFF, SPACE_CHAR, CharFormat, DotLink
 from ...core.state import AppState
 from .. import theme
+from ..qtutil import char_label
 from ..widgets.range_bar import RangeBar
 
-CHARSET = list("0123456789") + list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+# The space closes the palette rather than opening it: it is the one entry that
+# is not a drawing, and a user scanning for '0' should not meet it first.
+CHARSET = list("0123456789") + list("ABCDEFGHIJKLMNOPQRSTUVWXYZ") + [SPACE_CHAR]
+
+CONNECTOR_CSS = "font-family: Consolas, monospace; color: #2d6edc;"
 
 CHARS_PER_ROW = 10
 
@@ -370,6 +384,16 @@ def _point_segment_distance(p: QPointF, a: QPointF, b: QPointF) -> float:
     return math.dist((p.x(), p.y()), (ax + t * dx, ay + t * dy))
 
 
+def _new_format(char: str) -> CharFormat:
+    """The format a character never edited before starts from.
+
+    Whitespace starts out as a space of the default width: that *is* the
+    pre-configuration -- selecting it in the palette already gives a valid,
+    saveable format, and the only thing left is to tune the number.
+    """
+    return CharFormat.space(char) if char.isspace() else CharFormat(char)
+
+
 # ======================================================================
 
 
@@ -486,18 +510,10 @@ class Tab2Matrix(QWidget):
         box = QGroupBox("Matrix")
         lay = QVBoxLayout(box)
 
-        self.canvas = MatrixCanvas()
-        self.canvas.formatChanged.connect(self._on_format_changed)
-        self.canvas.message.connect(self.statusMessage.emit)
-        lay.addWidget(self.canvas, 1)
-
-        hint = QLabel(
-            "Left click: place / remove a dot.   Right click two dots: define their distance, Enter to commit.   "
-            "Esc: reselect.   Click a connector then Delete: remove it."
-        )
-        hint.setObjectName("hint")
-        hint.setWordWrap(True)
-        lay.addWidget(hint)
+        self.pages = QStackedWidget()
+        self.pages.addWidget(self._build_matrix_page())
+        self.pages.addWidget(self._build_space_page())
+        lay.addWidget(self.pages, 1)
 
         row = QWidget()
         rl = QHBoxLayout(row)
@@ -520,6 +536,98 @@ class Tab2Matrix(QWidget):
 
         lay.addWidget(row)
         return box
+
+    def _build_matrix_page(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        self.canvas = MatrixCanvas()
+        self.canvas.formatChanged.connect(self._on_format_changed)
+        self.canvas.message.connect(self.statusMessage.emit)
+        lay.addWidget(self.canvas, 1)
+
+        hint = QLabel(
+            "Left click: place / remove a dot.   Right click two dots: define their distance, Enter to commit.   "
+            "Esc: reselect.   Click a connector then Delete: remove it."
+        )
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        return page
+
+    def _build_space_page(self) -> QWidget:
+        """The space's editor: one width, in horizontal distance units.
+
+        The grid is put away rather than shown greyed out.  There is no drawing
+        here to be half-disabled -- a space is a distance and nothing else -- and
+        an empty 5x7 grid on screen would only invite the user to click it.
+        """
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addStretch(1)
+
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.addStretch(1)
+
+        rl.addWidget(QLabel("Width"))
+
+        left = QLabel("<----")
+        left.setStyleSheet(CONNECTOR_CSS)
+        rl.addWidget(left)
+
+        self.space_spin = QDoubleSpinBox()
+        self.space_spin.setRange(0.01, 100.0)
+        self.space_spin.setDecimals(2)
+        self.space_spin.setSingleStep(0.5)
+        self.space_spin.setValue(DEFAULT_SPACE_COEFF)
+        self.space_spin.setToolTip(
+            "Space width = coefficient x the horizontal distance unit"
+        )
+        self.space_spin.valueChanged.connect(self._on_space_coeff)
+        rl.addWidget(self.space_spin)
+
+        right = QLabel("---->")
+        right.setStyleSheet(CONNECTOR_CSS)
+        rl.addWidget(right)
+
+        rl.addWidget(QLabel("x dist.h"))
+        rl.addStretch(1)
+
+        lay.addWidget(row)
+
+        self.space_readout = QLabel("")
+        self.space_readout.setAlignment(Qt.AlignCenter)
+        self.space_readout.setStyleSheet("font-family: Consolas, monospace;")
+        lay.addWidget(self.space_readout)
+
+        lay.addStretch(1)
+
+        hint = QLabel(
+            "A space puts no ink on the page -- it only moves the next character "
+            "along. Its width is a multiple of the horizontal distance unit, so it "
+            "grows and shrinks with every other measurement instead of being a "
+            "pixel count that stops matching. Save it, then put it on a line with "
+            "the Space button in Tab 4."
+        )
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        return page
+
+    def _on_space_coeff(self, value: float) -> None:
+        fmt = self.canvas.fmt
+
+        if not fmt.is_space:
+            return
+
+        fmt.space_coeff = float(value)
+        self._on_format_changed()
 
     def _build_right(self) -> QWidget:
         w = QWidget()
@@ -574,10 +682,13 @@ class Tab2Matrix(QWidget):
                 row_layout.setSpacing(2)
                 self.char_rows.addWidget(row_widget)
 
-            b = QPushButton(ch)
+            b = QPushButton(char_label(ch))
             b.setCheckable(True)
             b.setChecked(ch == self.state.active_char)
             b.setFixedSize(26, 24)
+
+            if ch.isspace():
+                b.setToolTip("Space -- a blank of adjustable width, drawn as nothing")
             b.clicked.connect(lambda _c=False, c=ch: self._select_char(c))
             self.char_buttons[ch] = b
             row_layout.addWidget(b)
@@ -611,18 +722,20 @@ class Tab2Matrix(QWidget):
         known: list[str] = []
 
         for ch in self.new_char_edit.text():
-            if ch.isspace():
+            # Any whitespace is *the* space: there is one blank to configure,
+            # and it is in the palette already.
+            key = SPACE_CHAR if ch.isspace() else ch
+
+            if key in self._charset or key in added:
+                known.append(key)
                 continue
 
-            if ch in self._charset or ch in added:
-                known.append(ch)
-                continue
-
-            added.append(ch)
+            added.append(key)
 
         if not added:
             self.statusMessage.emit(
-                f"'{' '.join(known)}' already in the palette." if known
+                f"'{' '.join(char_label(c) for c in known)}' already in the palette."
+                if known
                 else "Type the character(s) to add first."
             )
             return
@@ -637,14 +750,17 @@ class Tab2Matrix(QWidget):
         char = self.canvas.fmt.char
 
         if char in CHARSET:
-            self.statusMessage.emit(f"'{char}' is built in and cannot be removed.")
+            self.statusMessage.emit(
+                f"'{char_label(char)}' is built in and cannot be removed."
+            )
             return
 
         if char in self.state.char_formats:
             answer = QMessageBox.question(
                 self,
                 "Remove character",
-                f"'{char}' has a saved format. Remove the character and discard it?",
+                f"'{char_label(char)}' has a saved format. Remove the character "
+                f"and discard it?",
             )
 
             if answer != QMessageBox.Yes:
@@ -655,7 +771,7 @@ class Tab2Matrix(QWidget):
         self._rebuild_char_buttons()
         self._select_char(self._charset[0])
         self.state.delete_char_format(char)
-        self.statusMessage.emit(f"Removed '{char}' from the palette.")
+        self.statusMessage.emit(f"Removed '{char_label(char)}' from the palette.")
 
     def _select_char(self, char: str) -> None:
         self.state.set_active_char(char)
@@ -675,7 +791,7 @@ class Tab2Matrix(QWidget):
 
         if char not in self._working:
             saved = self.state.char_formats.get(char)
-            self._working[char] = saved.copy() if saved else CharFormat(char)
+            self._working[char] = saved.copy() if saved else _new_format(char)
 
         fmt = self._working[char]
 
@@ -685,6 +801,15 @@ class Tab2Matrix(QWidget):
         self.grid_h.setValue(fmt.grid_h)
         self.grid_w.blockSignals(False)
         self.grid_h.blockSignals(False)
+
+        self.pages.setCurrentIndex(1 if fmt.is_space else 0)
+        self.grid_w.setEnabled(not fmt.is_space)
+        self.grid_h.setEnabled(not fmt.is_space)
+
+        if fmt.is_space:
+            self.space_spin.blockSignals(True)
+            self.space_spin.setValue(float(fmt.space_coeff or DEFAULT_SPACE_COEFF))
+            self.space_spin.blockSignals(False)
 
         self.canvas.set_format(fmt)
         self._on_format_changed()
@@ -701,10 +826,18 @@ class Tab2Matrix(QWidget):
         self._on_format_changed()
 
     def _clear(self) -> None:
+        """Back to a blank format -- for a space, back to the default width."""
         char = self.state.active_char
-        self._working[char] = CharFormat(char, self.grid_w.value(), self.grid_h.value())
-        self.canvas.set_format(self._working[char])
-        self._on_format_changed()
+        current = self._working.get(char)
+
+        if current is not None and current.is_space:
+            self._working[char] = CharFormat.space(char)
+        else:
+            self._working[char] = CharFormat(
+                char, self.grid_w.value(), self.grid_h.value()
+            )
+
+        self._load_char(char)
 
     # ==================================================================
 
@@ -725,9 +858,7 @@ class Tab2Matrix(QWidget):
             self.validation.setText("\n".join("- " + e for e in errors))
         else:
             self.validation.setObjectName("ok")
-            self.validation.setText(
-                "Valid: exactly 1 horizontal and 1 vertical constraint.\nReady to save."
-            )
+            self.validation.setText(f"Valid: {self._rule_text(fmt)}\nReady to save.")
 
         self.validation.setStyleSheet(
             "color: #c82828;" if errors else "color: #148c3c;"
@@ -737,6 +868,31 @@ class Tab2Matrix(QWidget):
         self._update_saved_label()
         self.canvas.update()
 
+    @staticmethod
+    def _rule_text(fmt: CharFormat) -> str:
+        """The constraint rule this drawing falls under, named for the user.
+
+        A character only needs a constraint on an axis it actually extends
+        along, so ':' and '-' ask for one and a lone dot for none, and a space
+        -- which extends along neither because it is not drawn -- states its one
+        number instead.
+        """
+        if fmt.is_space:
+            return f"space: {fmt.space_coeff:g} x dist.h wide, nothing drawn."
+
+        span_h, span_v = fmt.spans()
+
+        if span_h and span_v:
+            return "2-D character: 1 horizontal and 1 vertical constraint."
+
+        if span_h:
+            return "single row: 1 horizontal constraint, no vertical one."
+
+        if span_v:
+            return "single column: 1 vertical constraint, no horizontal one."
+
+        return "single dot: no constraint needed."
+
     def _update_preview(self) -> None:
         """The real grid pitch this character's links imply (plan 5.3)."""
         fmt = self.canvas.fmt
@@ -744,6 +900,24 @@ class Tab2Matrix(QWidget):
         dist_v = self.state.params["dist.v"].mean
 
         m = solve_metrics(fmt, dist_h, dist_v)
+
+        if fmt.is_space:
+            self.space_readout.setText(
+                f"{fmt.space_coeff:g} x {dist_h:.2f} px = {m.width:.2f} px"
+            )
+            self.preview.setText(
+                "\n".join(
+                    [
+                        f"dist.h = {dist_h:.2f} px",
+                        "",
+                        f"width  = {fmt.space_coeff:g} x dist.h",
+                        f"       = {m.width:.2f} px",
+                        "",
+                        "dots   = 0 (a space draws nothing)",
+                    ]
+                )
+            )
+            return
 
         lines = [
             f"dist.h = {dist_h:.2f} px      dist.v = {dist_v:.2f} px",
@@ -782,7 +956,10 @@ class Tab2Matrix(QWidget):
         saved = self.state.saved_chars()
         char = self.canvas.fmt.char
         mark = "saved" if char in self.state.char_formats else "not saved"
-        self.saved_label.setText(f"'{char}' {mark}   |   saved: {' '.join(saved) if saved else '-'}")
+        self.saved_label.setText(
+            f"'{char_label(char)}' {mark}   |   "
+            f"saved: {' '.join(char_label(c) for c in saved) if saved else '-'}"
+        )
 
     def _refresh_units(self, _keys=None) -> None:
         for key, bar in self.unit_bars.items():
@@ -804,5 +981,5 @@ class Tab2Matrix(QWidget):
             return
 
         self.state.save_char_format(fmt)
-        self.statusMessage.emit(f"Saved format for '{fmt.char}'.")
+        self.statusMessage.emit(f"Saved format for '{char_label(fmt.char)}'.")
         self._update_saved_label()

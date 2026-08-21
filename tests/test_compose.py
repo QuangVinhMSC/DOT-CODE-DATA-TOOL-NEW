@@ -73,6 +73,104 @@ def test_a_line_box_covers_every_character_box_on_that_line(make_job):
         assert cy + h / 2 <= line[2] + line[4] / 2 + 1e-9
 
 
+# ----------------------------------------------------------------------
+# the oriented annotations -- what "yolo-obb" exports
+# ----------------------------------------------------------------------
+
+
+def quad_points(quad):
+    """The four ``(x, y)`` corners of a ``(name, x1, y1, ... y4)`` entry."""
+    return np.asarray(quad[1:], dtype=float).reshape(4, 2)
+
+
+def polygon_area(points) -> float:
+    x, y = points[:, 0], points[:, 1]
+
+    return float(abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))) / 2.0)
+
+
+def test_quads_run_parallel_to_boxes(make_job):
+    """Same objects, same classes, same order -- the exporter relies on it."""
+    result = render(make_job(lines=("123", "45")), 1)
+
+    assert len(result.quads) == len(result.boxes)
+    assert [q[0] for q in result.quads] == [b[0] for b in result.boxes]
+    assert all(len(q) == 9 for q in result.quads)
+
+
+def test_every_quad_corner_is_inside_the_unit_square(make_job):
+    job = make_job(lines=("123", "45"))
+
+    for seed in range(50):
+        for quad in render(job, seed).quads:
+            for x, y in quad_points(quad):
+                assert 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0
+
+
+def test_a_character_quad_is_its_own_rectangle(make_job):
+    """Characters are pasted upright, so their oriented box is the box itself."""
+    result = render(make_job(lines=("12",)), 4)
+
+    for box, quad in zip(result.boxes, result.quads):
+        if box[0] == "line1":
+            continue
+
+        _, cx, cy, w, h = box
+        points = quad_points(quad)
+
+        assert points[:, 0].min() == pytest.approx(cx - w / 2, abs=1e-9)
+        assert points[:, 0].max() == pytest.approx(cx + w / 2, abs=1e-9)
+        assert points[:, 1].min() == pytest.approx(cy - h / 2, abs=1e-9)
+        assert points[:, 1].max() == pytest.approx(cy + h / 2, abs=1e-9)
+
+
+def test_a_quad_never_falls_short_of_its_box(make_job):
+    """The oriented box may be tilted, but it still bounds what the box bounds."""
+    job = make_job(lines=("123", "45"))
+
+    for seed in range(20):
+        result = render(job, seed)
+
+        for box, quad in zip(result.boxes, result.quads):
+            _, cx, cy, w, h = box
+            points = quad_points(quad)
+
+            assert points[:, 0].min() <= cx - w / 2 + 1e-6
+            assert points[:, 0].max() >= cx + w / 2 - 1e-6
+            assert points[:, 1].min() <= cy - h / 2 + 1e-6
+            assert points[:, 1].max() >= cy + h / 2 - 1e-6
+
+
+def test_a_line_on_a_tilted_surface_gets_a_tilted_quad(make_job):
+    """The reason the oriented format exists: it beats the axis-aligned box.
+
+    On a surface that recedes, a line of upright characters runs diagonally, so
+    the rotated rectangle around it is strictly smaller than the upright one.
+    """
+    job = make_job(lines=("12345",), quad=Quad([(80, 80), (560, 200), (560, 430), (80, 310)]))
+
+    for key in ("persp.h", "persp.v"):
+        job.params[key].enabled = True
+
+    result = render(job, 7)
+    line_box = next(b for b in result.boxes if b[0] == "line1")
+    line_quad = next(q for q in result.quads if q[0] == "line1")
+
+    assert polygon_area(quad_points(line_quad)) < line_box[3] * line_box[4] * 0.95
+
+
+def test_a_line_on_a_flat_surface_keeps_an_upright_quad(make_job):
+    """No tilt, no cost: the oriented box degenerates to the axis-aligned one."""
+    result = render(make_job(lines=("123",)), 5)
+
+    line_box = next(b for b in result.boxes if b[0] == "line1")
+    line_quad = next(q for q in result.quads if q[0] == "line1")
+
+    assert polygon_area(quad_points(line_quad)) == pytest.approx(
+        line_box[3] * line_box[4], rel=1e-6
+    )
+
+
 def test_a_box_holds_the_ink_it_claims_to_hold(make_job):
     job = make_job(lines=("12",))
     result = render(job, 2)

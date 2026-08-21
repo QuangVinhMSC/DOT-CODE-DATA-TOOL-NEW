@@ -32,6 +32,7 @@ from .models import (
     LineSpec,
     Quad,
     SampleImage,
+    is_blank_char,
 )
 from .params import ParamSet, default_params
 
@@ -603,12 +604,17 @@ class AppState(QObject):
         self.linesChanged.emit()
 
     def job_characters(self) -> list[str]:
+        """:meth:`Job.characters` for the job being edited -- spaces excluded.
+
+        Tab 5 builds its class list from this, and a space has no ink to put a
+        box around.
+        """
         out: list[str] = []
 
         for line in self.lines:
             for spec in line.chars:
                 for c in spec.alphabet():
-                    if c not in out:
+                    if c not in out and not is_blank_char(c, self.char_formats):
                         out.append(c)
 
         return sorted(out)

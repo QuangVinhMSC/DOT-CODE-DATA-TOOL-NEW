@@ -107,7 +107,21 @@ def solve_metrics(fmt: CharFormat, dist_h: float, dist_v: float) -> CharMetrics:
 
     A single-column character legitimately has ``width == 0``; the renderer
     adds its own dot-radius margin, so no minimum is faked here.
+
+    A space has no grid to solve -- its whole geometry is the width its own
+    coefficient declares -- so it short-circuits with that width and no dots.
+    The pitches are still reported as the raw units, because the panel that
+    prints them needs an honest number rather than a zero.
     """
+    if fmt.is_space:
+        return CharMetrics(
+            pitch_h=float(dist_h),
+            pitch_v=float(dist_v),
+            positions={},
+            width=fmt.space_width(dist_h),
+            height=_EMPTY_SIZE,
+        )
+
     pitch_h = _pitch_on(fmt, "h", dist_h)
     pitch_v = _pitch_on(fmt, "v", dist_v)
 

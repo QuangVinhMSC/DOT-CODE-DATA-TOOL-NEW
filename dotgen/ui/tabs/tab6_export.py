@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from ...core.classes import dataset_classes, validate_classes
-from ...core.exporter import ExportError, preflight, report_text, run_export
+from ...core.exporter import FORMATS, ExportError, preflight, report_text, run_export
 from ...core.state import AppState
 from .. import theme
 
@@ -80,6 +80,12 @@ class Tab6Export(QWidget):
         super().__init__(parent)
         self.state = state
 
+        # Live only for the duration of one export; the worker's slots read
+        # them and do nothing once they are cleared.
+        self._dialog: QProgressDialog | None = None
+        self._loop: QEventLoop | None = None
+        self._result: dict | None = None
+
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._build_left())
         splitter.addWidget(self._build_right())
@@ -111,11 +117,17 @@ class Tab6Export(QWidget):
 
         rl.addWidget(QLabel("Format"))
         self.format_combo = QComboBox()
-        self.format_combo.addItems(["yolo"])
-        self.format_combo.setCurrentText(self.state.export.fmt)
-        self.format_combo.currentTextChanged.connect(
-            lambda v: self.state.set_export(fmt=v)
+        self.format_combo.addItems(list(FORMATS))
+        self.format_combo.setToolTip(
+            "yolo      -- axis-aligned:  <class> cx cy w h\n"
+            "yolo-obb  -- oriented:      <class> x1 y1 x2 y2 x3 y3 x4 y4\n\n"
+            "Both write the same images, folders and data.yaml; only the shape "
+            "of a label line differs. Characters are upright either way, so the "
+            "oriented format is what tilts a line's box with the surface it "
+            "sits on."
         )
+        self.format_combo.setCurrentText(self.state.export.fmt)
+        self.format_combo.currentTextChanged.connect(self._set_format)
         rl.addWidget(self.format_combo)
 
         rl.addWidget(QLabel("Images per job"))
@@ -234,6 +246,10 @@ class Tab6Export(QWidget):
 
     # ==================================================================
 
+    def _set_format(self, value: str) -> None:
+        self.state.set_export(fmt=value)
+        self.refresh()  # the hint below the button names the format
+
     def _push_split(self) -> None:
         self.state.set_export(split=tuple(s.value() for s in self.split_spins))
 
@@ -318,6 +334,14 @@ class Tab6Export(QWidget):
         inside a queued slot while its own ``exec`` is running crashes PySide6
         6.9.2, and a plain loop makes the finishing order explicit (quit the
         loop, then close the dialog, then read the result).
+
+        The worker's signals are received by *methods of this widget*, never by
+        local closures.  A closure is not a ``QObject``, so Qt has no receiver
+        thread to queue the call to and invokes it directly in the thread that
+        emitted -- which put every ``dialog.setValue`` on the worker thread and
+        froze the window.  A bound method of a widget living on the GUI thread
+        is what makes the connection queued, which is the whole point of moving
+        the work off this thread in the first place.
         """
         jobs = list(self.state.jobs)
 
@@ -340,22 +364,13 @@ class Tab6Export(QWidget):
         loop = QEventLoop()
         result: dict = {}
 
-        def on_progress(done: int, total_: int) -> None:
-            dialog.setMaximum(max(total_, 1))
-            dialog.setValue(done)
-            dialog.setLabelText(f"Exporting dataset...  {done} / {total_}")
+        self._dialog = dialog
+        self._loop = loop
+        self._result = result
 
-        def on_finished(report) -> None:
-            result["report"] = report
-            loop.quit()
-
-        def on_failed(message: str) -> None:
-            result["error"] = message
-            loop.quit()
-
-        worker.progressed.connect(on_progress)
-        worker.finished.connect(on_finished)
-        worker.failed.connect(on_failed)
+        worker.progressed.connect(self._on_export_progress)
+        worker.finished.connect(self._on_export_finished)
+        worker.failed.connect(self._on_export_failed)
         thread.started.connect(worker.run)
 
         # Direct, deliberately.  The worker sits inside ``run`` for the whole
@@ -367,12 +382,23 @@ class Tab6Export(QWidget):
         self.export_button.setEnabled(False)
         thread.start()
         dialog.show()
-        loop.exec()
+
+        # A short export can finish before the loop is entered.  ``quit`` on a
+        # loop that is not running is forgotten, so entering it then would wait
+        # for a signal that has already been delivered -- and hang.
+        if not result:
+            loop.exec()
+
         dialog.close()
 
         thread.quit()
         thread.wait()
         worker.deleteLater()
+
+        self._dialog = None
+        self._loop = None
+        self._result = None
+
         self.refresh()
 
         if "error" in result:
@@ -387,6 +413,33 @@ class Tab6Export(QWidget):
             return
 
         self._show_report(report)
+
+    # -- worker signals, received on the GUI thread ---------------------
+    #
+    # Guarded because a queued signal can still be in flight after the loop has
+    # quit; by then the dialog is closed and there is nothing left to update.
+
+    def _on_export_progress(self, done: int, total: int) -> None:
+        if self._dialog is None:
+            return
+
+        self._dialog.setMaximum(max(total, 1))
+        self._dialog.setValue(done)
+        self._dialog.setLabelText(f"Exporting dataset...  {done} / {total}")
+
+    def _on_export_finished(self, report) -> None:
+        if self._result is None:
+            return
+
+        self._result["report"] = report
+        self._loop.quit()
+
+    def _on_export_failed(self, message: str) -> None:
+        if self._result is None:
+            return
+
+        self._result["error"] = message
+        self._loop.quit()
 
     def _show_report(self, report) -> None:
         box = QMessageBox(self)
@@ -429,10 +482,17 @@ class Tab6Export(QWidget):
         elif not self.state.export.out_dir:
             self.export_hint.setText("Choose an output directory.")
         else:
+            fmt = self.state.export.fmt
+            shape = (
+                "<class> x1 y1 x2 y2 x3 y3 x4 y4"
+                if fmt == "yolo-obb"
+                else "<class> cx cy w h"
+            )
             text = (
                 f"{len(self.state.jobs)} job(s) x {self.state.export.images_per_job} images "
                 f"= {len(self.state.jobs) * self.state.export.images_per_job} images, "
-                f"{len(names)} classes."
+                f"{len(names)} classes.\n"
+                f"Label lines: {shape}"
             )
 
             # The pre-flight runs here as well as in the exporter so the problem

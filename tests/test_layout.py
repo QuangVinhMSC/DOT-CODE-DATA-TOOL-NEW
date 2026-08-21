@@ -10,10 +10,10 @@ from dotgen.core.layout import (
     LayoutError,
     layout_job,
 )
-from dotgen.core.models import DefectSpec, Quad
+from dotgen.core.models import SPACE_CHAR, CharFormat, DefectSpec, Quad
 from dotgen.core.render_char import INK_FLOOR
 
-from .conftest import PLACED_DIST_V
+from .conftest import PLACED_DIST_H, PLACED_DIST_V
 
 
 # ----------------------------------------------------------------------
@@ -337,3 +337,88 @@ def test_the_ink_is_cropped_to_the_box_it_reports(make_job):
     for char in all_chars(run(make_job(), 0)):
         assert char.ink.shape[:2] == (int(char.bbox[3]), int(char.bbox[2]))
         assert float(char.ink.max()) > INK_FLOOR
+
+
+# ----------------------------------------------------------------------
+# spaces -- a slot that advances by its own width
+# ----------------------------------------------------------------------
+
+
+def with_space(job, coeff: float = 3.0):
+    """Give the job the space format Tab 2 would have saved for it."""
+    job.char_formats[SPACE_CHAR] = CharFormat.space(coeff=coeff)
+    return job
+
+
+def test_a_space_advances_the_line_by_its_own_width(make_job):
+    job = with_space(make_job(lines=("1 2",), spacing=37.0), coeff=3.0)
+
+    one, two = run(job, 1)[0].chars
+
+    assert two.pos[0] - one.pos[0] == pytest.approx(37.0 + 3.0 * PLACED_DIST_H)
+    assert two.pos[1] - one.pos[1] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_the_space_is_a_ratio_of_the_horizontal_unit(make_job):
+    """Double the coefficient, double the blank -- and nothing else moves."""
+    def width(coeff: float) -> float:
+        job = with_space(make_job(lines=("1 2",), spacing=37.0), coeff=coeff)
+        one, two = run(job, 1)[0].chars
+
+        return two.pos[0] - one.pos[0] - 37.0
+
+    assert width(4.0) == pytest.approx(2.0 * width(2.0))
+    assert width(2.0) == pytest.approx(2.0 * PLACED_DIST_H)
+
+
+def test_a_space_puts_nothing_on_the_page(make_job):
+    job = with_space(make_job(lines=("1 2",), spacing=37.0))
+
+    chars = run(job, 1)[0].chars
+
+    assert [c.char for c in chars] == ["1", "2"]
+
+
+def test_a_space_gets_no_class_of_its_own(make_job):
+    """A blank has nothing to detect, so Tab 5 must never be asked for a class."""
+    job = with_space(make_job(lines=("1 2",)))
+
+    assert SPACE_CHAR not in job.characters()
+    assert all(c.cls_name != SPACE_CHAR for c in all_chars(run(job, 1)))
+
+
+def test_a_line_without_spaces_lays_out_exactly_as_before(make_job):
+    """The cursor must reduce to ``j * char_spacing`` when no slot is a space."""
+    job = make_job(lines=("123",), spacing=37.0)
+    chars = run(job, 7)[0].chars
+
+    origin = chars[0].pos[0]
+
+    assert [c.pos[0] - origin for c in chars] == pytest.approx([0.0, 37.0, 74.0])
+
+
+def test_a_saved_but_unused_space_costs_no_randomness(make_job):
+    """Saving a space in Tab 2 must not re-roll a job that does not write one."""
+    plain = all_chars(run(make_job(lines=("12",)), 3))
+    carrying = all_chars(run(with_space(make_job(lines=("12",))), 3))
+
+    assert [c.pos for c in plain] == [c.pos for c in carrying]
+    assert all(np.array_equal(a.ink, b.ink) for a, b in zip(plain, carrying))
+
+
+def test_a_leading_space_still_shifts_the_line(make_job):
+    job = with_space(make_job(lines=("1", " 1"), spacing=37.0), coeff=2.0)
+
+    first, second = run(job, 4)
+
+    assert second.chars[0].pos[0] - first.chars[0].pos[0] == pytest.approx(
+        2.0 * PLACED_DIST_H
+    )
+
+
+def test_a_character_with_nothing_drawn_on_it_asks_for_no_class(make_job):
+    """It gets no box either, so a class for it would train on nothing."""
+    job = make_job(lines=("12",))
+    job.char_formats["2"] = CharFormat("2")
+
+    assert job.characters() == ["1"]

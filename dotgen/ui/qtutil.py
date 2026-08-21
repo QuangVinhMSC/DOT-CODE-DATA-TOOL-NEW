@@ -42,3 +42,13 @@ def clear_layout(layout: QLayout, keep: Iterable[QWidget] = ()) -> None:
             continue
 
         w.deleteLater()
+
+
+def char_label(char: str) -> str:
+    """What a character looks like on a button or a bar.
+
+    A space is a character like any other to the generator and an empty button
+    to the user, so it is shown as the open-box glyph typography has always used
+    for one.  Everything else is itself.
+    """
+    return "␣" if char.isspace() else char

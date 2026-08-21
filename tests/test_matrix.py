@@ -1,7 +1,7 @@
 import pytest
 
 from dotgen.core.matrix import CharMetrics, solve_metrics, validate
-from dotgen.core.models import CharFormat, DotLink
+from dotgen.core.models import DEFAULT_SPACE_COEFF, CharFormat, DotLink
 
 DIST_H = 12.0
 DIST_V = 20.0
@@ -358,14 +358,161 @@ def test_zero_and_negative_coefficients_are_errors():
         assert any("Coefficient" in e for e in validate(f))
 
 
-def test_a_single_dot_is_an_error():
-    f = fmt([(2, 2)])
-
-    assert any("at least 2 dots" in e for e in validate(f))
+def test_an_empty_format_is_an_error():
+    assert any("at least 1 dot" in e for e in validate(fmt([])))
 
 
 def test_errors_are_human_readable_strings():
-    errors = validate(fmt([(2, 2)]))
+    errors = validate(fmt([]))
 
     assert errors
     assert all(isinstance(e, str) and e for e in errors)
+
+
+# ----------------------------------------------------------------------
+# how many constraints a character needs depends on how it extends
+# ----------------------------------------------------------------------
+
+
+def test_a_single_dot_needs_no_constraint():
+    """'.' has neither a width nor a height to scale."""
+    assert validate(fmt([(2, 2)], char=".")) == []
+
+
+def test_a_single_column_needs_only_the_vertical_constraint():
+    """':' -- one column, so there is no horizontal pitch to fix."""
+    f = fmt([(2, 1), (2, 4)], [DotLink(0, 1, "v", 1.0)], char=":")
+
+    assert validate(f) == []
+
+
+def test_a_single_row_needs_only_the_horizontal_constraint():
+    """'-' -- the mirror case."""
+    f = fmt([(1, 3), (3, 3)], [DotLink(0, 1, "h", 1.0)], char="-")
+
+    assert validate(f) == []
+
+
+def test_a_single_column_without_its_vertical_constraint_is_an_error():
+    f = fmt([(2, 1), (2, 4)], char=":")
+
+    assert any("1 vertical constraint" in e for e in validate(f))
+
+
+def test_a_single_row_without_its_horizontal_constraint_is_an_error():
+    f = fmt([(1, 3), (3, 3)], char="-")
+
+    assert any("1 horizontal constraint" in e for e in validate(f))
+
+
+def test_a_flat_axis_rejects_a_constraint_it_cannot_use():
+    """A link along the axis the dots do not extend along has no cells to span."""
+    f = fmt([(2, 1), (2, 4)], [DotLink(0, 1, "v", 1.0), DotLink(0, 1, "h", 1.0)], char=":")
+
+    assert validate(f)
+
+
+def test_a_one_dimensional_character_still_solves_its_pitch():
+    f = fmt([(2, 1), (2, 4)], [DotLink(0, 1, "v", 2.0)], char=":")
+
+    m = solve_metrics(f, DIST_H, DIST_V)
+
+    assert m.pitch_v == pytest.approx(2.0 * DIST_V / 3)
+    assert m.height == pytest.approx(3 * m.pitch_v)
+    assert m.width == pytest.approx(0.0)
+
+
+# ----------------------------------------------------------------------
+# the space -- a width, not a drawing
+# ----------------------------------------------------------------------
+
+
+def test_a_fresh_space_is_valid_without_being_drawn():
+    """The point of pre-configuring it: selecting it is already enough."""
+    f = CharFormat.space()
+
+    assert f.is_space
+    assert f.space_coeff == DEFAULT_SPACE_COEFF
+    assert validate(f) == []
+
+
+def test_a_space_is_as_wide_as_its_coefficient_says():
+    f = CharFormat.space(coeff=2.5)
+
+    m = solve_metrics(f, DIST_H, DIST_V)
+
+    assert m.width == pytest.approx(2.5 * DIST_H)
+    assert m.height == pytest.approx(0.0)
+    assert m.positions == {}
+
+
+def test_a_space_follows_the_horizontal_unit_it_is_a_ratio_of():
+    """Doubling dist.h doubles the space; that is the whole reason for a ratio."""
+    f = CharFormat.space(coeff=3.0)
+
+    assert solve_metrics(f, 2 * DIST_H, DIST_V).width == pytest.approx(
+        2 * solve_metrics(f, DIST_H, DIST_V).width
+    )
+
+
+def test_a_space_needs_a_positive_width():
+    f = CharFormat.space(coeff=0.0)
+
+    assert any("must be > 0" in e for e in validate(f))
+
+
+def test_a_space_that_carries_dots_is_an_error():
+    """The two ways of describing a character cannot both be in force."""
+    f = CharFormat.space()
+    f.dots = [(0, 0), (1, 0)]
+
+    assert any("blank" in e for e in validate(f))
+
+
+def test_a_drawn_character_reports_no_space_width():
+    """``space_width`` must not be mistaken for "how wide this character is"."""
+    f = valid_format()
+
+    assert f.is_space is False
+    assert f.space_width(DIST_H) == 0.0
+
+
+def test_a_space_survives_a_round_trip():
+    f = CharFormat.space(coeff=4.25)
+
+    assert CharFormat.from_dict(f.to_dict()).space_coeff == pytest.approx(4.25)
+    assert CharFormat.from_dict(f.to_dict()).is_space
+
+
+def test_a_format_written_before_spaces_existed_still_loads():
+    d = valid_format().to_dict()
+    d.pop("space_coeff")
+
+    assert CharFormat.from_dict(d).is_space is False
+
+
+def test_an_empty_whitespace_format_is_read_back_as_a_space():
+    """The migration: the only blank older builds could save was an invalid one."""
+    legacy = CharFormat(" ").to_dict()
+    legacy.pop("space_coeff")
+
+    migrated = CharFormat.from_dict(legacy)
+
+    assert migrated.is_space
+    assert migrated.space_coeff == DEFAULT_SPACE_COEFF
+    assert migrated.validate() == []
+
+
+def test_the_migration_leaves_a_drawn_character_alone():
+    d = valid_format().to_dict()
+    d.pop("space_coeff")
+
+    assert CharFormat.from_dict(d).is_space is False
+
+
+def test_the_migration_does_not_touch_a_dotless_visible_character():
+    """Only whitespace is a space; an unfinished 'A' is still unfinished."""
+    d = CharFormat("A").to_dict()
+    d.pop("space_coeff")
+
+    assert CharFormat.from_dict(d).is_space is False

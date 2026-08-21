@@ -15,14 +15,18 @@ import pytest
 
 from dotgen.core.classes import build_classes, class_index, dataset_classes
 from dotgen.core.export_yolo import (
+    FORMATS,
     ExportReport,
     image_seed,
     label_lines,
+    obb_label_lines,
+    quad_from_box,
+    quads_for,
     split_of,
     write_dataset,
 )
 from dotgen.core.exporter import ExportError, preflight, report_text, run_export
-from dotgen.core.models import ExportSpec, Quad
+from dotgen.core.models import ComposedImage, ExportSpec, Quad
 
 
 # ----------------------------------------------------------------------
@@ -133,6 +137,55 @@ def test_label_lines_clip_to_the_unit_square():
 
 
 # ----------------------------------------------------------------------
+# pieces -- the oriented format
+# ----------------------------------------------------------------------
+
+
+def test_quad_from_box_gives_the_rectangles_four_corners():
+    assert quad_from_box((0.5, 0.5, 0.2, 0.4)) == (0.4, 0.3, 0.6, 0.3, 0.6, 0.7, 0.4, 0.7)
+
+
+def test_obb_label_lines_are_a_class_and_eight_coordinates():
+    lines = obb_label_lines([("1", 0.1, 0.1, 0.3, 0.15, 0.3, 0.4, 0.1, 0.35)], {"1": 0})
+    parts = lines[0].split()
+
+    assert len(parts) == 9
+    assert parts[0] == "0"
+    assert [float(v) for v in parts[1:]] == [0.1, 0.1, 0.3, 0.15, 0.3, 0.4, 0.1, 0.35]
+
+
+def test_obb_label_lines_drop_unknown_classes_without_renumbering():
+    quads = [
+        ("1", *quad_from_box((0.5, 0.5, 0.1, 0.2))),
+        ("2_fail", *quad_from_box((0.1, 0.1, 0.1, 0.1))),
+        ("line1", *quad_from_box((0.5, 0.5, 0.4, 0.3))),
+    ]
+
+    assert [l.split()[0] for l in obb_label_lines(quads, {"1": 0, "line1": 1})] == ["0", "1"]
+
+
+def test_obb_label_lines_clip_to_the_unit_square():
+    lines = obb_label_lines([("1", -0.2, 0.1, 1.4, 0.1, 1.4, 0.9, -0.2, 0.9)], {"1": 0})
+    values = [float(v) for v in lines[0].split()[1:]]
+
+    assert values[0] == 0.0 and values[2] == 1.0
+
+
+def test_quads_are_derived_when_the_composer_reports_only_boxes():
+    """An engine that knows nothing about orientation can still be exported."""
+    composed = ComposedImage(image=None, boxes=[("1", 0.5, 0.5, 0.2, 0.4)])
+
+    assert quads_for(composed) == [("1", 0.4, 0.3, 0.6, 0.3, 0.6, 0.7, 0.4, 0.7)]
+
+
+def test_quads_reported_by_the_composer_are_used_as_they_are():
+    quad = ("1", 0.1, 0.2, 0.3, 0.1, 0.4, 0.3, 0.2, 0.4)
+    composed = ComposedImage(image=None, boxes=[("1", 0.25, 0.25, 0.3, 0.3)], quads=[quad])
+
+    assert quads_for(composed) == [quad]
+
+
+# ----------------------------------------------------------------------
 # write_dataset
 # ----------------------------------------------------------------------
 
@@ -165,6 +218,111 @@ def test_writes_a_loadable_yolo_folder(make_job, tmp_path):
             assert len(parts) == 5
             assert 0 <= int(parts[0]) < len(names)
             assert all(0.0 <= float(v) <= 1.0 for v in parts[1:])
+
+
+def test_writes_a_loadable_yolo_obb_folder(make_job, tmp_path):
+    job = make_job(("12",))
+    report = write_dataset([job], spec_for(tmp_path, images_per_job=6, fmt="yolo-obb"))
+
+    assert report.images == 6
+    assert report.fmt == "yolo-obb"
+
+    names = read_yaml_names(tmp_path)
+    assert names == dataset_classes([job])
+
+    images = image_files(tmp_path)
+    labels = label_files(tmp_path)
+
+    assert len(images) == 6
+    assert [os.path.basename(p)[:-4] for p in images] == [
+        os.path.basename(p)[:-4] for p in labels
+    ]
+
+    for path in labels:
+        rows = open(path, encoding="utf-8").read().splitlines()
+        assert rows
+
+        for row in rows:
+            parts = row.split()
+            assert len(parts) == 9  # class + four corners
+            assert 0 <= int(parts[0]) < len(names)
+            assert all(0.0 <= float(v) <= 1.0 for v in parts[1:])
+
+
+def test_both_formats_label_the_same_objects_on_the_same_images(make_job, tmp_path):
+    """Only the shape of a label line changes -- not the pixels, not the counts."""
+    hbb, obb = tmp_path / "hbb", tmp_path / "obb"
+
+    a = write_dataset([make_job(("12",))], spec_for(hbb, images_per_job=4, seed=7))
+    b = write_dataset(
+        [make_job(("12",))], spec_for(obb, images_per_job=4, seed=7, fmt="yolo-obb")
+    )
+
+    assert (a.images, a.boxes, a.class_counts) == (b.images, b.boxes, b.class_counts)
+    assert a.split_counts == b.split_counts
+
+    for pa, pb in zip(image_files(hbb), image_files(obb)):
+        assert open(pa, "rb").read() == open(pb, "rb").read()
+
+    for pa, pb in zip(label_files(hbb), label_files(obb)):
+        rows_a = open(pa, encoding="utf-8").read().splitlines()
+        rows_b = open(pb, encoding="utf-8").read().splitlines()
+
+        assert [r.split()[0] for r in rows_a] == [r.split()[0] for r in rows_b]
+
+
+def test_an_obb_quad_still_covers_its_axis_aligned_box(make_job, tmp_path):
+    """A corner-by-corner check that the oriented labels bound the same ink."""
+    hbb, obb = tmp_path / "hbb", tmp_path / "obb"
+
+    write_dataset([make_job(("123",))], spec_for(hbb, images_per_job=3, seed=11))
+    write_dataset(
+        [make_job(("123",))], spec_for(obb, images_per_job=3, seed=11, fmt="yolo-obb")
+    )
+
+    for pa, pb in zip(label_files(hbb), label_files(obb)):
+        for row_a, row_b in zip(
+            open(pa, encoding="utf-8").read().splitlines(),
+            open(pb, encoding="utf-8").read().splitlines(),
+        ):
+            cx, cy, w, h = (float(v) for v in row_a.split()[1:])
+            xs = [float(v) for v in row_b.split()[1::2]]
+            ys = [float(v) for v in row_b.split()[2::2]]
+
+            assert min(xs) <= cx - w / 2 + 1e-5 and max(xs) >= cx + w / 2 - 1e-5
+            assert min(ys) <= cy - h / 2 + 1e-5 and max(ys) >= cy + h / 2 - 1e-5
+
+
+def test_an_obb_re_export_is_byte_identical(make_job, tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    fields = dict(images_per_job=4, seed=99, fmt="yolo-obb")
+
+    write_dataset([make_job(("12",))], spec_for(a, **fields))
+    write_dataset([make_job(("12",))], spec_for(b, **fields))
+
+    for pa, pb in zip(image_files(a) + label_files(a), image_files(b) + label_files(b)):
+        assert open(pa, "rb").read() == open(pb, "rb").read()
+
+
+def test_the_report_records_which_format_was_written(make_job, tmp_path):
+    write_dataset([make_job(("12",))], spec_for(tmp_path, images_per_job=2, fmt="yolo-obb"))
+    data = json.loads((tmp_path / "export_report.json").read_text(encoding="utf-8"))
+
+    assert data["fmt"] == "yolo-obb"
+
+
+def test_an_unknown_format_is_refused_by_both_gates(make_job, tmp_path):
+    spec = spec_for(tmp_path, fmt="coco")
+
+    assert any("coco" in e for e in preflight([make_job(("12",))], spec))
+
+    with pytest.raises(ValueError):
+        write_dataset([make_job(("12",))], spec)
+
+
+def test_preflight_passes_every_known_format(make_job, tmp_path):
+    for fmt in FORMATS:
+        assert preflight([make_job(("12",))], spec_for(tmp_path, fmt=fmt)) == []
 
 
 def test_data_yaml_declares_every_split_and_the_count(make_job, tmp_path):

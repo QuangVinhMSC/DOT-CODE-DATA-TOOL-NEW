@@ -199,7 +199,13 @@ class Tab3Summary(QWidget):
     # ==================================================================
 
     def _refresh_chars(self) -> None:
-        chars = self.state.saved_chars()
+        # Spaces are left out: the two frames compare a *rendered* character,
+        # and a blank looks the same at Min as it does at Max.
+        chars = [
+            c
+            for c in self.state.saved_chars()
+            if not self.state.char_formats[c].is_space
+        ]
         current = self.char_combo.currentText()
 
         self.char_combo.blockSignals(True)

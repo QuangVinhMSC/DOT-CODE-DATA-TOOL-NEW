@@ -15,10 +15,10 @@ from __future__ import annotations
 import os
 
 from .classes import validate_classes
-from .export_yolo import ExportReport, Progress, write_dataset
+from .export_yolo import FORMATS, ExportReport, Progress, write_dataset
 from .models import ExportSpec, Job
 
-__all__ = ["ExportError", "preflight", "report_text", "run_export"]
+__all__ = ["ExportError", "FORMATS", "preflight", "report_text", "run_export"]
 
 
 class ExportError(RuntimeError):
@@ -47,8 +47,10 @@ def preflight(jobs: list[Job], spec: ExportSpec) -> list[str]:
     if sum(spec.split) <= 0:
         errors.append("The train/val/test split is all zeros.")
 
-    if spec.fmt != "yolo":
-        errors.append(f"Unknown export format '{spec.fmt}'.")
+    if spec.fmt not in FORMATS:
+        errors.append(
+            f"Unknown export format '{spec.fmt}'. Known formats: {', '.join(FORMATS)}."
+        )
 
     for job in jobs:
         for e in validate_classes(job.classes, job.characters()):
@@ -91,7 +93,7 @@ def report_text(report: ExportReport) -> str:
         report.out_dir,
         "",
         f"{report.boxes} boxes over {len(report.classes)} classes"
-        f"  ({report.elapsed:.1f} s, seed {report.seed})",
+        f"  ({report.fmt}, {report.elapsed:.1f} s, seed {report.seed})",
         "  " + "  ".join(f"{s}: {n}" for s, n in report.split_counts.items()),
     ]
 
