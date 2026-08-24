@@ -1,7 +1,11 @@
 """Tab 4 -- Create job.
 
 Left: the background set, its common size, and the base quadrilateral that every
-background must carry before Tab 5 unlocks.
+background must carry before Tabs 5 and 6 unlock.  Over the preview sit the two
+bounding-box controls: **Show bounding boxes**, which draws the labels this job
+would export, and **Box size**, one number of pixels added to every edge of
+every one of them.  They belong together and belong here -- a pad is a number
+you can only sensibly choose while looking at the boxes it moves.
 Right: lines, characters, replacements, spacings and the defective-dot settings.
 
 The Min / Mean / Max bars used to have a third column here.  They live in Tab 3
@@ -14,10 +18,13 @@ preview still redraws on ``paramsChanged``, which is how a Tab 3 Load shows up.
 from __future__ import annotations
 
 import numpy as np
-from PySide6.QtCore import QTimer, Qt, Signal
+from PySide6.QtCore import QPointF, QTimer, Qt, Signal
+from PySide6.QtGui import QPolygonF
 from PySide6.QtWidgets import (
+    QCheckBox,
     QDoubleSpinBox,
     QFileDialog,
+    QGraphicsPolygonItem,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -32,19 +39,34 @@ from PySide6.QtWidgets import (
 
 from ...core import registry
 from ...core.imageops import load_image
-from ...core.models import DefectSpec, Quad
+from ...core.models import DEFECT_CLASS_PREFIX, DefectSpec, Quad
+from ...core.params import RangeParam
 from ...core.state import AppState
 from .. import theme
 from ..widgets.bg_strip import BgStrip
 from ..widgets.image_canvas import ImageCanvas, ToolMode
 from ..widgets.line_editor import LineEditor
-from ..widgets.overlay_items import QuadItem
+from ..widgets.overlay_items import QuadItem, cosmetic_pen
+from ..widgets.range_bar import RangeBar
 
 IMAGE_FILTER = "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff);;All files (*)"
 PREVIEW_SEED = 7
 
 # How long a parameter drag has to be still before the preview recomposes.
 PREVIEW_DELAY_MS = 200
+
+# The bounding-box pad is a plain number of pixels with no useful bound of its
+# own -- how far a box may usefully grow depends on the print, not on us -- so
+# the spinbox is given a range wide enough to be no limit at all.
+PAD_LIMIT = 1.0e6
+
+PAD_NOTE = (
+    "Pixels added to every edge of every bounding box, characters and lines "
+    "alike, in this job's dataset.\n"
+    "0 is the box around the ink exactly as it was printed; a negative value "
+    "pulls the edges in, a positive one pushes them out.\n"
+    "The image itself does not change -- only the labels that are exported."
+)
 
 
 class Tab4Job(QWidget):
@@ -56,6 +78,7 @@ class Tab4Job(QWidget):
         self.active_bg = -1
         self._shown_bg = -2
         self._quad_item: QuadItem | None = None
+        self._box_items: list[QGraphicsPolygonItem] = []
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._build_background_column())
@@ -105,6 +128,29 @@ class Tab4Job(QWidget):
         )
         self.quad_button.toggled.connect(self._on_quad_tool)
         rl.addWidget(self.quad_button)
+
+        self.show_boxes = QCheckBox("Show bounding boxes")
+        self.show_boxes.setToolTip(
+            "Draw the labels this job would export over the preview.\n"
+            "Nothing about the dataset changes -- this only shows it."
+        )
+        self.show_boxes.toggled.connect(lambda _on: self.refresh())
+        rl.addWidget(self.show_boxes)
+
+        rl.addWidget(QLabel("Box size"))
+
+        self.box_pad = QDoubleSpinBox()
+        self.box_pad.setRange(-PAD_LIMIT, PAD_LIMIT)
+        self.box_pad.setDecimals(2)
+        self.box_pad.setSingleStep(0.5)
+        self.box_pad.setSuffix(" px")
+        self.box_pad.setValue(self.state.box_pad)
+        # Without this a typed "-12" recomposes the preview at "-", "-1" and
+        # "-12"; with it the value lands once, on Enter or on focus out.
+        self.box_pad.setKeyboardTracking(False)
+        self.box_pad.setToolTip(PAD_NOTE)
+        self.box_pad.valueChanged.connect(self.state.set_box_pad)
+        rl.addWidget(self.box_pad)
 
         rl.addStretch(1)
         lay.addWidget(row)
@@ -177,11 +223,56 @@ class Tab4Job(QWidget):
         self.line_editor.replacementsChanged.connect(self.state.set_replacements)
         self.line_editor.spacingChanged.connect(self.state.set_char_spacing)
         self.line_editor.gapChanged.connect(self.state.set_line_gap)
+        self.line_editor.spacingBoundChanged.connect(self.state.set_char_spacing_field)
+        self.line_editor.gapBoundChanged.connect(self.state.set_line_gap_field)
         bl.addWidget(self.line_editor, 1)
 
         lay.addWidget(box, 1)
+        lay.addWidget(self._build_rotation())
         lay.addWidget(self._build_defects())
         return w
+
+    def _build_rotation(self) -> QWidget:
+        """The one bar that lives here rather than in Tab 3.
+
+        Every other Min/Mean/Max bar is a *measurement* of the sampled print and
+        belongs beside the two frames that show what moving it does.  This one
+        measures nothing: it is a property of the job -- how crooked the printed
+        code is allowed to sit -- so it sits with the lines it turns.
+        """
+        box = QGroupBox("Line rotation")
+        bl = QVBoxLayout(box)
+
+        self.rot_bar = RangeBar(self._rot_param(), show_enable=True, label_width=110)
+        self.rot_bar.setToolTip(
+            "Turns the whole block, every line and character of it, about its\n"
+            "own centre.  Mean alone prints every image at the same angle; Min\n"
+            "and Max apart draw one fresh angle per image, uniformly across the\n"
+            "range."
+        )
+        self.rot_bar.valueChanged.connect(self.state.set_param)
+        self.rot_bar.enabledToggled.connect(self.state.set_param_enabled)
+        bl.addWidget(self.rot_bar)
+
+        note = QLabel(
+            "The angle of the whole code block. It does not touch Tilt X / "
+            "Tilt Y, which describe the printed surface and shape the "
+            "characters themselves."
+        )
+        note.setObjectName("hint")
+        note.setWordWrap(True)
+        bl.addWidget(note)
+        return box
+
+    def _rot_param(self) -> RangeParam:
+        """The live ``line.rot``, or a stand-in for a config that predates it.
+
+        Loading a job replaces the whole ParamSet, so the bar is re-pointed on
+        every refresh rather than being handed one object for good.
+        """
+        p = self.state.params.get("line.rot")
+
+        return p if p is not None else RangeParam("line.rot", "Line rotation", "deg")
 
     def _build_defects(self) -> QWidget:
         box = QGroupBox("Defective dots")
@@ -349,6 +440,13 @@ class Tab4Job(QWidget):
 
         self.strip.set_backgrounds(specs, self.active_bg)
         self.line_editor.set_lines(self.state.lines, self.state.line_gaps)
+        self.rot_bar.setParam(self._rot_param())
+
+        # Loading a job or a config replaces the value under the spinbox.
+        if self.box_pad.value() != self.state.box_pad:
+            self.box_pad.blockSignals(True)
+            self.box_pad.setValue(self.state.box_pad)
+            self.box_pad.blockSignals(False)
 
         missing = self.state.backgrounds_missing_quad()
 
@@ -356,7 +454,7 @@ class Tab4Job(QWidget):
             self.banner.setText(
                 "These backgrounds still need a base quadrilateral: "
                 + ", ".join(f"#{i + 1}" for i in missing)
-                + ".  Tab 5 stays locked until every background has one."
+                + ".  Tabs 5 and 6 stay locked until every background has one."
             )
             self.banner.setVisible(True)
         else:
@@ -366,6 +464,7 @@ class Tab4Job(QWidget):
         if self.active_bg < 0:
             self.canvas.set_image(None)
             self.canvas.clear_overlays()
+            self._box_items = []
             self.size_label.setText("")
             self._shown_bg = -2
             return
@@ -386,6 +485,7 @@ class Tab4Job(QWidget):
     def _render_preview(self, spec) -> None:
         """Background plus the characters and lines, drawn at its centre."""
         image = spec.array
+        quads: list[tuple] = []
 
         if image is not None and self.state.has_content():
             job = self.state.snapshot_job("preview")
@@ -395,6 +495,7 @@ class Tab4Job(QWidget):
                     job, self.active_bg, np.random.default_rng(PREVIEW_SEED)
                 )
                 image = composed.image
+                quads = list(composed.quads)
             except Exception as exc:  # noqa: BLE001 - a preview must never crash the tab
                 self.statusMessage.emit(f"Preview unavailable: {exc}")
 
@@ -402,6 +503,50 @@ class Tab4Job(QWidget):
         self.canvas.set_image(image, keep_view=not first)
         self._shown_bg = self.active_bg
         self._sync_quad_overlay(spec, rebuilt=first)
+        self._sync_box_overlay(quads, image)
+
+    def _sync_box_overlay(self, quads, image) -> None:
+        """The composed labels, drawn where they landed -- pad included.
+
+        The polygons come back from ``compose`` already padded, so what is on
+        screen is the shape that would be written to the label file, not a
+        redrawing of it here that could drift out of step with the exporter.
+
+        The *polygon* rather than the axis-aligned box, because that is what a
+        label now is: fitted to the dot matrix and turned by whatever ``tilt.*``
+        and ``line.rot`` did to the print.  The plain ``yolo`` format writes
+        this polygon's upright envelope, which is exactly what the drawn shape
+        spans -- and on a job with no tilt the two are the same rectangle they
+        always were.
+
+        Items are dropped one by one rather than through
+        ``canvas.clear_overlays()``: the base quadrilateral shares this scene
+        and may be under the user's cursor.
+        """
+        for item in self._box_items:
+            self.canvas.remove_overlay(item)
+
+        self._box_items = []
+
+        if image is None or not self.show_boxes.isChecked():
+            return
+
+        width, height = float(image.shape[1]), float(image.shape[0])
+
+        for name, *coords in quads:
+            item = QGraphicsPolygonItem(
+                QPolygonF(
+                    [
+                        QPointF(coords[i] * width, coords[i + 1] * height)
+                        for i in range(0, 8, 2)
+                    ]
+                )
+            )
+            defect = name.startswith(DEFECT_CLASS_PREFIX)
+            item.setPen(cosmetic_pen(theme.WARN_AMBER if defect else theme.BOUND_BLUE))
+            item.setZValue(20.0)
+            self.canvas.add_overlay(item)
+            self._box_items.append(item)
 
     def _sync_quad_overlay(self, spec, rebuilt: bool) -> None:
         """Create/drop the quad item without ever recreating it mid-drag.
@@ -413,6 +558,7 @@ class Tab4Job(QWidget):
         if rebuilt:
             self.canvas.clear_overlays()
             self._quad_item = None
+            self._box_items = []
 
         if spec.base_quad is None:
             if self._quad_item is not None:

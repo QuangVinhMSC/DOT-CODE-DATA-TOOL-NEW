@@ -1,4 +1,4 @@
-"""What Tab 6's "Export data" button actually calls.
+"""What Tab 7's "Export data" button actually calls.
 
 :mod:`export_yolo` knows the format; this module knows the *run*: refuse an
 export that cannot produce a usable dataset, dispatch on ``spec.fmt``, and turn
@@ -16,9 +16,16 @@ import os
 
 from .classes import validate_classes
 from .export_yolo import FORMATS, ExportReport, Progress, write_dataset
-from .models import ExportSpec, Job
+from .models import DEFECT_LABELS, ExportSpec, Job, defect_class_name
 
-__all__ = ["ExportError", "FORMATS", "preflight", "report_text", "run_export"]
+__all__ = [
+    "ExportError",
+    "FORMATS",
+    "preflight",
+    "preflight_warnings",
+    "report_text",
+    "run_export",
+]
 
 
 class ExportError(RuntimeError):
@@ -53,7 +60,10 @@ def preflight(jobs: list[Job], spec: ExportSpec) -> list[str]:
         )
 
     for job in jobs:
-        for e in validate_classes(job.classes, job.characters()):
+        # ``job.line_defects`` is what makes an enabled defect with no enabled
+        # class an error; the check lives in ``validate_classes`` so the class
+        # tab and the export refuse for the same reason, in the same words.
+        for e in validate_classes(job.classes, job.characters(), job.line_defects):
             errors.append(f"{job.name}: {e}")
 
         if not job.backgrounds:
@@ -70,6 +80,40 @@ def preflight(jobs: list[Job], spec: ExportSpec) -> list[str]:
             )
 
     return errors
+
+
+def preflight_warnings(jobs: list[Job], spec: ExportSpec) -> list[str]:
+    """Reasons to hesitate, not reasons to refuse -- shown before the run starts.
+
+    Kept apart from :func:`preflight` on purpose: an export whose only problem
+    is a rare defect is still a valid export, and folding these into the error
+    list would make the one list mean two things.
+
+    The check is the arithmetic a user does not do in their head.  A kind that
+    fires on ``p_line`` of the lines, over ``len(job.lines)`` lines and
+    ``images_per_job`` images, is expected to hit ``p_line * lines * images``
+    lines in total; below one, the class it labels will very likely have no box
+    anywhere in the finished dataset, and the four minutes have been spent
+    training nothing.  ``report.empty_classes`` says the same thing afterwards.
+    """
+    warnings: list[str] = []
+    images = max(int(spec.images_per_job), 0)
+
+    for job in jobs:
+        n_lines = len(job.lines)
+
+        for kind in job.line_defects.enabled_kinds():
+            expected = job.line_defects.get(kind).p_line * n_lines * images
+
+            if expected < 1.0:
+                warnings.append(
+                    f"{job.name}: '{DEFECT_LABELS[kind]}' is expected to hit "
+                    f"{expected:.2f} line(s) over the whole run, so "
+                    f"'{defect_class_name(kind)}' will very likely be empty. "
+                    f"Raise its chance per line, or the images per job."
+                )
+
+    return warnings
 
 
 def run_export(
@@ -96,6 +140,18 @@ def report_text(report: ExportReport) -> str:
         f"  ({report.fmt}, {report.elapsed:.1f} s, seed {report.seed})",
         "  " + "  ".join(f"{s}: {n}" for s, n in report.split_counts.items()),
     ]
+
+    if report.line_defects:
+        # Lines damaged per kind, worst first.  A kind that fired at all but
+        # whose class is still empty is a line that carried a higher-priority
+        # kind's class instead -- ``empty_classes`` below is where that shows.
+        lines.append(
+            "  Line defects: "
+            + ", ".join(
+                f"{k} {n}"
+                for k, n in sorted(report.line_defects.items(), key=lambda kv: (-kv[1], kv[0]))
+            )
+        )
 
     if report.cancelled:
         lines.insert(

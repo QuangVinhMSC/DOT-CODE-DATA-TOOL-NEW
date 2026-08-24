@@ -11,29 +11,50 @@ that is written out is the integer paste rectangle, not the float one layout
 computed.  Half a pixel of disagreement between an image and its label is the
 sort of thing that quietly costs a point of mAP.
 
+*Except by exactly ``job.box_pad``.*  Tab 4 offers one number, in pixels, that
+moves every edge of every box out (positive) or in (negative) -- a detector
+trained on ink-tight boxes and one trained on boxes with a pixel of air around
+them are different detectors, and which is better is a question for the
+training run, not for this module.  It is applied here, once, at the last step
+before normalising, so the character boxes, the line boxes and both label
+formats move together and no caller can forget it.
+
 *Both characters and lines are labelled* (General Rule 4).  A line's box is the
 union of the characters actually drawn on it, including any that carry no class
 of their own -- the line still covers them.
 
-*Every label exists in both shapes.*  ``boxes`` and ``quads`` are built in the
-same pass and stay parallel -- same class, same order, one entry each -- so
-exporting oriented boxes changes the shape of a label line and nothing else.
-Characters are pasted upright, so a character's quad is its rectangle's four
-corners; a line is the minimum-area rectangle over the characters on it, which
-is genuinely tilted once perspective puts the text on a receding surface, and
-is where the oriented format earns its extra four numbers.
+*Every label exists in both shapes, and the quad is the one that is real.*
+``boxes`` and ``quads`` are built in the same pass and stay parallel -- same
+class, same order, one entry each -- so exporting oriented boxes changes the
+shape of a label line and nothing else.  The quad is
+:mod:`~dotgen.core.polygons`' oriented polygon, fitted to the dot matrix back
+in :mod:`~dotgen.core.render_char` and carried here through every transform
+that moved the glyph; the box is that polygon's upright envelope.  Deriving one
+from the other rather than measuring them separately is what stops the two
+export formats describing subtly different objects, and it is why a tilted
+character no longer gets a box a third full of paper.
+
+A line's quad is the minimum-area rectangle over the *character quads* on it,
+not over their rectangles: fitting to upright boxes would put the line's own
+corners back out where the characters' corners were not.
+
+*The two defect tallies are counted apart.*  ``meta["defects"]`` counts damaged
+**dots**, summed off every character; ``meta["line_defects"]`` counts damaged
+**lines**, one per kind per line it fired on.  They are different units of
+different failures and adding them together would be meaningless, which is why
+they never share a key.
 
 Numpy and OpenCV only.
 """
 
 from __future__ import annotations
 
-import cv2
 import numpy as np
 
+from . import polygons
 from .imageops import clip_rect, white_canvas
 from .ink import paste_ink_rect
-from .layout import LayoutError, PlacedLine, layout_job
+from .layout import LayoutError, PlacedChar, PlacedLine, layout_job
 from .models import ComposedImage, Job
 
 # Boxes smaller than this are dropped: two pixels square is not a character, it
@@ -56,6 +77,23 @@ def _paste_rect(image: np.ndarray, char) -> tuple[int, int, int, int]:
     return (x, y, w, h)
 
 
+def _placed_quad(char: PlacedChar, rect: tuple[int, int, int, int]) -> np.ndarray:
+    """One character's oriented label, moved onto the pixels it was pasted at.
+
+    :func:`_paste_rect` rounds the float box layout computed to whole pixels,
+    because that is where the ink really went; the polygon is shifted by the
+    same fraction of a pixel so it stays on the ink rather than on the box that
+    was asked for.  A character from an engine that does not model orientation
+    falls back to its paste rectangle, which is exactly what it used to get.
+    """
+    if char.quad is None:
+        return polygons.rect(*(float(v) for v in rect))
+
+    return polygons.translated(
+        char.quad, rect[0] - char.bbox[0], rect[1] - char.bbox[1]
+    )
+
+
 def _normalised(
     rect: tuple[float, float, float, float], size: tuple[int, int]
 ) -> tuple[float, float, float, float] | None:
@@ -70,49 +108,47 @@ def _normalised(
     return ((x + w / 2.0) / iw, (y + h / 2.0) / ih, w / iw, h / ih)
 
 
-def _rect_quad(
-    rect: tuple[float, float, float, float], size: tuple[int, int]
-) -> Quad8 | None:
-    """The clipped rectangle's four corners, normalised, clockwise from top-left.
+def _label(
+    quad: np.ndarray, size: tuple[int, int]
+) -> tuple[tuple[float, float, float, float], Quad8] | None:
+    """One polygon as both label shapes, or ``None`` when it is not worth one.
 
-    Same clipping and same minimum area as :func:`_normalised`, so a character
-    that gets a box always gets a quad and vice versa.
-    """
-    x, y, w, h = clip_rect(rect, size)
+    The two come back together, from the one polygon, so an object can never
+    end up in ``boxes`` but not ``quads`` or the other way round -- which is
+    the invariant the exporter relies on to switch formats without changing
+    which objects are labelled.  The single minimum-area test is applied to the
+    upright envelope, as it always was.
 
-    if w * h < MIN_BOX_AREA:
-        return None
-
-    iw, ih = float(size[0]), float(size[1])
-    x0, y0 = x / iw, y / ih
-    x1, y1 = (x + w) / iw, (y + h) / ih
-
-    return (x0, y0, x1, y0, x1, y1, x0, y1)
-
-
-def _min_area_quad(rects: list[tuple[int, int, int, int]], size: tuple[int, int]) -> Quad8:
-    """The tightest rotated rectangle around every corner of ``rects``.
-
-    Corners, not centres: a rectangle fitted through the character centres would
-    cut the top and bottom rows of dots off the line it is supposed to bound.
-    Coordinates are normalised and clamped rather than polygon-clipped -- a
+    Coordinates are normalised and clamped rather than polygon-clipped: a
     corner just off the page is the normal case for text near a margin, and
     ultralytics only asks that the numbers be in [0, 1].
     """
-    corners = np.array(
-        [
-            (x, y)
-            for (x, y, w, h) in rects
-            for x, y in ((x, y), (x + w, y), (x + w, y + h), (x, y + h))
-        ],
-        dtype=np.float32,
-    )
+    box = _normalised(polygons.envelope(quad), size)
 
-    pts = cv2.boxPoints(cv2.minAreaRect(corners))
+    if box is None:
+        return None
+
     iw, ih = float(size[0]), float(size[1])
-    flat = [float(min(max(v, 0.0), 1.0)) for p in pts for v in (p[0] / iw, p[1] / ih)]
+    flat = [
+        float(min(max(v, 0.0), 1.0))
+        for px, py in quad
+        for v in (px / iw, py / ih)
+    ]
 
-    return tuple(flat)  # type: ignore[return-value]
+    return box, tuple(flat)  # type: ignore[return-value]
+
+
+def _line_quad(parts: list[np.ndarray]) -> np.ndarray:
+    """The tightest rotated rectangle around every corner of ``parts``.
+
+    Corners, not centres: a rectangle fitted through the character centres
+    would cut the top and bottom rows of dots off the line it is supposed to
+    bound.  Under a perspective warp the character polygons are not all
+    parallel to each other, so there is no orientation to inherit and the line
+    genuinely has to be re-fitted -- which is why this is the one label in the
+    project that comes out of a fit rather than out of the transform chain.
+    """
+    return polygons.fit(np.concatenate(parts, axis=0))
 
 
 def compose(job: Job, bg_index: int, rng: np.random.Generator) -> ComposedImage:
@@ -136,18 +172,24 @@ def compose(job: Job, bg_index: int, rng: np.random.Generator) -> ComposedImage:
     size = (width, height)
 
     lines: list[PlacedLine] = layout_job(job, bg, rng)
+    pad = float(job.box_pad)
 
     boxes: list[tuple[str, float, float, float, float]] = []
     quads: list[tuple[str, ...]] = []
     defect_totals: dict[str, int] = {}
+    line_totals: dict[str, int] = {}
     n_chars = 0
 
     for line in lines:
-        drawn: list[tuple[int, int, int, int]] = []
+        drawn: list[np.ndarray] = []
+
+        for kind in line.defects:
+            line_totals[kind] = line_totals.get(kind, 0) + 1
 
         for char in line.chars:
             rect = _paste_rect(image, char)
-            drawn.append(rect)
+            quad = _placed_quad(char, rect)
+            drawn.append(quad)
             n_chars += 1
 
             for kind, count in char.defects.items():
@@ -156,25 +198,33 @@ def compose(job: Job, bg_index: int, rng: np.random.Generator) -> ComposedImage:
             if char.cls_name is None:
                 continue
 
-            box = _normalised(rect, size)
+            label = _label(polygons.grown(quad, pad), size)
 
-            if box is not None:
+            if label is not None:
+                box, corners = label
                 boxes.append((char.cls_name, *box))
-                quads.append((char.cls_name, *_rect_quad(rect, size)))
+                quads.append((char.cls_name, *corners))
+
+        # Ink that belongs to the line but is not a character: an ``ink_cover``
+        # smear.  It is pasted after the characters, so it lies over them the way
+        # it did on the label, and it joins ``drawn`` -- the smear is part of what
+        # went wrong with that line, and the line's box has to cover it.  It is
+        # deliberately not counted in ``n_chars``: nothing was printed here.
+        for (ox, oy), ink in line.overlays:
+            paste_ink_rect(image, ox, oy, ink)
+            drawn.append(
+                polygons.rect(ox, oy, float(ink.shape[1]), float(ink.shape[0]))
+            )
 
         if not drawn or line.cls_name is None:
             continue
 
-        x0 = min(r[0] for r in drawn)
-        y0 = min(r[1] for r in drawn)
-        x1 = max(r[0] + r[2] for r in drawn)
-        y1 = max(r[1] + r[3] for r in drawn)
+        label = _label(polygons.grown(_line_quad(drawn), pad), size)
 
-        box = _normalised((x0, y0, x1 - x0, y1 - y0), size)
-
-        if box is not None:
+        if label is not None:
+            box, corners = label
             boxes.append((line.cls_name, *box))
-            quads.append((line.cls_name, *_min_area_quad(drawn, size)))
+            quads.append((line.cls_name, *corners))
 
     return ComposedImage(
         image=image,
@@ -188,5 +238,6 @@ def compose(job: Job, bg_index: int, rng: np.random.Generator) -> ComposedImage:
             "lines": len(lines),
             "scale": lines[0].scale if lines else 1.0,
             "defects": defect_totals,
+            "line_defects": line_totals,
         },
     )

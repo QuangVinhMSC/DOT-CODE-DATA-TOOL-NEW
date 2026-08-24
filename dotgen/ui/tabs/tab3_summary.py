@@ -5,10 +5,11 @@ Checking a parameter's box renders the top frame at that parameter's Min and the
 bottom frame at its Max; unchecked parameters use the Mean in both.
 
 This is also where the parameters are *edited*.  Tab 1 measures them and shows
-them read-only because it re-measures constantly; here the handles are live, and
-they move a draft rather than the job.  Both frames render from that draft, so
-the effect of a drag is on screen immediately -- but the exporter, Tab 4's
-preview and every saved job keep the old numbers until **Load** is pressed.
+them read-only because it re-measures constantly; here each parameter is three
+numbers you can type -- Min, Mean, Max -- and they move a draft rather than the
+job.  Both frames render from that draft, so the effect of an entered number is
+on screen immediately -- but the exporter, Tab 4's preview and every saved job
+keep the old numbers until **Load** is pressed.
 Seeing a change and committing to it are two different decisions, and the two
 preview frames exist precisely so the first can be made before the second.
 """
@@ -140,17 +141,24 @@ class Tab3Summary(QWidget):
         lay = QVBoxLayout(box)
 
         self.bars = RangeBarList(
-            self.state, show_compare=True, editable=True, draft=True, label_width=140
+            self.state,
+            show_compare=True,
+            editable=True,
+            draft=True,
+            numeric=True,
+            label_width=140,
         )
         self.bars.setToolTip(
-            "Drag the red dot for the mean and the blue dots for min and max.\n"
+            "Click a field to type a value, then press Enter to apply it.\n"
             "The frames follow at once; Load is what hands the values to the job."
         )
+        self.bars.editRejected.connect(self.statusMessage)
         lay.addWidget(self.bars, 1)
 
         legend = QLabel(
-            "Red dot = Mean.   Two blue dots = Min and Max.\n"
-            "Tick a bar to render its Min in the top frame and its Max in the bottom frame."
+            "Three fields per parameter, left to right: Min, Mean (red), Max.\n"
+            "Click one to type a number and press Enter to apply it; Escape leaves it as it was.\n"
+            "Tick a row to render its Min in the top frame and its Max in the bottom frame."
         )
         legend.setObjectName("hint")
         legend.setWordWrap(True)
@@ -162,7 +170,7 @@ class Tab3Summary(QWidget):
 
         self.load_button = QPushButton("Load")
         self.load_button.setToolTip(
-            "Hand the edited values to the job.\n"
+            "Hand the entered values to the job.\n"
             "Until this is pressed they only affect the two frames above."
         )
         self.load_button.clicked.connect(self._load_params)

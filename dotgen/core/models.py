@@ -12,7 +12,7 @@ from typing import Literal, Sequence
 
 import numpy as np
 
-from .params import ParamSet
+from .params import Mode, ParamSet
 
 Axis = Literal["h", "v"]
 ClassKind = Literal["char_pass", "char_fail", "line"]
@@ -607,6 +607,245 @@ class DefectSpec:
         return DefectSpec(**d)
 
 
+# ======================================================================
+# Line-level defects (Tab 5 "Defect generation")
+# ======================================================================
+#
+# Not to be confused with ``DefectSpec`` above.  That one is Tab 4's and
+# damages individual *dots* inside a character -- a dot that did not fire, a
+# dot that landed askew.  The structures below damage whole *lines*: a print
+# head that lifted, a wet label that was touched, a web that slipped under the
+# head.  The two are configured in different tabs, applied by different modules
+# and produce different classes; keep them apart.
+
+
+# The line-level defect kinds, in the order they are offered in the tab and in
+# the order that decides which class a line carries when two of them fire.
+DEFECT_KINDS = (
+    "top_loss",
+    "bottom_loss",
+    "ink_cover",
+    "char_loss",
+    "collapse_all",
+    "collapse_side",
+    "squeeze",
+)
+
+DEFECT_LABELS = {
+    "top_loss":      "Top of line lost",
+    "bottom_loss":   "Bottom of line lost",
+    "ink_cover":     "Ink smear over characters",
+    "char_loss":     "Characters missing",
+    "collapse_all":  "Whole line collapsed",
+    "collapse_side": "One side collapsed",
+    "squeeze":       "Line horizontally squeezed",
+}
+
+DEFECT_CLASS_PREFIX = "line_"
+
+# The kinds whose ``span`` is forced to 1.0 -- the whole line, always.  A
+# half-collapsed "whole line collapsed" is a contradiction, and a squeeze that
+# narrowed only part of a line would tear it in two.
+DEFECT_FULL_SPAN = ("collapse_all", "squeeze")
+
+# The kinds that have no side to be anchored to.
+DEFECT_NO_SIDE = ("top_loss", "bottom_loss", "squeeze")
+
+DEFECT_SIDES = ("left", "right", "random")
+
+# The default ``amount`` / ``span`` range of each kind, as ``(amount, span)``.
+#
+# Phase 1 gave every kind the same ``(0.2, 0.5)`` pair because no kind had been
+# rendered yet.  These are the fitted replacements: ``tools/df_lines_sheet.py``
+# composes one panel per kind beside the photograph it is meant to reproduce,
+# and each pair below is the range whose panel matches its photograph.  The
+# span of a kind in ``DEFECT_FULL_SPAN`` is never read -- it is stored so the
+# tab and the serialised form keep one shape for all seven kinds -- but it is
+# still drawn, so changing it renumbers nothing.
+DEFECT_RANGES: dict[str, tuple[tuple[float, float], tuple[float, float]]] = {
+    #                  amount          span
+    "top_loss":      ((0.30, 0.55), (0.55, 1.00)),
+    "bottom_loss":   ((0.25, 0.50), (0.60, 1.00)),
+    "ink_cover":     ((0.85, 1.00), (0.08, 0.18)),
+    "char_loss":     ((0.20, 0.50), (0.20, 0.45)),
+    "collapse_all":  ((0.05, 0.20), (1.00, 1.00)),
+    "collapse_side": ((0.08, 0.25), (0.20, 0.40)),
+    "squeeze":       ((0.45, 0.75), (1.00, 1.00)),
+}
+
+# What a kind not in the table gets.  An eighth kind added without a measured
+# range still loads and still renders; it is simply not fitted yet.
+DEFECT_RANGE_FALLBACK = ((0.2, 0.5), (0.2, 0.5))
+
+
+def defect_range(kind: str) -> tuple[tuple[float, float], tuple[float, float]]:
+    """``(amount, span)`` defaults for ``kind``."""
+    return DEFECT_RANGES.get(kind, DEFECT_RANGE_FALLBACK)
+
+
+def defect_class_name(kind: str) -> str:
+    """The line class a fired ``kind`` gives its line."""
+    return DEFECT_CLASS_PREFIX + kind
+
+
+@dataclass
+class LineDefect:
+    """One defect kind's settings.
+
+    ``amount`` and ``span`` mean different things per kind -- the table is
+    below and repeated in the tab's tooltips, because a shared pair of ranges
+    is what keeps the settings panel and the serialised form from growing seven
+    near-identical shapes.
+
+    =============  =========================================  ========================================  =========================
+    kind           ``amount``                                 ``span``                                  ``side``
+    =============  =========================================  ========================================  =========================
+    top_loss       fraction of glyph height removed from the  fraction of the line's length affected    ignored
+                   top (0.15-0.6)                             (1.0 = the whole line)
+    bottom_loss    the same, measured from the bottom         as above                                  ignored
+    ink_cover      peak ink of the blob, 0..1 (0.85-1.0 for   fraction of the line's length the blob     which end the blob starts
+                   ``coverink.png``)                          covers                                    from
+    char_loss      ignored                                    fraction of the line's characters removed  which end the removed run
+                                                                                                        is anchored to
+    collapse_all   residual pitch factor ``k`` (0.05 = a      forced to 1.0                             direction collapsed toward
+                   hard blob, 0.3 = merely crowded)
+    collapse_side  residual pitch factor ``k``                fraction of the line collapsed            direction
+    squeeze        horizontal scale factor (0.35-0.7)         forced to 1.0                             ignored
+    =============  =========================================  ========================================  =========================
+
+    The character-level contract that goes with this: a character a defect
+    touches carries ``PlacedChar.defect = kind`` (the field arrives with the
+    geometry stage) and therefore no class of its own.  It is still drawn and
+    still counts toward its line's box -- it is on the page.
+    """
+
+    kind: str
+    enabled: bool = False
+    p_line: float = 0.0                        # chance this kind hits any one line
+    max_lines: int = 1                         # cap on lines hit per image
+    amount: tuple[float, float] | None = None  # uniform draw, meaning per kind
+    span: tuple[float, float] | None = None    # fraction of the line covered
+    side: str = "random"                       # "left" | "right" | "random"
+
+    def __post_init__(self) -> None:
+        """Fill the two ranges the caller left out from :data:`DEFECT_RANGES`.
+
+        ``None`` rather than a shared literal default because the fitted range
+        differs per kind, and a dataclass cannot otherwise tell "the caller
+        wants this kind's default" from "the caller wants 0.2 to 0.5".
+        """
+        amount, span = defect_range(self.kind)
+
+        if self.amount is None:
+            self.amount = amount
+
+        if self.span is None:
+            self.span = span
+
+        self.amount = (float(self.amount[0]), float(self.amount[1]))
+        self.span = (float(self.span[0]), float(self.span[1]))
+
+    def sample_amount(self, rng) -> float:
+        lo, hi = self.amount
+        return float(rng.uniform(min(lo, hi), max(lo, hi)))
+
+    def sample_span(self, rng) -> float:
+        """The span of one firing; 1.0 for the kinds that force it.
+
+        The draw is consumed either way, so forcing a span does not renumber
+        the kinds drawn after this one.
+        """
+        lo, hi = self.span
+        drawn = float(rng.uniform(min(lo, hi), max(lo, hi)))
+
+        return 1.0 if self.kind in DEFECT_FULL_SPAN else drawn
+
+    def sample_side(self, rng) -> str:
+        """Resolves ``"random"`` to left or right.  Always consumes one draw."""
+        pick = "left" if rng.random() < 0.5 else "right"
+
+        return self.side if self.side in ("left", "right") else pick
+
+    def to_dict(self) -> dict:
+        return {
+            "kind": self.kind,
+            "enabled": self.enabled,
+            "p_line": self.p_line,
+            "max_lines": self.max_lines,
+            "amount": list(self.amount),
+            "span": list(self.span),
+            "side": self.side,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "LineDefect":
+        base = LineDefect(kind=d["kind"])
+
+        return LineDefect(
+            kind=base.kind,
+            enabled=bool(d.get("enabled", base.enabled)),
+            p_line=float(d.get("p_line", base.p_line)),
+            max_lines=int(d.get("max_lines", base.max_lines)),
+            amount=tuple(float(x) for x in d.get("amount", base.amount)),
+            span=tuple(float(x) for x in d.get("span", base.span)),
+            side=str(d.get("side", base.side)),
+        )
+
+
+@dataclass
+class LineDefectSpec:
+    """Every kind's settings, keyed by kind.
+
+    Always holds all of DEFECT_KINDS so the tab can render a row per kind
+    without None-checking, and so a job written before a kind existed loads
+    with that kind disabled rather than absent.
+    """
+
+    defects: dict[str, LineDefect] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for k in DEFECT_KINDS:
+            self.defects.setdefault(k, LineDefect(kind=k))
+
+    def get(self, kind: str) -> LineDefect:
+        return self.defects[kind]
+
+    def enabled_kinds(self) -> list[str]:
+        """DEFECT_KINDS order, filtered to enabled with ``p_line > 0`` and
+        ``max_lines > 0`` -- the same predicate the planner uses, so the class
+        list can never advertise a class the planner cannot produce."""
+        out: list[str] = []
+
+        for k in DEFECT_KINDS:
+            d = self.defects.get(k)
+
+            if d is not None and d.enabled and d.p_line > 0.0 and d.max_lines > 0:
+                out.append(k)
+
+        return out
+
+    def any_enabled(self) -> bool:
+        return bool(self.enabled_kinds())
+
+    def to_dict(self) -> dict:
+        return {k: self.defects[k].to_dict() for k in DEFECT_KINDS}
+
+    @staticmethod
+    def from_dict(d: dict) -> "LineDefectSpec":
+        src = d or {}
+        out: dict[str, LineDefect] = {}
+
+        for k in DEFECT_KINDS:
+            entry = src.get(k)
+            out[k] = (
+                LineDefect.from_dict(dict(entry, kind=k))
+                if isinstance(entry, dict)
+                else LineDefect(kind=k)
+            )
+
+        return LineDefectSpec(out)
+
+
 @dataclass
 class CharSpec:
     char: str
@@ -623,11 +862,97 @@ class CharSpec:
         return CharSpec(d["char"], list(d["replacements"]))
 
 
+# A range narrower than this is no range at all: drawing inside it would cost a
+# number from ``rng`` and hand back the mean anyway.
+_RANGE_EPS = 1e-12
+
+
+def _opt_float(value) -> float | None:
+    """``None`` stays ``None`` -- an absent bound means "collapsed onto the mean"."""
+    return None if value is None else float(value)
+
+
+def _ordered(lo: float, mean: float, hi: float) -> tuple[float, float, float]:
+    """``lo <= mean <= hi`` -- the invariant :meth:`RangeParam.clamp` keeps."""
+    lo, hi = float(lo), float(hi)
+
+    if lo > hi:
+        lo, hi = hi, lo
+
+    return lo, float(min(max(float(mean), lo), hi)), hi
+
+
+def _pushed(
+    name: Mode, value: float, lo: float, mean: float, hi: float
+) -> tuple[float, float, float]:
+    """One of min/mean/max set to ``value``, the other two pushed out of its way.
+
+    :meth:`RangeParam.set_field`'s rule, and for its reason: a bound dragged
+    past the mean pushes the mean rather than being rejected, because a control
+    that refuses what was typed into it feels stuck.
+
+    With one addition the bars do not need: a mean moved while Min and Max sit
+    on it carries them both along.  Retyping the spacing of a line whose range
+    was never opened must not leave a bound behind and quietly start
+    randomising a job that was printing one pitch.
+    """
+    value = float(value)
+
+    if name == "mean":
+        if hi - lo <= _RANGE_EPS:
+            return value, value, value
+
+        return _ordered(min(lo, value), value, max(hi, value))
+
+    if name == "min":
+        return _ordered(value, max(mean, value), max(hi, value))
+
+    if name == "max":
+        return _ordered(min(lo, value), min(mean, value), value)
+
+    raise KeyError(name)
+
+
+def _draw(lo: float, mean: float, hi: float, rng: np.random.Generator) -> float:
+    """Uniform draw inside ``[lo, hi]``, or ``mean`` when the range is collapsed.
+
+    Uniform rather than normal, the same way ``line.rot`` is drawn: the bounds
+    say how far apart the print is *allowed* to space itself, not how far apart
+    it usually does, so every spacing in the range has to be as likely as every
+    other.
+
+    A collapsed range takes nothing from ``rng``, so a job saved before these
+    bounds existed -- and any line whose Min and Max the user leaves sitting on
+    the mean -- draws the same numbers out of the same seed as it always did and
+    reproduces its old images exactly.
+    """
+    if hi - lo <= _RANGE_EPS:
+        return float(mean)
+
+    return float(rng.uniform(lo, hi))
+
+
 @dataclass
 class LineSpec:
     index: int
     chars: list[CharSpec] = field(default_factory=list)
     char_spacing: float = 20.0
+    # Min/Max around ``char_spacing``: one spacing is drawn uniformly between
+    # them per line per image, so the characters of a line stay evenly spaced
+    # while the dataset covers a range of pitches.  ``None`` means "collapsed
+    # onto the mean", which is what a line written before these bounds existed
+    # loads as.
+    char_spacing_min: float | None = None
+    char_spacing_max: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.char_spacing_min is None:
+            self.char_spacing_min = float(self.char_spacing)
+
+        if self.char_spacing_max is None:
+            self.char_spacing_max = float(self.char_spacing)
+
+        self.clamp_spacing()
 
     @property
     def name(self) -> str:
@@ -636,11 +961,49 @@ class LineSpec:
     def text(self) -> str:
         return "".join(c.char for c in self.chars)
 
+    # ------------------------------------------------------------------
+    def clamp_spacing(self) -> None:
+        """Force ``min <= mean <= max``, and no spacing below zero."""
+        self.char_spacing_min, self.char_spacing, self.char_spacing_max = _ordered(
+            max(0.0, float(self.char_spacing_min)),
+            max(0.0, float(self.char_spacing)),
+            max(0.0, float(self.char_spacing_max)),
+        )
+
+    def set_spacing_field(self, name: Mode, value: float) -> None:
+        """Set one of min/mean/max, pushing the other two out of the way."""
+        self.char_spacing_min, self.char_spacing, self.char_spacing_max = _pushed(
+            name,
+            max(0.0, float(value)),
+            float(self.char_spacing_min),
+            float(self.char_spacing),
+            float(self.char_spacing_max),
+        )
+
+    def spacing_is_point(self) -> bool:
+        """True when Min and Max sit together -- one spacing for every image."""
+        return float(self.char_spacing_max) - float(self.char_spacing_min) <= _RANGE_EPS
+
+    def sample_spacing(self, rng: np.random.Generator) -> float:
+        """This image's centre-to-centre character spacing, in pixels."""
+        return _draw(
+            float(self.char_spacing_min),
+            float(self.char_spacing),
+            float(self.char_spacing_max),
+            rng,
+        )
+
+    def copy(self) -> "LineSpec":
+        return LineSpec.from_dict(self.to_dict())
+
+    # ------------------------------------------------------------------
     def to_dict(self) -> dict:
         return {
             "index": self.index,
             "chars": [c.to_dict() for c in self.chars],
             "char_spacing": self.char_spacing,
+            "char_spacing_min": self.char_spacing_min,
+            "char_spacing_max": self.char_spacing_max,
         }
 
     @staticmethod
@@ -649,23 +1012,84 @@ class LineSpec:
             int(d["index"]),
             [CharSpec.from_dict(c) for c in d["chars"]],
             float(d["char_spacing"]),
+            _opt_float(d.get("char_spacing_min")),
+            _opt_float(d.get("char_spacing_max")),
         )
 
 
 @dataclass
 class LineGap:
-    """The ``<----2----->`` connector between two adjacent lines."""
+    """The ``<----2----->`` connector between two adjacent lines.
+
+    ``coeff`` is the mean; ``coeff_min`` / ``coeff_max`` bound it the way
+    :class:`LineSpec`'s bounds do its character spacing, and one coefficient is
+    drawn uniformly between them per gap per image.
+    """
 
     upper: int
     lower: int
     coeff: float = 2.0
+    coeff_min: float | None = None
+    coeff_max: float | None = None
 
+    def __post_init__(self) -> None:
+        if self.coeff_min is None:
+            self.coeff_min = float(self.coeff)
+
+        if self.coeff_max is None:
+            self.coeff_max = float(self.coeff)
+
+        self.clamp_coeff()
+
+    # ------------------------------------------------------------------
+    def clamp_coeff(self) -> None:
+        """Force ``min <= mean <= max``, and no gap below zero."""
+        self.coeff_min, self.coeff, self.coeff_max = _ordered(
+            max(0.0, float(self.coeff_min)),
+            max(0.0, float(self.coeff)),
+            max(0.0, float(self.coeff_max)),
+        )
+
+    def set_coeff_field(self, name: Mode, value: float) -> None:
+        """Set one of min/mean/max, pushing the other two out of the way."""
+        self.coeff_min, self.coeff, self.coeff_max = _pushed(
+            name,
+            max(0.0, float(value)),
+            float(self.coeff_min),
+            float(self.coeff),
+            float(self.coeff_max),
+        )
+
+    def coeff_is_point(self) -> bool:
+        """True when Min and Max sit together -- one gap for every image."""
+        return float(self.coeff_max) - float(self.coeff_min) <= _RANGE_EPS
+
+    def sample_coeff(self, rng: np.random.Generator) -> float:
+        """This image's gap coefficient -- multiplied by ``dist.v`` for pixels."""
+        return _draw(float(self.coeff_min), float(self.coeff), float(self.coeff_max), rng)
+
+    def copy(self) -> "LineGap":
+        return LineGap(self.upper, self.lower, self.coeff, self.coeff_min, self.coeff_max)
+
+    # ------------------------------------------------------------------
     def to_dict(self) -> dict:
-        return {"upper": self.upper, "lower": self.lower, "coeff": self.coeff}
+        return {
+            "upper": self.upper,
+            "lower": self.lower,
+            "coeff": self.coeff,
+            "coeff_min": self.coeff_min,
+            "coeff_max": self.coeff_max,
+        }
 
     @staticmethod
     def from_dict(d: dict) -> "LineGap":
-        return LineGap(int(d["upper"]), int(d["lower"]), float(d["coeff"]))
+        return LineGap(
+            int(d["upper"]),
+            int(d["lower"]),
+            float(d["coeff"]),
+            _opt_float(d.get("coeff_min")),
+            _opt_float(d.get("coeff_max")),
+        )
 
 
 # ======================================================================
@@ -740,7 +1164,13 @@ class Job:
     lines: list[LineSpec] = field(default_factory=list)
     line_gaps: list[LineGap] = field(default_factory=list)
     defects: DefectSpec = field(default_factory=DefectSpec)
+    line_defects: LineDefectSpec = field(default_factory=LineDefectSpec)
     classes: list[ClassDef] = field(default_factory=list)
+    # Pixels added to every edge of every label box -- characters and lines
+    # alike -- when :mod:`compose` writes it out.  0 is the measured ink box,
+    # negative pulls the edges in, positive pushes them out.  It changes the
+    # label only; the ink on the image is exactly the same either way.
+    box_pad: float = 0.0
 
     def characters(self) -> list[str]:
         """Every character that can be *drawn*, replacements included.
@@ -768,7 +1198,9 @@ class Job:
             "lines": [l.to_dict() for l in self.lines],
             "line_gaps": [g.to_dict() for g in self.line_gaps],
             "defects": self.defects.to_dict(),
+            "line_defects": self.line_defects.to_dict(),
             "classes": [c.to_dict() for c in self.classes],
+            "box_pad": self.box_pad,
         }
 
     @staticmethod
@@ -784,7 +1216,9 @@ class Job:
             lines=[LineSpec.from_dict(l) for l in d["lines"]],
             line_gaps=[LineGap.from_dict(g) for g in d["line_gaps"]],
             defects=DefectSpec.from_dict(d["defects"]),
+            line_defects=LineDefectSpec.from_dict(d.get("line_defects") or {}),
             classes=[ClassDef.from_dict(c) for c in d["classes"]],
+            box_pad=float(d.get("box_pad", 0.0)),
         )
 
 
@@ -795,11 +1229,25 @@ class Job:
 
 @dataclass
 class RenderedChar:
+    """One drawn character, in the frame of its own ``ink`` canvas.
+
+    ``bbox`` is the upright rectangle the ink actually covers -- what the
+    caller crops to.  ``quad`` is the *oriented* polygon around the dot matrix
+    (:mod:`~dotgen.core.polygons`): four corners, TL TR BR BL of the
+    character's own frame, carrying whatever tilt, perspective or waviness the
+    warp gave it.  The two are different shapes on purpose, and the label the
+    exporter writes comes from ``quad``.
+
+    ``quad`` is ``None`` only from an engine that does not model orientation --
+    the stub one -- and every consumer falls back to ``bbox``'s corners there.
+    """
+
     ink: np.ndarray  # float32 HxW 0..1
     origin: tuple[float, float]
     dot_centers: list[tuple[float, float]] = field(default_factory=list)
     bbox: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
     defects: dict = field(default_factory=dict)
+    quad: np.ndarray | None = None  # (4, 2) float64, ink-canvas coordinates
 
     @property
     def defect_count(self) -> int:

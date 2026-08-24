@@ -28,13 +28,15 @@ from .models import (
     DotSample,
     ExportSpec,
     Job,
+    LineDefectSpec,
     LineGap,
     LineSpec,
     Quad,
     SampleImage,
+    defect_class_name,
     is_blank_char,
 )
-from .params import ParamSet, default_params
+from .params import Mode, ParamSet, default_params
 
 MAX_SAMPLE_IMAGES = 5
 MAX_DOT_SAMPLES = 10
@@ -53,6 +55,7 @@ class AppState(QObject):
     charFormatsChanged = Signal()
     backgroundsChanged = Signal()
     linesChanged = Signal()
+    lineDefectsChanged = Signal()
     classesChanged = Signal()
     jobsChanged = Signal()
     statusMessage = Signal(str)
@@ -84,6 +87,9 @@ class AppState(QObject):
         self.lines: list[LineSpec] = []
         self.line_gaps: list[LineGap] = []
         self.defects: DefectSpec = DefectSpec()
+        self.line_defects: LineDefectSpec = LineDefectSpec()
+        # Pixels added to every edge of every label box -- see Job.box_pad.
+        self.box_pad: float = 0.0
         self.classes: list[ClassDef] = []
         self.jobs: list[Job] = []
         self.export: ExportSpec = ExportSpec()
@@ -581,26 +587,67 @@ class AppState(QObject):
         self.linesChanged.emit()
 
     def set_char_spacing(self, line_index: int, spacing: float) -> None:
+        """The mean spacing -- Min and Max move only if this passes them."""
+        self.set_char_spacing_field(line_index, "mean", spacing)
+
+    def set_char_spacing_field(self, line_index: int, name: Mode, value: float) -> None:
+        """Set one of the line's spacing min/mean/max.
+
+        The three go through :meth:`LineSpec.set_spacing_field` rather than
+        being written directly, so ``min <= mean <= max`` holds however the user
+        edits them.
+        """
         if 0 <= line_index < len(self.lines):
-            self.lines[line_index].char_spacing = float(spacing)
+            self.lines[line_index].set_spacing_field(name, value)
             self.linesChanged.emit()
 
     def set_line_gap(self, upper: int, coeff: float) -> None:
+        """The mean gap coefficient -- Min and Max move only if this passes them."""
+        self.set_line_gap_field(upper, "mean", coeff)
+
+    def set_line_gap_field(self, upper: int, name: Mode, value: float) -> None:
+        """Set one of the gap's coefficient min/mean/max."""
         for g in self.line_gaps:
             if g.upper == upper:
-                g.coeff = float(coeff)
+                g.set_coeff_field(name, value)
                 self.linesChanged.emit()
                 return
 
     def _sync_gaps(self) -> None:
-        """One gap per adjacent line pair, preserving existing coefficients."""
-        old = {g.upper: g.coeff for g in self.line_gaps}
-        self.line_gaps = [
-            LineGap(i + 1, i + 2, old.get(i + 1, 2.0)) for i in range(max(len(self.lines) - 1, 0))
-        ]
+        """One gap per adjacent line pair, preserving existing coefficients.
+
+        The whole gap is carried over, bounds included: adding a line must not
+        quietly collapse the ranges the user set on the gaps that were already
+        there.
+        """
+        old = {g.upper: g for g in self.line_gaps}
+        self.line_gaps = []
+
+        for i in range(max(len(self.lines) - 1, 0)):
+            prev = old.get(i + 1)
+            self.line_gaps.append(
+                LineGap(i + 1, i + 2, prev.coeff, prev.coeff_min, prev.coeff_max)
+                if prev is not None
+                else LineGap(i + 1, i + 2, 2.0)
+            )
 
     def set_defects(self, defects: DefectSpec) -> None:
         self.defects = defects
+        self.linesChanged.emit()
+
+    def set_box_pad(self, pad: float) -> None:
+        """How much air every label box carries, in pixels.
+
+        ``linesChanged`` rather than a signal of its own: the pad changes no
+        pixel of the image, only the boxes drawn over the previews, and those
+        are exactly the listeners that redraw on this one.
+        """
+        pad = float(pad)
+
+        if pad == self.box_pad:
+            return
+
+        self.box_pad = pad
         self.linesChanged.emit()
 
     def job_characters(self) -> list[str]:
@@ -621,6 +668,31 @@ class AppState(QObject):
 
     def has_content(self) -> bool:
         return any(line.chars for line in self.lines)
+
+    # ==================================================================
+    # Tab 5 -- line-level defects
+    # ==================================================================
+
+    def set_line_defect(self, kind: str, **fields) -> None:
+        """Update one kind's settings and emit once.
+
+        The tab sends whichever widgets moved, so a card that only toggled its
+        checkbox does not have to resend six spinboxes it never touched.
+        """
+        d = self.line_defects.get(kind)
+
+        for k, v in fields.items():
+            setattr(d, k, v)
+
+        self.lineDefectsChanged.emit()
+
+    def set_line_defects(self, spec: LineDefectSpec) -> None:
+        self.line_defects = spec
+        self.lineDefectsChanged.emit()
+
+    def line_defect_classes(self) -> list[str]:
+        """The line classes the enabled kinds require, in DEFECT_KINDS order."""
+        return [defect_class_name(k) for k in self.line_defects.enabled_kinds()]
 
     # ==================================================================
     # Tab 5 -- classes
@@ -649,7 +721,9 @@ class AppState(QObject):
     def classes_ready(self) -> bool:
         from .classes import validate_classes
 
-        return bool(self.classes) and not validate_classes(self.classes)
+        return bool(self.classes) and not validate_classes(
+            self.classes, line_defects=self.line_defects
+        )
 
     # ==================================================================
     # Tab 6 -- jobs
@@ -664,9 +738,11 @@ class AppState(QObject):
             char_formats={k: v.copy() for k, v in self.char_formats.items()},
             backgrounds=list(self.backgrounds),
             lines=[LineSpec.from_dict(l.to_dict()) for l in self.lines],
-            line_gaps=[LineGap(g.upper, g.lower, g.coeff) for g in self.line_gaps],
+            line_gaps=[g.copy() for g in self.line_gaps],
             defects=DefectSpec(**self.defects.to_dict()),
+            line_defects=LineDefectSpec.from_dict(self.line_defects.to_dict()),
             classes=[ClassDef(**c.to_dict()) for c in self.classes],
+            box_pad=self.box_pad,
         )
 
     def save_job(self, name: str = "") -> Job:
@@ -704,9 +780,11 @@ class AppState(QObject):
         self.char_formats = {k: v.copy() for k, v in job.char_formats.items()}
         self.backgrounds = list(job.backgrounds)
         self.lines = [LineSpec.from_dict(l.to_dict()) for l in job.lines]
-        self.line_gaps = [LineGap(g.upper, g.lower, g.coeff) for g in job.line_gaps]
+        self.line_gaps = [g.copy() for g in job.line_gaps]
         self.defects = DefectSpec(**job.defects.to_dict())
+        self.line_defects = LineDefectSpec.from_dict(job.line_defects.to_dict())
         self.classes = [ClassDef(**c.to_dict()) for c in job.classes]
+        self.box_pad = float(job.box_pad)
 
         self.emit_all()
 
@@ -726,7 +804,9 @@ class AppState(QObject):
         self.lines.clear()
         self.line_gaps.clear()
         self.defects = DefectSpec()
+        self.line_defects = LineDefectSpec()
         self.classes.clear()
+        self.box_pad = 0.0
         self.params = default_params()
 
         self.emit_all()
@@ -746,5 +826,6 @@ class AppState(QObject):
         self.charFormatsChanged.emit()
         self.backgroundsChanged.emit()
         self.linesChanged.emit()
+        self.lineDefectsChanged.emit()
         self.classesChanged.emit()
         self.jobsChanged.emit()

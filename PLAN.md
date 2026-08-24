@@ -33,6 +33,11 @@ clickable end-to-end with fake numbers; at the end of Phase 9 the same clicks pr
 - Phase 8 — Class definition and YOLO export
 - Phase 9 — Background separation tool (deferred feature)
 - Phase 10 — Integration, performance, verification
+- Phase 11 — Line-level defect generation — **planned in `plan2.md`**, not below. It adds
+  Tab 5 "Defect generation" (renumbering class definition to Tab 6 and export to Tab 7),
+  `core/dfield.py`, `core/line_defects.py`, and the `line_<kind>` classes. Nothing in this
+  file changes: a job with no defect kind enabled renders byte-identically to Phase 10's
+  (`tests/test_orig_regression.py`).
 
 ---
 
@@ -250,6 +255,18 @@ with a `MixedEngines` wrapper so the app always runs.
 - Signal `valueChanged(str key, str field, float value)`; writes back through `AppState.set_param`.
 - Read-only mode (`setEditable(False)`) for bars that are computed, not typed.
 
+**`ValueRow`** (`widgets/value_row.py`) — the same parameter as three typed numbers, used by Tab 3.
+
+- Label left, then Min / Mean / Max fields and the unit; mean red, bounds blue, the bar's convention.
+- A field is locked until clicked, opens with its number selected, and applies on **Enter** — Tab 2's
+  rule for the constraint coefficient. Escape or losing focus puts the old number back: only Enter
+  commits, so an abandoned edit cannot move a parameter.
+- A value that is not a number is refused, the field stays open with the old number selected, and the
+  message goes out on `editRejected(str)`; a value the parameter reorders or clamps is written back
+  into the field, so what is shown is always what was accepted.
+- Same signals and same methods as `RangeBar` (`valueChanged`, `enabledToggled`, `compareToggled`,
+  `setEditable`, `setParam`, `refresh`), so `RangeBarList(numeric=True)` swaps one for the other.
+
 **`ImageCanvas`** (`widgets/image_canvas.py`)
 
 - `QGraphicsView` + `QGraphicsScene`, one `QGraphicsPixmapItem` base layer, one overlay item group.
@@ -327,8 +344,10 @@ Per-character independence is required: switching characters must not carry link
 ### 1.9 Tab 3 — Summary (layout)
 
 - **Left ~60%**, two stacked `ImageCanvas` frames at 50% height each, labelled `MIN` and `MAX`.
-- **Right ~40%**, a `RangeBarList` in read-only mode aggregating **all** params from Tabs 1 and 2,
-  each with `show_compare=True`.
+- **Right ~40%**, a `RangeBarList(numeric=True, draft=True)` aggregating **all** params from Tabs 1
+  and 2, each with `show_compare=True`. Values are *typed*, not dragged: three fields per parameter
+  under one Min / Mean / Max header, applied with Enter (see `ValueRow` in 1.6). Tab 1 keeps the bars
+  — it measures and re-measures; Tab 3 is where a number is stated, and a handle cannot state one.
 - Checkbox semantics: for every param with `compare=True`, the top image renders with that param at
   `min` and the bottom at `max`; every unchecked param uses `mean` in both. Multiple checkboxes may be
   active at once. Implement as two `ParamSet` snapshots built by
@@ -346,7 +365,9 @@ Per-character independence is required: switching characters must not carry link
 - Clicking the test panel pastes a visible dot.
 - Tab 2: place dots, create a `2` coefficient link that renders as an arrowed connector, `Esc`
   reselect, `Delete` a link, `Save` blocked until exactly one H and one V constraint exist.
-- Tab 3: checking a bar makes the top/bottom previews differ; unchecking makes them identical.
+- Tab 3: checking a row makes the top/bottom previews differ; unchecking makes them identical.
+- Tab 3: clicking a Min/Mean/Max field opens it, Enter applies the number to the draft and locks the
+  field, and Escape or clicking away leaves the parameter as it was.
 - `pytest tests/` green: `test_params.py` (clamp, sample, `build_compare_sets`),
   `test_state.py` (signals fire, max-5 / max-10 caps), `test_ui_smoke.py` (window constructs, all tabs
   instantiate, no exceptions).

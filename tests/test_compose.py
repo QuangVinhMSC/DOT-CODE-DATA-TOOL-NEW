@@ -108,7 +108,12 @@ def test_every_quad_corner_is_inside_the_unit_square(make_job):
 
 
 def test_a_character_quad_is_its_own_rectangle(make_job):
-    """Characters are pasted upright, so their oriented box is the box itself."""
+    """No warp, no cost: an untilted character's polygon *is* its box.
+
+    The polygon is fitted to the dot matrix and the box is the polygon's
+    envelope, so with nothing turning the character the two have to coincide
+    exactly -- a job that does not use tilt keeps the labels it always had.
+    """
     result = render(make_job(lines=("12",)), 4)
 
     for box, quad in zip(result.boxes, result.quads):
@@ -141,22 +146,130 @@ def test_a_quad_never_falls_short_of_its_box(make_job):
             assert points[:, 1].max() >= cy + h / 2 - 1e-6
 
 
-def test_a_line_on_a_tilted_surface_gets_a_tilted_quad(make_job):
+def test_a_turned_line_gets_a_tilted_quad(make_job):
     """The reason the oriented format exists: it beats the axis-aligned box.
 
-    On a surface that recedes, a line of upright characters runs diagonally, so
-    the rotated rectangle around it is strictly smaller than the upright one.
+    A block Tab 4 turned runs diagonally across the page, so the rotated
+    rectangle around one of its lines is strictly smaller than the upright one.
     """
-    job = make_job(lines=("12345",), quad=Quad([(80, 80), (560, 200), (560, 430), (80, 310)]))
-
-    for key in ("persp.h", "persp.v"):
-        job.params[key].enabled = True
+    job = make_job(lines=("12345",))
+    rot = job.params["line.rot"]
+    rot.mean = rot.min = rot.max = 20.0
 
     result = render(job, 7)
     line_box = next(b for b in result.boxes if b[0] == "line1")
     line_quad = next(q for q in result.quads if q[0] == "line1")
 
     assert polygon_area(quad_points(line_quad)) < line_box[3] * line_box[4] * 0.95
+
+
+def tilted(make_job, key: str, degrees: float, lines=("123",)):
+    """A job whose characters are warped by one geometry bar."""
+    job = make_job(lines=lines)
+    p = job.params[key]
+    p.mean = p.min = p.max = degrees
+    p.enabled = True
+
+    return job
+
+
+def edge_angle(points, image, i: int = 0) -> float:
+    """The direction of quad edge ``i``, in degrees.
+
+    Back in pixels first: the labels are normalised by the image's width and
+    height separately, and on a 640x480 page that turns a 25 degree edge into a
+    32 degree one.  An angle is only an angle in square coordinates.
+    """
+    h, w = image.shape[:2]
+    dx, dy = (points[(i + 1) % 4] - points[i]) * (w, h)
+
+    return float(np.degrees(np.arctan2(dy, dx)))
+
+
+def test_a_tilted_character_gets_a_tilted_quad(make_job):
+    """The point of the whole exercise.
+
+    ``tilt.x`` turns every glyph on the page.  The polygon is built around the
+    dot lattice *before* that warp and pushed through it, so it comes out at
+    the same angle the glyph did -- and the character's own frame is then a
+    good deal smaller than the upright rectangle around it.
+    """
+    result = render(tilted(make_job, "tilt.x", 25.0), 4)
+    chars = [(b, q) for b, q in zip(result.boxes, result.quads) if b[0] != "line1"]
+
+    assert chars
+
+    for box, quad in chars:
+        points = quad_points(quad)
+        _, _, _, w, h = box
+
+        assert edge_angle(points, result.image) == pytest.approx(25.0, abs=1.0)
+        assert polygon_area(points) < w * h * 0.9
+
+
+def test_a_character_quad_still_holds_every_dot_it_was_tilted_with(make_job):
+    """Tighter, but never tighter than the ink.
+
+    :func:`~dotgen.core.polygons.cover` closes the four edges onto the ink that
+    was actually composed, so the saving comes out of paper rather than out of
+    the print.
+    """
+    import cv2
+
+    job = tilted(make_job, "tilt.y", 20.0, lines=("12",))
+    result = render(job, 6)
+    h, w = result.image.shape[:2]
+    darkened = result.image.min(axis=2) < BG_LEVEL - 10
+    covered = np.zeros_like(darkened)
+
+    for name, *coords in result.quads:
+        if name == "line1":
+            continue
+
+        pts = np.asarray(coords, dtype=float).reshape(4, 2) * (w, h)
+        cv2.fillConvexPoly(covered, np.round(pts).astype(np.int32), True)
+
+    assert darkened.any()
+    assert not (darkened & ~covered).any()
+
+
+def test_perspective_gives_a_character_a_genuine_trapezium(make_job):
+    """``persp.h`` converges the top edge against the bottom one.
+
+    A rotated rectangle cannot say that; four free corners can, and they are
+    what the label carries -- so the convergence Tab 1 measured off the sample
+    survives all the way into the export.
+    """
+    result = render(tilted(make_job, "persp.h", 0.6, lines=("1",)), 3)
+    points = quad_points(next(q for q in result.quads if q[0] != "line1"))
+
+    top = np.hypot(*(points[1] - points[0]))
+    bottom = np.hypot(*(points[3] - points[2]))
+
+    assert top > bottom * 1.2
+
+
+def test_a_turned_block_turns_every_character_label_with_it(make_job):
+    """``line.rot`` turns the glyphs, so it has to turn their polygons too.
+
+    Before the polygon existed this was the worst case: a rotated glyph got the
+    upright box around its rotated raster, which is bigger than the glyph in
+    both axes at once.
+    """
+    job = make_job(lines=("123",))
+    rot = job.params["line.rot"]
+    rot.mean = rot.min = rot.max = 30.0
+
+    result = render(job, 7)
+    chars = [(b, q) for b, q in zip(result.boxes, result.quads) if b[0] != "line1"]
+
+    assert chars
+
+    for box, quad in chars:
+        points = quad_points(quad)
+
+        assert edge_angle(points, result.image) == pytest.approx(30.0, abs=1.5)
+        assert polygon_area(points) < box[3] * box[4] * 0.85
 
 
 def test_a_line_on_a_flat_surface_keeps_an_upright_quad(make_job):
@@ -242,6 +355,104 @@ def test_a_box_clipped_to_a_sliver_is_dropped(make_job):
     assert result.meta["chars"] == 1  # it was placed and drawn
     assert 1 * 3 < MIN_BOX_AREA  # but at most 1 x 3 px of it is on the page
     assert result.boxes == []
+
+
+# ----------------------------------------------------------------------
+# the box pad -- Tab 4's one number
+# ----------------------------------------------------------------------
+
+
+def pixel_boxes(result, size=(640, 480)):
+    """``{name: (x, y, w, h)}`` in pixels, in the order the boxes came."""
+    w, h = size
+
+    return [
+        (name, (cx - bw / 2) * w, (cy - bh / 2) * h, bw * w, bh * h)
+        for name, cx, cy, bw, bh in result.boxes
+    ]
+
+
+def test_a_positive_pad_pushes_every_edge_out_by_that_many_pixels(make_job):
+    job = make_job(lines=("12", "34"))
+    tight = pixel_boxes(render(job, 0))
+
+    job.box_pad = 3.0
+    padded = pixel_boxes(render(job, 0))
+
+    assert [b[0] for b in padded] == [b[0] for b in tight]
+
+    for (_, x, y, w, h), (_, px, py, pw, ph) in zip(tight, padded):
+        assert (px, py) == pytest.approx((x - 3.0, y - 3.0), abs=1e-6)
+        assert (pw, ph) == pytest.approx((w + 6.0, h + 6.0), abs=1e-6)
+
+
+def test_a_negative_pad_pulls_them_in(make_job):
+    job = make_job(lines=("12",))
+    tight = pixel_boxes(render(job, 0))
+
+    job.box_pad = -1.5
+    pulled = pixel_boxes(render(job, 0))
+
+    for (_, x, y, w, h), (_, px, py, pw, ph) in zip(tight, pulled):
+        assert (px, py) == pytest.approx((x + 1.5, y + 1.5), abs=1e-6)
+        assert (pw, ph) == pytest.approx((w - 3.0, h - 3.0), abs=1e-6)
+
+
+def test_the_pad_moves_the_labels_and_not_one_pixel_of_the_image(make_job):
+    """The whole point of the control: it is a labelling decision, not a
+    printing one, so the same seed must still draw the same photograph."""
+    job = make_job(lines=("12",))
+    plain = render(job, 4).image
+
+    job.box_pad = 6.0
+
+    assert np.array_equal(render(job, 4).image, plain)
+
+
+def test_a_pad_that_eats_a_box_drops_the_label(make_job):
+    """Same rule as a box clipped to a sliver: nothing is left to train on."""
+    job = make_job(lines=("1",))
+    job.box_pad = -500.0
+
+    result = render(job, 0)
+
+    assert result.meta["chars"] == 1  # still printed
+    assert result.boxes == []  # but no longer labelled
+    assert result.quads == []
+
+
+def test_the_quads_carry_the_pad_too(make_job):
+    """``boxes`` and ``quads`` describe the same rectangles or the two export
+    formats disagree about what was annotated."""
+    job = make_job(lines=("12",))
+    tight = [q for q in render(job, 0).quads]
+
+    job.box_pad = 4.0
+    padded = render(job, 0).quads
+
+    assert len(padded) == len(tight)
+
+    for (name, *a), (pname, *b) in zip(tight, padded):
+        assert name == pname
+
+        area = _quad_area(a)
+        assert _quad_area(b) > area, "every quad grew"
+
+    # The character quad is upright, so its growth is exactly the pad.
+    (_, *a), (_, *b) = tight[0], padded[0]
+
+    assert (b[2] - b[0]) * 640 == pytest.approx((a[2] - a[0]) * 640 + 8.0, abs=1e-6)
+
+
+def _quad_area(coords) -> float:
+    """Shoelace over the four normalised corners."""
+    pts = list(zip(coords[0::2], coords[1::2]))
+    total = 0.0
+
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:] + pts[:1]):
+        total += x0 * y1 - x1 * y0
+
+    return abs(total) / 2.0
 
 
 # ----------------------------------------------------------------------

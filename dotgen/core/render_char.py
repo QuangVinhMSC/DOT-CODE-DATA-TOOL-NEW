@@ -22,6 +22,14 @@ skips the warp entirely rather than trusting a round trip through
 it is read back off the rendered pixels; a deformed or jittered dot moves the
 box because it really moved the ink.
 
+*And the label is a polygon, not the bbox.*  The upright rectangle says where
+the ink is; it does not say what shape the character is, and under a tilt those
+are very different statements.  So the ideal dot lattice rides through the warp
+as four extra points, exactly as the metric origin does, and comes out the
+other side as an oriented quadrilateral still glued to the glyph -- see
+:mod:`~dotgen.core.polygons`.  ``bbox`` still crops the ink; ``quad`` is what
+becomes a label.
+
 Numpy and OpenCV only -- no Qt, so the headless exporter renders every
 character through this same function.
 """
@@ -34,7 +42,7 @@ from typing import Iterable, Literal
 import cv2
 import numpy as np
 
-from . import curve, matrix, perspective
+from . import curve, matrix, perspective, polygons
 from .dot_pca import generate_pca_dot
 from .ink import shift_image
 from .models import CharFormat, DefectSpec, DotModel, RenderedChar
@@ -428,6 +436,58 @@ def compose_dots(
     return np.clip(np.minimum(1.0 - keep, cap), 0.0, 1.0).astype(np.float32)
 
 
+def ink_points(ink: np.ndarray, ox: float = 0.0, oy: float = 0.0) -> np.ndarray:
+    """Every inked pixel of ``ink`` as its four corners, offset by ``(ox, oy)``.
+
+    The point cloud an oriented box is closed onto.  Read off the *composed*
+    ink rather than off the dot patches that went into it, because composing is
+    not a union: :func:`compose_dots` multiplies what each dot leaves of the
+    paper, so two dots whose tails are each below :data:`INK_FLOOR` can darken
+    their overlap past it.  A box fitted to the patches would leave that ink
+    outside itself, which is the one thing a label may never do.
+
+    Corners rather than centres: pixel ``i`` occupies ``[i, i + 1]``, so a box
+    that stopped at ``xs.max()`` would stop half way through the pixel it was
+    fitted to.  :mod:`~dotgen.core.line_defects` reads the ink it has just cut
+    or bled through the same function, so every box in the project is closed
+    onto ink the same way.
+
+    Only the convex hull of the inked pixels is returned, which loses nothing:
+    the callers use these points to take a maximum of ``n . p`` over them, and
+    a linear functional attains its maximum on the hull.  It is worth doing --
+    a smeared line on a full-size page has tens of thousands of inked pixels
+    and a hull of a few dozen, and the hull is found in OpenCV rather than by
+    materialising an array of them.
+    """
+    inked = cv2.findNonZero((ink > INK_FLOOR).astype(np.uint8))
+
+    if inked is None:  # blank: findNonZero says so with None, not an empty array
+        return np.empty((0, 2), dtype=np.float64)
+
+    hull = cv2.convexHull(inked).reshape(-1, 2)
+    corner = hull.astype(np.float64) + (float(ox), float(oy))
+
+    return np.concatenate(
+        [corner + d for d in ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))]
+    )
+
+
+def _lattice(width: float, height: float) -> np.ndarray:
+    """The rectangle around the ideal dot grid, before anything warps it.
+
+    A one-column or one-row character has a lattice with no width or no height,
+    and a rectangle with a zero-length edge has no direction to carry through
+    the warp.  Such a lattice is opened out to :data:`polygons.MIN_EXTENT`
+    about its own centre -- far below a dot radius, so
+    :func:`~dotgen.core.polygons.cover` takes the real extent back off it, and
+    wide enough that the edge directions survive ``getPerspectiveTransform``.
+    """
+    w = max(float(width), polygons.MIN_EXTENT)
+    h = max(float(height), polygons.MIN_EXTENT)
+
+    return polygons.rect((float(width) - w) / 2.0, (float(height) - h) / 2.0, w, h)
+
+
 def _measure_bbox(ink: np.ndarray) -> tuple[float, float, float, float]:
     """Tight box over the inked pixels, grown 1 px and clipped to the canvas.
 
@@ -493,12 +553,20 @@ def render_char(
             origin=(float(margin), float(margin)),
             bbox=(0.0, 0.0, float(size), float(size)),
             defects={k: 0 for k in DEFECT_KINDS},
+            quad=polygons.rect(0.0, 0.0, float(size), float(size)),
         )
 
-    # The metric origin rides along as an extra point so it lands wherever the
-    # same geometry puts it, instead of being re-derived afterwards.
+    # The metric origin and the four corners of the ideal dot lattice ride
+    # along as extra points, so each lands wherever the same geometry puts it
+    # instead of being re-derived afterwards.  The lattice corners are what
+    # come out as the character's oriented label: a homography takes the
+    # lattice's bounding lines to straight lines, so warping four corners and
+    # warping the whole rectangle are the same thing.
     pts = np.array(
-        [metrics.positions[i] for i in range(n)] + [(0.0, 0.0)], dtype=np.float64
+        [metrics.positions[i] for i in range(n)]
+        + [(0.0, 0.0)]
+        + [tuple(c) for c in _lattice(metrics.width, metrics.height)],
+        dtype=np.float64,
     )
 
     geometry, is_neutral = _geometry_params(params, mode_str)
@@ -559,10 +627,19 @@ def render_char(
     ink = compose_dots((height, width), placed)
     origin = (float(pts[n, 0] + off_x), float(pts[n, 1] + off_y))
 
+    # The warped lattice says which way the four edges run; the ink that came
+    # out says where they sit.  A missing dot pulls its edge in, a jittered one
+    # pushes its edge out, and neither can change the angle -- the box stays
+    # square to the print however the defects moved the ink.
+    quad = polygons.cover(
+        polygons.translated(pts[n + 1 :], off_x, off_y), ink_points(ink)
+    )
+
     return RenderedChar(
         ink=ink,
         origin=origin,
         dot_centers=dot_centers,
         bbox=_measure_bbox(ink),
         defects=dict(plan.counts),
+        quad=quad,
     )

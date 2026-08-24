@@ -25,8 +25,20 @@ from dotgen.core.export_yolo import (
     split_of,
     write_dataset,
 )
-from dotgen.core.exporter import ExportError, preflight, report_text, run_export
-from dotgen.core.models import ComposedImage, ExportSpec, Quad
+from dotgen.core.exporter import (
+    ExportError,
+    preflight,
+    preflight_warnings,
+    report_text,
+    run_export,
+)
+from dotgen.core.models import (
+    DEFECT_LABELS,
+    ComposedImage,
+    ExportSpec,
+    Quad,
+    defect_class_name,
+)
 
 
 # ----------------------------------------------------------------------
@@ -84,6 +96,35 @@ def image_files(out_dir) -> list[str]:
         out += [os.path.join(d, f) for f in sorted(os.listdir(d))]
 
     return out
+
+
+# A quarter-size page.  The defect tests below export forty images through the
+# real engines, and the cost of that is the area of the page.
+SMALL = (320, 240)
+SMALL_QUAD = Quad([(30, 30), (290, 30), (290, 210), (30, 210)])
+
+
+def defect_job(make_job, kind: str, lines=("12",), **over):
+    """A job whose ``kind`` fires on every line, with a class list that says so.
+
+    ``p_line = 1.0`` and a ``max_lines`` past the line count is what makes the
+    label files predictable: every line of every image carries the defect, so
+    "some label file happens to have one" cannot pass by luck.
+    """
+    job = make_job(lines=lines, size=SMALL, quad=SMALL_QUAD)
+    defect = job.line_defects.get(kind)
+    defect.enabled, defect.p_line, defect.max_lines = True, 1.0, 9
+
+    for field_name, value in over.items():
+        setattr(defect, field_name, value)
+
+    job.classes = build_classes(job.characters(), job.lines, line_defects=job.line_defects)
+
+    return job
+
+
+def rows_of(path) -> list[list[str]]:
+    return [line.split() for line in open(path, encoding="utf-8").read().splitlines()]
 
 
 # ----------------------------------------------------------------------
@@ -602,3 +643,168 @@ def test_report_text_mentions_the_headline_numbers(make_job, tmp_path):
 
 def test_empty_report_has_no_empty_class_noise():
     assert ExportReport().empty_classes == []
+
+
+# ----------------------------------------------------------------------
+# line defects in the dataset (Phase 8)
+# ----------------------------------------------------------------------
+
+
+def test_a_fired_defect_replaces_the_plain_line_class_in_every_label(make_job, tmp_path):
+    """The claim the feature is for: forty images, no undamaged line among them."""
+    job = defect_job(make_job, "ink_cover", lines=("12", "34"))
+    report = write_dataset([job], spec_for(tmp_path, images_per_job=40))
+
+    names = read_yaml_names(tmp_path)
+    index = class_index(names)
+    smeared = str(index["line_ink_cover"])
+    plain = {str(index["line1"]), str(index["line2"])}
+
+    assert report.images == 40
+    assert report.line_defects == {"ink_cover": 40 * len(job.lines)}
+
+    for path in label_files(tmp_path):
+        classes = {row[0] for row in rows_of(path)}
+
+        assert smeared in classes
+        assert not (classes & plain)
+
+    # And the plain classes say so afterwards, rather than shipping empty.
+    assert {"line1", "line2"} <= set(report.empty_classes)
+
+
+def test_no_character_a_defect_touched_is_labelled_anywhere_in_the_export(
+    make_job, tmp_path
+):
+    """plan2.md 9.5: the first label rule, asserted over a whole dataset.
+
+    ``squeeze`` is the kind that proves it hardest, because it touches *every*
+    character of the line it fires on -- so a correct export of forty images has
+    no character row in it at all, only the line's own. One escaped box in one
+    image of forty fails this; a per-image unit test can only say that the one
+    image it looked at was clean.
+
+    The characters are still drawn and still inside the line's box: that is what
+    the second assertion is for. A rule implemented by not drawing the character
+    would pass the first one and be wrong.
+    """
+    job = defect_job(make_job, "squeeze", lines=("1234", "5678"), amount=(0.5, 0.5))
+    report = write_dataset([job], spec_for(tmp_path, images_per_job=40))
+
+    names = read_yaml_names(tmp_path)
+    index = class_index(names)
+    squeezed = str(index["line_squeeze"])
+
+    assert report.line_defects == {"squeeze": 40 * len(job.lines)}
+
+    for path in label_files(tmp_path):
+        rows = rows_of(path)
+
+        assert rows, f"{path} is empty"
+        assert {row[0] for row in rows} == {squeezed}
+        assert len(rows) == len(job.lines)
+
+    # Every character class the job could have produced ships empty, which is
+    # the same fact seen from the report rather than from the label files.
+    assert set("12345678") <= set(report.empty_classes)
+
+
+def test_data_yaml_lists_the_defect_classes_unquoted(make_job, tmp_path):
+    """``line_ink_cover`` is a plain YAML identifier; quoting it would be noise."""
+    job = defect_job(make_job, "ink_cover")
+    write_dataset([job], spec_for(tmp_path, images_per_job=2))
+
+    names = read_yaml_names(tmp_path)
+    text = (tmp_path / "data.yaml").read_text(encoding="utf-8")
+
+    assert "line_ink_cover" in names
+    assert f"  {names.index('line_ink_cover')}: line_ink_cover" in text
+
+
+def test_the_report_and_its_json_carry_the_line_defect_counts(make_job, tmp_path):
+    job = defect_job(make_job, "squeeze", lines=("1234",), amount=(0.4, 0.4))
+    report = write_dataset([job], spec_for(tmp_path, images_per_job=5))
+    data = json.loads((tmp_path / "export_report.json").read_text(encoding="utf-8"))
+
+    assert report.line_defects == {"squeeze": 5}
+    assert data["line_defects"] == {"squeeze": 5}
+    assert "Line defects: squeeze 5" in report_text(report)
+
+
+def test_a_report_with_no_defects_says_nothing_about_them(make_job, tmp_path):
+    report = write_dataset([make_job(("12",))], spec_for(tmp_path, images_per_job=2))
+
+    assert report.line_defects == {}
+    assert "Line defects" not in report_text(report)
+
+
+def test_preflight_refuses_a_defect_that_has_no_class(make_job, tmp_path):
+    """The mistake this feature makes possible: armed in Tab 5, never loaded in Tab 6."""
+    job = make_job(("12",))
+    defect = job.line_defects.get("top_loss")
+    defect.enabled, defect.p_line = True, 1.0
+
+    errors = preflight([job], spec_for(tmp_path))
+
+    assert len(errors) == 1
+    assert DEFECT_LABELS["top_loss"] in errors[0]
+    assert job.name in errors[0]
+
+    with pytest.raises(ExportError):
+        run_export([job], spec_for(tmp_path))
+
+
+def test_preflight_warns_when_a_defect_will_almost_never_fire(make_job, tmp_path):
+    """A warning, not an error: the export is legal, the class will just be empty."""
+    job = defect_job(make_job, "top_loss", p_line=0.01)
+    spec = spec_for(tmp_path, images_per_job=4)
+
+    warnings = preflight_warnings([job], spec)
+
+    assert preflight([job], spec) == []
+    assert len(warnings) == 1
+    assert DEFECT_LABELS["top_loss"] in warnings[0]
+    assert defect_class_name("top_loss") in warnings[0]
+
+    # One line, forty images: forty expected firings, nothing to warn about.
+    assert preflight_warnings([job], spec_for(tmp_path, images_per_job=400)) == []
+
+
+def test_preflight_warns_about_nothing_when_no_defect_is_armed(make_job, tmp_path):
+    assert preflight_warnings([make_job(("12",))], spec_for(tmp_path)) == []
+
+
+def test_a_defect_export_is_byte_identical_when_re_exported(make_job, tmp_path):
+    """The property most at risk: an ``rng`` drawn in the wrong order."""
+    a, b = tmp_path / "a", tmp_path / "b"
+
+    write_dataset([defect_job(make_job, "ink_cover", lines=("12", "34"))], spec_for(a, seed=77))
+    write_dataset([defect_job(make_job, "ink_cover", lines=("12", "34"))], spec_for(b, seed=77))
+
+    for pa, pb in zip(image_files(a) + label_files(a), image_files(b) + label_files(b)):
+        assert open(pa, "rb").read() == open(pb, "rb").read()
+
+
+def test_an_obb_label_of_a_collapsed_line_is_a_real_quad(make_job, tmp_path):
+    """One merged blob is one degenerate-looking point set -- and must not be."""
+    job = defect_job(
+        make_job, "collapse_all", lines=("1234",), amount=(0.05, 0.05), side="left"
+    )
+    report = write_dataset([job], spec_for(tmp_path, images_per_job=3, fmt="yolo-obb"))
+
+    assert report.line_defects == {"collapse_all": 3}
+
+    for path in label_files(tmp_path):
+        rows = rows_of(path)
+
+        assert rows
+
+        for row in rows:
+            assert len(row) == 9
+
+            xs = [float(v) for v in row[1::2]]
+            ys = [float(v) for v in row[2::2]]
+
+            assert all(0.0 <= v <= 1.0 for v in xs + ys)
+            assert max(xs) > min(xs)
+            assert max(ys) > min(ys)

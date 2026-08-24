@@ -103,6 +103,10 @@ class ExportReport:
     requested: int = 0
     class_counts: dict[str, int] = field(default_factory=dict)
     split_counts: dict[str, int] = field(default_factory=dict)
+    # Lines hit per defect kind over the whole run, summed off each composed
+    # image's ``meta["line_defects"]``.  Not derivable from ``class_counts``: a
+    # line that fired two kinds carries the class of only the first of them.
+    line_defects: dict[str, int] = field(default_factory=dict)
     skipped: list[dict] = field(default_factory=list)
     elapsed: float = 0.0
     cancelled: bool = False
@@ -127,6 +131,7 @@ class ExportReport:
             "requested": self.requested,
             "class_counts": dict(self.class_counts),
             "split_counts": dict(self.split_counts),
+            "line_defects": dict(self.line_defects),
             "empty_classes": self.empty_classes,
             "skipped": list(self.skipped),
             "skipped_images": self.skipped_images,
@@ -175,7 +180,7 @@ def label_lines(
 ) -> list[str]:
     """``"<idx> <cx> <cy> <w> <h>"`` per box, skipping classes not in the index.
 
-    A box whose class is disabled in Tab 5 is dropped rather than renumbered:
+    A box whose class is disabled in Tab 6 is dropped rather than renumbered:
     the character is still drawn on the image, it just carries no label.
     """
     out: list[str] = []
@@ -428,6 +433,9 @@ def write_dataset(
             for box in composed.boxes:
                 if box[0] in report.class_counts:
                     report.class_counts[box[0]] += 1
+
+            for kind, n_lines in composed.meta.get("line_defects", {}).items():
+                report.line_defects[kind] = report.line_defects.get(kind, 0) + int(n_lines)
 
             done += 1
 

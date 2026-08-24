@@ -43,6 +43,7 @@ rather than counts.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import re
 from pathlib import Path
@@ -595,3 +596,59 @@ def test_same_seed_reproduces_identical_files(export, rerun) -> None:
     mismatched = sorted(k for k in first if first[k] != second[k])
 
     assert mismatched == [], f"{len(mismatched)} file(s) differ between two seeded exports"
+
+
+# ======================================================================
+# 5 -- the line defects, on the real photographs
+# ======================================================================
+
+DEFECT_IMAGES = 6
+
+
+def _armed(job: Job, kind: str = "ink_cover") -> Job:
+    """A copy of the e2e job with one defect kind firing on every line.
+
+    A copy because ``job`` is module-scoped and every assertion above reads it;
+    arming the shared one would move the dataset those tests describe.
+    """
+    out = copy.deepcopy(job)
+    defect = out.line_defects.get(kind)
+    defect.enabled, defect.p_line, defect.max_lines = True, 1.0, 9
+    out.classes = build_classes(out.characters(), out.lines, line_defects=out.line_defects)
+
+    return out
+
+
+def test_a_defect_export_of_the_photographs_is_still_reproducible(
+    job, tmp_path_factory
+) -> None:
+    """Phase 8: the seed still is the dataset once a defect draws from the rng."""
+    spec_fields = dict(fmt="yolo", images_per_job=DEFECT_IMAGES, seed=SEED, split=SPLIT)
+
+    first_dir = tmp_path_factory.mktemp("e2e_defect_a")
+    second_dir = tmp_path_factory.mktemp("e2e_defect_b")
+
+    first = run_export([_armed(job)], ExportSpec(out_dir=str(first_dir), **spec_fields))
+    second = run_export([_armed(job)], ExportSpec(out_dir=str(second_dir), **spec_fields))
+
+    expected = DEFECT_IMAGES * len(job.lines)
+
+    assert first.line_defects == second.line_defects == {"ink_cover": expected}
+    assert _hash_tree(first_dir) == _hash_tree(second_dir)
+
+    # The damage is in the labels, not only in the report.
+    _, names = _read_data_yaml(first_dir)
+    smeared = str(names.index("line_ink_cover"))
+
+    for split in SPLITS:
+        for path in sorted((first_dir / "labels" / split).iterdir()):
+            assert smeared in {row.split()[0] for row in path.read_text().splitlines()}
+
+
+def test_the_undamaged_export_reports_no_line_defects(export) -> None:
+    """The twenty-image dataset every assertion above reads was drawn with no
+    kind armed, and the report has to say exactly that -- an ``ink_cover`` count
+    appearing here would mean a defect fired on a job that never asked for one."""
+    _, report = export
+
+    assert report.line_defects == {}

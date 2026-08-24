@@ -162,6 +162,66 @@ Tab6 §2 "Save job" captures Tabs 1–5, then Tab 1 is free for a new job — **
 Tab6 §3 "Export data" exports the whole dataset — **PARTIAL** (Phase 8, `core/exporter.py::run_export`, `core/export_yolo.py`, `tests/test_export_yolo.py::test_writes_a_loadable_yolo_folder`, `::test_re_export_is_byte_identical`, `::test_cancelling_leaves_matching_pairs_only`, `tests/test_ui_smoke.py::test_tab6_writes_a_yolo_folder`) — the export itself is correct, reproducible, cancellable and preflighted
 - **LIMITATION** (handoff, Phase 10.2 outstanding) — the export runs single-threaded in a Python thread, so the GIL makes the GUI sluggish during a large export; `ProcessPoolExecutor` is the intended fix and is not implemented
 
+## Line-level defect generation — the manual checklist (`plan2.md`)
+
+Added after this document's first pass, which is why the tab numbers in the headings above are the
+old ones: line-level defect generation took Tab 5, class definition moved to Tab 6 and export to
+Tab 7.
+
+This section is a **manual** checklist on purpose. Whether a rendered defect looks like the
+photograph it was specified from is not a thing a test can assert, so what is automated here is the
+labels and the cost, and what is left to a human is the resemblance.
+
+Regenerate the evidence, then read it:
+
+```
+python tools/df_lines_sheet.py          -> tools/smudge/line_defects.png
+python tests/bench_compose.py           -> the two 9.3 verdicts
+python -m pytest tests/ -q              -> everything else
+```
+
+### The seven photographs and the panel that reproduces each
+
+Each row of `tools/smudge/line_defects.png` is one kind, at
+`models.DEFECT_RANGES[kind]`, with its photograph beside it. One image per kind is also written at
+1:1 to `tools/smudge/line_defects/<kind>.png`, and with the labels drawn on to
+`<kind>_boxes.png`.
+
+| # | photograph | kind | look for | verdict |
+| --- | --- | --- | --- | --- |
+| 1 | `toplost.png` | `top_loss` | the top band of the glyphs gone; what is left still reads as clipped characters, not as a new font | OK |
+| 2 | `botlost.png` | `bottom_loss` | the same from the bottom edge, on the lower line | OK |
+| 3 | `coverink.png` | `ink_cover` | one torn-edged blob crossing **both** lines, dark at the centre and dragged to one side | PARTIAL — the blob is about 1.5× the photograph's height; see `tools/README.md` |
+| 4 | `randomlost.png` | `char_loss` | a run of characters simply absent, the rest of the line correctly spaced around the hole | OK |
+| 5 | `dfall.png` | `collapse_all` | each line one solid blob against one edge, nothing readable left | PARTIAL — the blob is rectangular where the photograph's is irregular |
+| 6 | `df1side.png` | `collapse_side` | one crowded blob at one end, the remaining characters normal and still readable | OK |
+| 7 | `dfscale.png` | `squeeze` | the whole line narrower, every character compressed, spacing shrunk with it | OK |
+
+### The two label rules
+
+Both are visible on the `_boxes` panels and both are pinned by tests.
+
+- **A character a defect touched carries no box.** Green boxes are characters. On the `top_loss`
+  panel 5 of 19 characters keep one; on `squeeze`, none do — the defect touches every character in
+  the line. `PlacedChar.defect` is what suppresses it (`layout.layout_job`), and the character is
+  still drawn and still inside its line's box.
+  Tests: `tests/test_line_defects_geometry.py`, `tests/test_line_defects_ink.py`,
+  `tests/test_export_yolo.py`.
+- **A line a defect fired on carries the defect's class instead of its own.** Magenta boxes are
+  `line_<kind>`; red is an undamaged `line1` / `line2`. Never both on one line — one box per line,
+  one class per box, priority in `DEFECT_KINDS` order (`classes.resolve_line_class`).
+  Tests: `tests/test_classes.py`, `tests/test_export_yolo.py`.
+
+### What is automated instead
+
+| claim | where |
+| --- | --- |
+| nothing enabled changes no pixel and consumes no randomness | `tests/test_orig_regression.py` — `orig.png` still reproduced at IoU 0.636 |
+| the same seed exports byte-identical images and labels with defects on | `tests/test_e2e.py` |
+| every enabled kind's class reaches `data.yaml` with a non-zero count | `tests/test_export_yolo.py`, `ExportReport.line_defects` |
+| a `.dotcfg` written before the feature opens, renders and exports unchanged | `tests/test_io_config.py`, `tests/test_orig_regression.py` |
+| all seven armed cost under 2× the undefected image, at any page size | `tests/bench_compose.py` |
+
 ## General rules
 
 GR §1 the exported dataset's classes are every class appearing in any job — **OK** (Phase 8, `classes.dataset_classes`, `tests/test_classes.py::test_dataset_classes_is_the_union_over_jobs`, `::test_disabled_classes_are_excluded`, `::test_class_order_is_deterministic_and_grouped_by_kind`, `tests/test_export_yolo.py::test_two_jobs_share_one_class_index`)

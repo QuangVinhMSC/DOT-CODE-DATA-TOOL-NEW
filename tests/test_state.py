@@ -1,7 +1,14 @@
 import numpy as np
 import pytest
 
-from dotgen.core.models import CharFormat, CurveSpec, DotLink, DotSequence, Quad
+from dotgen.core.models import (
+    CharFormat,
+    CurveSpec,
+    DotLink,
+    DotSequence,
+    LineDefectSpec,
+    Quad,
+)
 from dotgen.core.state import (
     MAX_DOT_SAMPLES,
     MAX_IMAGE_UNDO,
@@ -314,6 +321,75 @@ def test_gap_coefficients_survive_adding_another_line(state):
     assert state.line_gaps[0].coeff == 3.5
 
 
+def test_spacing_bounds_default_to_the_spacing_itself(state):
+    state.add_line()
+    state.set_char_spacing(0, 18.0)
+    line = state.lines[0]
+
+    assert (line.char_spacing_min, line.char_spacing_max) == (18.0, 18.0)
+    assert line.spacing_is_point()
+
+
+def test_a_spacing_bound_dragged_past_the_mean_pushes_it(state):
+    state.add_line()
+    state.set_char_spacing(0, 20.0)
+    state.set_char_spacing_field(0, "min", 30.0)
+    line = state.lines[0]
+
+    assert (line.char_spacing_min, line.char_spacing, line.char_spacing_max) == (
+        30.0,
+        30.0,
+        30.0,
+    )
+
+    state.set_char_spacing_field(0, "max", 10.0)
+
+    assert (line.char_spacing_min, line.char_spacing, line.char_spacing_max) == (
+        10.0,
+        10.0,
+        10.0,
+    )
+
+
+def test_the_mean_spacing_stays_inside_the_bounds(state):
+    state.add_line()
+    state.set_char_spacing_field(0, "min", 15.0)
+    state.set_char_spacing_field(0, "max", 45.0)
+    state.set_char_spacing(0, 30.0)
+    line = state.lines[0]
+
+    assert (line.char_spacing_min, line.char_spacing, line.char_spacing_max) == (
+        15.0,
+        30.0,
+        45.0,
+    )
+    assert not line.spacing_is_point()
+
+
+def test_gap_bounds_survive_adding_another_line(state):
+    state.add_line()
+    state.add_line()
+    state.set_line_gap_field(1, "min", 1.5)
+    state.set_line_gap_field(1, "max", 3.5)
+    state.add_line()
+
+    gap = state.line_gaps[0]
+
+    assert (gap.coeff_min, gap.coeff, gap.coeff_max) == (1.5, 2.0, 3.5)
+
+
+def test_saved_jobs_carry_the_spacing_bounds(state):
+    state.add_line()
+    state.add_line()
+    state.set_char_spacing_field(0, "max", 55.0)
+    state.set_line_gap_field(1, "max", 4.0)
+
+    job = state.snapshot_job()
+
+    assert job.lines[0].char_spacing_max == 55.0
+    assert job.line_gaps[0].coeff_max == 4.0
+
+
 def test_removing_a_line_renumbers_the_rest(state):
     for _ in range(3):
         state.add_line()
@@ -447,3 +523,48 @@ def test_a_committed_edit_survives_the_next_measurement(state):
     state.add_dot_sequence(DotSequence.pair((0, 0), (12, 0), "h"))
 
     assert state.params["dist.h"].max == 33.0
+
+
+# ----------------------------------------------------------------------
+# line-level defects
+# ----------------------------------------------------------------------
+
+
+def test_setting_one_defect_field_emits_once(state):
+    seen = []
+    state.lineDefectsChanged.connect(lambda: seen.append(1))
+
+    state.set_line_defect("squeeze", enabled=True, p_line=0.4, amount=(0.35, 0.7))
+
+    assert len(seen) == 1
+    assert state.line_defects.get("squeeze").amount == (0.35, 0.7)
+    assert state.line_defects.enabled_kinds() == ["squeeze"]
+
+
+def test_the_defect_class_list_follows_the_enabled_kinds(state):
+    state.set_line_defect("ink_cover", enabled=True, p_line=0.2)
+    state.set_line_defect("top_loss", enabled=True, p_line=0.2)
+
+    assert state.line_defect_classes() == ["line_top_loss", "line_ink_cover"]
+
+
+def test_a_snapshot_is_a_deep_copy_of_the_defects(state):
+    state.set_line_defect("char_loss", enabled=True, p_line=0.3)
+    job = state.save_job("j")
+
+    state.set_line_defect("char_loss", p_line=0.9)
+
+    assert job.line_defects.get("char_loss").p_line == 0.3
+
+
+def test_reset_and_load_carry_the_defects(state):
+    state.set_line_defect("collapse_all", enabled=True, p_line=0.5, amount=(0.05, 0.2))
+    state.save_job("j")
+    state.reset_job_definition()
+
+    assert state.line_defects == LineDefectSpec()
+
+    state.load_job(0)
+
+    assert state.line_defects.enabled_kinds() == ["collapse_all"]
+    assert state.line_defects.get("collapse_all").amount == (0.05, 0.2)

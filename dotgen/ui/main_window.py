@@ -1,4 +1,4 @@
-"""MainWindow -- the six tabs, the status bar and the progressive gating.
+"""MainWindow -- the seven tabs, the status bar and the progressive gating.
 
 A tab that is not ready is disabled and the reason is shown in the status bar
 when the user hovers it, rather than letting them walk into a half-defined job.
@@ -40,10 +40,11 @@ from .tabs.tab1_sample import Tab1Sample
 from .tabs.tab2_matrix import Tab2Matrix
 from .tabs.tab3_summary import Tab3Summary
 from .tabs.tab4_job import Tab4Job
-from .tabs.tab5_class import Tab5Class
-from .tabs.tab6_export import Tab6Export
+from .tabs.tab5_defect import Tab5Defect
+from .tabs.tab6_class import Tab6Class
+from .tabs.tab7_export import Tab7Export
 
-# The size the six tabs were laid out for, before the screen gets a say.
+# The size the seven tabs were laid out for, before the screen gets a say.
 WANTED_SIZE = (1600, 1000)
 
 TAB_TITLES = [
@@ -51,8 +52,9 @@ TAB_TITLES = [
     "2 - Number matrix",
     "3 - Summary",
     "4 - Create job",
-    "5 - Class definition",
-    "6 - Save job and export",
+    "5 - Defect generation",
+    "6 - Class definition",
+    "7 - Save job and export",
 ]
 
 
@@ -72,15 +74,24 @@ class MainWindow(QMainWindow):
         self.tab2 = Tab2Matrix(self.state)
         self.tab3 = Tab3Summary(self.state)
         self.tab4 = Tab4Job(self.state)
-        self.tab5 = Tab5Class(self.state)
-        self.tab6 = Tab6Export(self.state)
+        self.tab5 = Tab5Defect(self.state)
+        self.tab6 = Tab6Class(self.state)
+        self.tab7 = Tab7Export(self.state)
 
-        for title, widget in zip(
-            TAB_TITLES, (self.tab1, self.tab2, self.tab3, self.tab4, self.tab5, self.tab6)
-        ):
+        ordered = (
+            self.tab1,
+            self.tab2,
+            self.tab3,
+            self.tab4,
+            self.tab5,
+            self.tab6,
+            self.tab7,
+        )
+
+        for title, widget in zip(TAB_TITLES, ordered):
             self.tabs.addTab(widget, title)
 
-        for tab in (self.tab1, self.tab2, self.tab3, self.tab4, self.tab5, self.tab6):
+        for tab in ordered:
             tab.statusMessage.connect(self.show_message)
 
         self.state.statusMessage.connect(self.show_message)
@@ -99,6 +110,7 @@ class MainWindow(QMainWindow):
             self.state.charFormatsChanged,
             self.state.backgroundsChanged,
             self.state.linesChanged,
+            self.state.lineDefectsChanged,
             self.state.classesChanged,
             self.state.jobsChanged,
         ):
@@ -300,7 +312,7 @@ class MainWindow(QMainWindow):
 
     def gating_reasons(self) -> dict[int, str]:
         """index -> blocking reason ('' when the tab is open)."""
-        reasons = {i: "" for i in range(6)}
+        reasons = {i: "" for i in range(7)}
 
         if not self.state.has_distance_units():
             reasons[1] = (
@@ -323,21 +335,31 @@ class MainWindow(QMainWindow):
                     + " in Tab 2."
                 )
 
+        # Tabs 5 and 6 stand or fall together: the defect tab composes the job
+        # to preview it and the class tab reads its classes off the same lines
+        # and backgrounds, so a state that blocks one blocks the other.  The
+        # reason is written once into a local and assigned to both, because two
+        # copies of it would drift apart at the first edit.
+        content: str = ""
+
         if not self.state.backgrounds:
-            reasons[4] = "Tab 5 needs at least one background in Tab 4."
+            content = "Tabs 5 and 6 need at least one background in Tab 4."
         elif self.state.backgrounds_missing_quad():
             missing = ", ".join(f"#{i + 1}" for i in self.state.backgrounds_missing_quad())
-            reasons[4] = f"Tab 5 is locked: backgrounds {missing} have no base quadrilateral."
+            content = f"Tabs 5 and 6 are locked: backgrounds {missing} have no base quadrilateral."
         elif not self.state.has_content():
-            reasons[4] = "Tab 5 needs at least one line with one character in Tab 4."
+            content = "Tabs 5 and 6 need at least one line with one character in Tab 4."
 
-        # ... or a saved job.  "Save job" lives *in* Tab 6 and clears Tabs 1-5
+        reasons[4] = content
+        reasons[5] = content
+
+        # ... or a saved job.  "Save job" lives *in* Tab 7 and clears Tabs 1-6
         # behind it, so gating on the class list alone locks the tab the moment
         # it is used -- and the Export button, which is a child of the tab and
         # therefore disabled with it, becomes unreachable for the jobs already
         # saved.  Classes get you in the first time; a saved job keeps you in.
         if not self.state.classes_ready() and not self.state.jobs:
-            reasons[5] = "Tab 6 needs a valid class list in Tab 5, or a saved job."
+            reasons[6] = "Tab 7 needs a valid class list in Tab 6, or a saved job."
 
         return reasons
 
@@ -395,6 +417,10 @@ class MainWindow(QMainWindow):
             self,
             "DOT-CODE-DATA-TOOL",
             "Synthetic dot-matrix character dataset generator.\n\n"
-            "Phases 1-2: the complete GUI, driven by stub engines.\n"
-            "Phases 3-9 replace the engines without changing this interface.",
+            "Seven tabs: sample the dots, draw the characters, check the\n"
+            "ranges, build the job, generate the defects, define the classes,\n"
+            "export the dataset.\n\n"
+            "PLAN.md phases 1-10 built the program.  plan2.md (phase 11) added\n"
+            "Tab 5's line-level defect generation and the classes that go with\n"
+            "it, and renumbered the two tabs after it.",
         )

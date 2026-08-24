@@ -3,9 +3,9 @@
 Tab 1 uses it with group-level enable checkboxes for the optional parameter
 groups; Tab 3 uses it in *draft* mode with per-bar compare checkboxes.
 
-Draft mode is what puts Tab 3's Load button in charge.  The bars then edit a
+Draft mode is what puts Tab 3's Load button in charge.  The rows then edit a
 private copy of the parameters instead of the live ones, so the two preview
-frames can follow a handle while nothing downstream has moved yet; the copy
+frames can follow a typed number while nothing downstream has moved yet; the copy
 reaches :class:`AppState` only when the tab asks it to.  A bar the user has not
 touched keeps tracking its measurement, exactly as ``ParamSet.merge`` does with
 ``user_set`` -- the draft is that same rule, one step earlier.
@@ -37,6 +37,13 @@ from ...core.state import AppState
 from .. import theme
 from ..qtutil import clear_layout
 from .range_bar import RangeBar
+from .value_row import FIELD_WIDTH, ValueRow
+
+# How far a section indents its rows, and the width the numeric header leaves
+# for an enable checkbox -- both only so the column captions land over their
+# columns.  ``_Section`` below is what actually applies the indent.
+_SECTION_INDENT = 14
+_ENABLE_BOX_WIDTH = 18
 
 # Groups the draft marks as "can be used or unused".
 OPTIONAL_GROUPS: dict[str, tuple[str, ...]] = {
@@ -78,7 +85,7 @@ class _Section(QFrame):
 
         self.body = QWidget()
         self.body_layout = QVBoxLayout(self.body)
-        self.body_layout.setContentsMargins(14, 0, 0, 4)
+        self.body_layout.setContentsMargins(_SECTION_INDENT, 0, 0, 4)
         self.body_layout.setSpacing(1)
         outer.addWidget(self.body)
 
@@ -98,6 +105,7 @@ class _Section(QFrame):
 
 class RangeBarList(QWidget):
     draftEdited = Signal(str)  # key -- draft mode only
+    editRejected = Signal(str)  # numeric mode only: what was typed is not a number
 
     def __init__(
         self,
@@ -110,6 +118,7 @@ class RangeBarList(QWidget):
         show_filter: bool = True,
         label_width: int = 128,
         draft: bool = False,
+        numeric: bool = False,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -120,6 +129,11 @@ class RangeBarList(QWidget):
         self.editable = editable
         self.group_enable = group_enable
         self.label_width = label_width
+        # Two ways to show the same parameter: a bar with three handles, or
+        # three fields with the numbers in them.  Tab 1 measures and displays,
+        # so it keeps the bar; Tab 3 is where values are stated, and there a
+        # typed number beats a dragged one.
+        self.numeric = numeric
 
         self.draft: ParamSet | None = state.params.deep_copy() if draft else None
         self._edited: set[str] = set()
@@ -139,6 +153,9 @@ class RangeBarList(QWidget):
         self.filter_edit.setVisible(show_filter)
         outer.addWidget(self.filter_edit)
 
+        if self.numeric:
+            outer.addWidget(self._build_header())
+
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.NoFrame)
@@ -157,6 +174,37 @@ class RangeBarList(QWidget):
         self.rebuild()
 
         state.paramsChanged.connect(self.refresh)
+
+    # ------------------------------------------------------------------
+    def _build_header(self) -> QWidget:
+        """Name the three columns, once, above the scroll area.
+
+        Three anonymous boxes are three chances to type a mean into the max.
+        The margins and widths here are the ones a row uses -- the section
+        indent, the row's own margin, then the label -- so the captions sit
+        over their fields instead of near them, and it stays put while the
+        list underneath scrolls.
+        """
+        header = QWidget()
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(_SECTION_INDENT + 2, 0, 2, 0)
+        hl.setSpacing(theme.GAP)
+
+        if self.show_enable:
+            hl.addSpacing(_ENABLE_BOX_WIDTH + theme.GAP)
+
+        hl.addSpacing(self.label_width)
+
+        for name in ("Min", "Mean", "Max"):
+            cap = QLabel(name)
+            cap.setObjectName("hint")
+            cap.setFixedWidth(FIELD_WIDTH)
+            cap.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+            hl.addWidget(cap)
+
+        hl.addStretch(1)
+
+        return header
 
     # ------------------------------------------------------------------
     def add_section(self, title: str, widget: QWidget) -> None:
@@ -181,7 +229,7 @@ class RangeBarList(QWidget):
     # ------------------------------------------------------------------
 
     def edited_keys(self) -> list[str]:
-        """The bars the user has dragged since the last :meth:`reseed`."""
+        """The bars the user has changed since the last :meth:`reseed`."""
         return sorted(self._edited)
 
     def reseed(self) -> None:
@@ -209,7 +257,7 @@ class RangeBarList(QWidget):
 
         Everything except min/mean/max is taken from the state even on an edited
         bar -- the label, the bounds and the enabled flag are not what the user
-        staged, and a bar frozen against its own group's checkbox would be a lie.
+        typed, and a bar frozen against its own group's checkbox would be a lie.
         """
         if self.draft is None:
             return
@@ -288,8 +336,10 @@ class RangeBarList(QWidget):
                     lambda v, pref=prefixes: self.state.set_group_enabled(pref, v)
                 )
 
+            row_class = ValueRow if self.numeric else RangeBar
+
             for p in by_group[gname]:
-                bar = RangeBar(
+                bar = row_class(
                     p,
                     show_enable=self.show_enable,
                     show_compare=self.show_compare,
@@ -301,6 +351,9 @@ class RangeBarList(QWidget):
                 )
                 bar.enabledToggled.connect(self.state.set_param_enabled)
                 bar.compareToggled.connect(self.state.set_param_compare)
+
+                if self.numeric:
+                    bar.editRejected.connect(self.editRejected)
                 self.bars[p.key] = bar
                 section.add(bar)
 

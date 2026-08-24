@@ -1,0 +1,7 @@
+train: images/train
+val: images/val
+test: images/test
+nc: 2
+names:
+  0: "1"
+  1: line1

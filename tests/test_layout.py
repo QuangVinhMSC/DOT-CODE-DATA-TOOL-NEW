@@ -159,6 +159,140 @@ def test_lines_are_horizontal_when_tilt_is_switched_off(make_job):
 
 
 # ----------------------------------------------------------------------
+# spacing ranges -- one Min/Max pair per line and per gap
+# ----------------------------------------------------------------------
+
+
+def pitches(job, seeds=range(200)):
+    """The centre-to-centre spacing of the first line, one per seed."""
+    out = []
+
+    for seed in seeds:
+        chars = run(job, seed)[0].chars
+        out.append(chars[1].pos[0] - chars[0].pos[0])
+
+    return out
+
+
+def gap_coeffs(job, seeds=range(200)):
+    """The gap coefficient between the first two lines, one per seed."""
+    out = []
+
+    for seed in seeds:
+        first, second = run(job, seed)[:2]
+        out.append((second.chars[0].pos[1] - first.chars[0].pos[1]) / PLACED_DIST_V)
+
+    return out
+
+
+def thirds(values, lo, hi):
+    """How many of ``values`` land in each third of ``[lo, hi]``."""
+    edges = (lo + (hi - lo) / 3.0, lo + 2.0 * (hi - lo) / 3.0)
+
+    return [
+        sum(1 for v in values if v < edges[0]),
+        sum(1 for v in values if edges[0] <= v < edges[1]),
+        sum(1 for v in values if v >= edges[1]),
+    ]
+
+
+def test_a_collapsed_spacing_range_prints_one_pitch_for_every_image(make_job):
+    job = make_job(lines=("12",), spacing=37.0)
+
+    assert pitches(job, range(20)) == pytest.approx([37.0] * 20)
+
+
+def test_the_character_spacing_is_drawn_between_min_and_max(make_job):
+    job = make_job(lines=("12",), spacing=40.0)
+    job.lines[0].set_spacing_field("min", 20.0)
+    job.lines[0].set_spacing_field("max", 60.0)
+
+    drawn = pitches(job)
+
+    assert min(drawn) >= 20.0 - 1e-6
+    assert max(drawn) <= 60.0 + 1e-6
+    assert max(drawn) - min(drawn) > 30.0
+
+
+def test_the_character_spacing_is_drawn_uniformly_not_normally(make_job):
+    """Every pitch in the range as likely as every other -- no bulge at the mean."""
+    job = make_job(lines=("12",), spacing=40.0)
+    job.lines[0].set_spacing_field("min", 20.0)
+    job.lines[0].set_spacing_field("max", 60.0)
+
+    counts = thirds(pitches(job), 20.0, 60.0)
+
+    assert all(45 < c < 90 for c in counts), counts
+
+
+def test_one_spacing_is_drawn_for_the_whole_line(make_job):
+    """A line has a pitch; its characters do not each get one of their own."""
+    job = make_job(lines=("1234",), spacing=40.0)
+    job.lines[0].set_spacing_field("min", 20.0)
+    job.lines[0].set_spacing_field("max", 60.0)
+
+    for seed in range(20):
+        chars = run(job, seed)[0].chars
+        steps = [b.pos[0] - a.pos[0] for a, b in zip(chars, chars[1:])]
+
+        assert steps == pytest.approx([steps[0]] * len(steps))
+
+
+def test_each_line_draws_its_own_spacing(make_job):
+    job = make_job(lines=("12", "34"), spacing=40.0)
+
+    for line in job.lines:
+        line.set_spacing_field("min", 20.0)
+        line.set_spacing_field("max", 60.0)
+
+    differ = 0
+
+    for seed in range(20):
+        first, second = run(job, seed)[:2]
+        a = first.chars[1].pos[0] - first.chars[0].pos[0]
+        b = second.chars[1].pos[0] - second.chars[0].pos[0]
+
+        differ += abs(a - b) > 1.0
+
+    assert differ > 15
+
+
+def test_the_line_gap_is_drawn_between_min_and_max(make_job):
+    job = make_job(lines=("12", "34"), gap=2.0)
+    job.line_gaps[0].set_coeff_field("min", 1.0)
+    job.line_gaps[0].set_coeff_field("max", 3.0)
+
+    drawn = gap_coeffs(job)
+
+    assert min(drawn) >= 1.0 - 1e-6
+    assert max(drawn) <= 3.0 + 1e-6
+    assert all(45 < c < 90 for c in thirds(drawn, 1.0, 3.0))
+
+
+def test_a_collapsed_gap_range_puts_every_image_s_lines_the_same_distance_apart(make_job):
+    job = make_job(lines=("12", "34"), gap=2.5)
+
+    assert gap_coeffs(job, range(20)) == pytest.approx([2.5] * 20)
+
+
+def test_collapsed_ranges_consume_no_randomness(make_job):
+    """A job that leaves Min and Max on the mean must not move at all."""
+    plain = make_job(lines=("12", "34"), spacing=40.0, gap=2.0)
+    same = make_job(lines=("12", "34"), spacing=40.0, gap=2.0)
+
+    for line in same.lines:
+        line.set_spacing_field("min", 40.0)
+        line.set_spacing_field("max", 40.0)
+
+    same.line_gaps[0].set_coeff_field("min", 2.0)
+    same.line_gaps[0].set_coeff_field("max", 2.0)
+
+    assert [c.pos for c in all_chars(run(plain, 9))] == [
+        c.pos for c in all_chars(run(same, 9))
+    ]
+
+
+# ----------------------------------------------------------------------
 # replacements -- Tab 4 section 7
 # ----------------------------------------------------------------------
 
@@ -276,8 +410,15 @@ def test_without_perspective_lines_stack_straight_down(make_job):
     assert second.chars[0].pos[0] - first.chars[0].pos[0] == pytest.approx(0.0, abs=1e-9)
 
 
-def test_perspective_bends_the_block_onto_the_marked_surface(make_job):
-    """The lower line leans the same way the marked surface does."""
+def test_the_base_quad_never_bends_the_block(make_job):
+    """An area to print in is an area to print in.
+
+    The quad used to carry a homography that leaned the block onto the marked
+    surface, so the same job came out at a different angle -- and a different
+    size -- on every background.  The shape of the characters is Tab 1's
+    ``persp.*`` / ``tilt.*``; the angle of a line is Tab 4's ``line.rot``; the
+    quad decides only where the block may land.
+    """
     job = make_job(lines=("12", "34"), quad=LEANING)
 
     for key in ("persp.h", "persp.v"):
@@ -287,8 +428,29 @@ def test_perspective_bends_the_block_onto_the_marked_surface(make_job):
         lines = run(job, seed)
         dx = lines[1].chars[0].pos[0] - lines[0].chars[0].pos[0]
 
-        assert dx > 2.0, f"seed {seed} placed the lines straight above each other"
+        assert dx == pytest.approx(0.0, abs=1e-9), f"seed {seed} leaned the block"
         assert all(inside(LEANING, c.bbox) for c in all_chars(lines))
+
+
+def test_the_base_quad_does_not_resize_the_block(make_job):
+    """Ticking the perspective group changes where nothing lands.
+
+    The removed homography squeezed the block toward the narrow end of the quad
+    and turned it with the quad's edges, so the same seed printed at a
+    different size and a different angle on every background.  The two jobs
+    below now place their characters on exactly the same pixels.
+    """
+    plain = make_job(lines=("12", "34"), quad=SLANTED)
+    ticked = make_job(lines=("12", "34"), quad=SLANTED)
+
+    for key in ("persp.h", "persp.v", "persp.scale"):
+        ticked.params[key].enabled = True
+
+    for seed in range(10):
+        a = [(c.pos, c.bbox) for c in all_chars(run(plain, seed))]
+        b = [(c.pos, c.bbox) for c in all_chars(run(ticked, seed))]
+
+        assert a == b, f"seed {seed} placed the block differently"
 
 
 def test_perspective_keeps_characters_inside_a_slanted_quad(make_job):
@@ -301,6 +463,171 @@ def test_perspective_keeps_characters_inside_a_slanted_quad(make_job):
         for char in all_chars(run(job, seed)):
             assert inside(SLANTED, char.bbox)
 
+
+# ----------------------------------------------------------------------
+# block rotation -- Tab 4's own bar
+# ----------------------------------------------------------------------
+
+
+def set_rotation(job, mean: float, low: float | None = None, high: float | None = None) -> None:
+    p = job.params["line.rot"]
+    p.min = low if low is not None else mean
+    p.max = high if high is not None else mean
+    p.mean = mean
+    p.clamp()
+
+
+def line_angle(line) -> float:
+    """The angle through the character centres of one placed line, in degrees."""
+    first, last = line.chars[0].pos, line.chars[-1].pos
+
+    return math.degrees(math.atan2(last[1] - first[1], last[0] - first[0]))
+
+
+def test_rotation_turns_the_block_by_the_mean(make_job):
+    job = make_job(lines=("123", "456"))
+    set_rotation(job, 20.0)
+
+    for seed in range(5):
+        for line in run(job, seed):
+            assert line_angle(line) == pytest.approx(20.0, abs=0.5)
+
+
+def test_rotation_keeps_the_character_spacing(make_job):
+    """The line turns as one piece: the centres stay the same distance apart."""
+    def pitch(job):
+        chars = run(job, 3)[0].chars
+        return math.dist(chars[0].pos, chars[1].pos)
+
+    straight = make_job(lines=("123",))
+    turned = make_job(lines=("123",))
+    set_rotation(turned, 30.0)
+
+    assert pitch(turned) == pytest.approx(pitch(straight), abs=0.75)
+
+
+def test_rotation_turns_the_glyphs_with_the_line(make_job):
+    """Not just the positions: the characters ride round with their line.
+
+    A glyph turned by 45 degrees stands on a corner, so the upright box around
+    it has both sides equal to the diagonal's projection -- which is neither
+    side of the box it started with.
+    """
+    straight = run(make_job(lines=("1",)), 0)[0].chars[0]
+
+    job = make_job(lines=("1",))
+    set_rotation(job, 45.0)
+    turned = run(job, 0)[0].chars[0]
+
+    diagonal = (straight.bbox[2] + straight.bbox[3]) / math.sqrt(2.0)
+
+    assert turned.bbox[2] == pytest.approx(diagonal, abs=2.0)
+    assert turned.bbox[3] == pytest.approx(diagonal, abs=2.0)
+
+
+def test_rotation_does_not_touch_tilt(make_job):
+    """The bar is the line's own angle and feeds back into nothing."""
+    job = make_job(lines=("123",))
+    set_rotation(job, 25.0, -25.0, 25.0)
+
+    before = {k: job.params[k].to_dict() for k in ("tilt.x", "tilt.y")}
+    run(job, 1)
+
+    assert {k: job.params[k].to_dict() for k in ("tilt.x", "tilt.y")} == before
+
+
+def test_rotation_draws_one_angle_for_the_whole_block(make_job):
+    """One code, one angle: the lines are crooked together or not at all."""
+    job = make_job(lines=("123", "456", "789"))
+    set_rotation(job, 0.0, -25.0, 25.0)
+
+    for seed in range(10):
+        angles = [round(line_angle(l), 3) for l in run(job, seed)]
+
+        assert len(set(angles)) == 1, f"seed {seed} turned the lines apart: {angles}"
+
+    # ...and it is still a draw, not a constant.
+    assert len({round(line_angle(run(job, seed)[0]), 3) for seed in range(10)}) > 8
+
+
+def test_rotation_keeps_the_lines_stacked(make_job):
+    """The block turns as one piece, so line 2 stays square under line 1.
+
+    Its centre swings round with everything else: the step from one line to the
+    next comes out perpendicular to the lines themselves, at the gap the job
+    asked for and not at some sheared version of it.
+    """
+    straight = make_job(lines=("123", "456"))
+    turned = make_job(lines=("123", "456"))
+    set_rotation(turned, 30.0)
+
+    def step(job):
+        first, second = run(job, 6)
+        a, b = first.chars[0].pos, second.chars[0].pos
+        return math.dist(a, b), math.degrees(math.atan2(b[1] - a[1], b[0] - a[0]))
+
+    plain_len, plain_dir = step(straight)
+    turned_len, turned_dir = step(turned)
+
+    assert turned_len == pytest.approx(plain_len, abs=1.0)
+    assert turned_dir - plain_dir == pytest.approx(30.0, abs=1.0)
+
+
+def test_rotation_is_drawn_uniformly_over_the_range(make_job):
+    """Uniform, not normal: the ends of the range are as likely as the middle.
+
+    A normal draw would pile up around the mean and leave the outer fifths
+    nearly empty; over 200 images each fifth of the range takes a share close to
+    the flat one.
+    """
+    job = make_job(lines=("123",))
+    set_rotation(job, 0.0, -25.0, 25.0)
+
+    angles = [line_angle(run(job, seed)[0]) for seed in range(200)]
+    edges = np.linspace(-25.0, 25.0, 6)
+    counts, _ = np.histogram(angles, bins=edges)
+
+    assert min(counts) > 0.6 * len(angles) / 5
+    assert max(counts) < 1.6 * len(angles) / 5
+
+
+def test_a_neutral_rotation_bar_costs_no_randomness(make_job):
+    """A job that does not use the feature renders exactly as it always did.
+
+    Same seed, same page -- which is only true if a bar sitting on zero draws
+    nothing at all from the generator.
+    """
+    plain = make_job(lines=("12", "34"))
+    without = make_job(lines=("12", "34"))
+    del without.params["line.rot"]
+
+    for seed in range(5):
+        a = [c.pos for c in all_chars(run(plain, seed))]
+        b = [c.pos for c in all_chars(run(without, seed))]
+
+        assert a == b
+
+
+def test_a_turned_block_still_lands_inside_the_quad(make_job):
+    job = make_job(lines=("12", "34"))
+    set_rotation(job, 0.0, -35.0, 35.0)
+    quad = job.backgrounds[0].base_quad
+
+    for seed in range(30):
+        for char in all_chars(run(job, seed)):
+            assert inside(quad, char.bbox), f"seed {seed}: {char.char} at {char.bbox}"
+
+
+def test_a_turned_block_shrinks_rather_than_leaving_the_quad(make_job):
+    """A block turned in a tight quad is wider than it was, and has to fit."""
+    quad = Quad([(60, 60), (360, 60), (360, 260), (60, 260)])
+    job = make_job(lines=("12345",), spacing=60.0, quad=quad)
+    set_rotation(job, 45.0)
+
+    line = run(job, 0)[0]
+
+    assert line.scale <= 1.0
+    assert inside(quad, line.bbox)
 
 # ----------------------------------------------------------------------
 # classes

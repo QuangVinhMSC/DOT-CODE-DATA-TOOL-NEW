@@ -33,12 +33,13 @@ from .models import (
     DotSample,
     ExportSpec,
     Job,
+    LineDefectSpec,
     LineGap,
     LineSpec,
     Quad,
     SampleImage,
 )
-from .params import ParamSet
+from .params import ParamSet, default_params
 
 if TYPE_CHECKING:
     from .state import AppState
@@ -49,7 +50,13 @@ if TYPE_CHECKING:
 # 3: a CharFormat may carry "space_coeff" and be a blank of declared width.
 # Same reason for the bump: an older build ignores the key and lays the space
 # out as an ordinary slot, which moves every character after it on that line.
-SCHEMA = 3
+# 4: a job may carry line-level defects.  An older build ignores the key and
+# exports a dataset with the defect classes declared but never produced, so it
+# is told to refuse instead.
+# 5: a job may carry "box_pad".  An older build ignores the key and exports
+# every box at its ink-tight size, which is a quietly different dataset from
+# the one that was configured, so it is told to refuse instead.
+SCHEMA = 5
 CONFIG_FILTER = "DotGen configuration (*.dotcfg);;All files (*)"
 JOBS_FILTER = "DotGen jobs (*.dotjobs);;All files (*)"
 
@@ -160,6 +167,8 @@ def save_config(state: "AppState", path: str) -> None:
         "lines": [l.to_dict() for l in state.lines],
         "line_gaps": [g.to_dict() for g in state.line_gaps],
         "defects": state.defects.to_dict(),
+        "line_defects": state.line_defects.to_dict(),
+        "box_pad": state.box_pad,
         "classes": [c.to_dict() for c in state.classes],
         "export": state.export.to_dict(),
         "jobs": [j.to_dict() for j in state.jobs],
@@ -262,12 +271,19 @@ def load_config(state: "AppState", path: str) -> None:
         state.lines = [LineSpec.from_dict(l) for l in meta.get("lines", [])]
         state.line_gaps = [LineGap.from_dict(g) for g in meta.get("line_gaps", [])]
         state.defects = DefectSpec.from_dict(meta.get("defects", {}))
+        state.line_defects = LineDefectSpec.from_dict(meta.get("line_defects", {}))
+        state.box_pad = float(meta.get("box_pad", 0.0))
         state.classes = [ClassDef.from_dict(c) for c in meta.get("classes", [])]
         state.export = ExportSpec.from_dict(meta["export"]) if "export" in meta else ExportSpec()
         state.jobs = [Job.from_dict(j) for j in meta.get("jobs", [])]
 
         # -- params ----------------------------------------------------
-        state.params = ParamSet.from_dict(meta["params"])
+        # Into a fresh default set rather than straight across: a config
+        # written before a canonical key existed must still come back with that
+        # key present, or the bar it belongs to would have nothing to draw.
+        params = default_params()
+        params.merge(ParamSet.from_dict(meta["params"]), keep_user_edits=False)
+        state.params = params
 
     state.emit_all()
 

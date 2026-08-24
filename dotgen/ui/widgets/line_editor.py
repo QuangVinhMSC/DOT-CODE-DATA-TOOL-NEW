@@ -4,6 +4,12 @@ Character spacing is entered in a box outside the background frame (draft Tab 4
 section 6); the inter-line gap is the ``<----2----->`` connector (section 5) and
 is editable both here and on the preview.
 
+Each of the two is three boxes rather than one -- Min, the value itself, Max --
+laid out with the bounds on either side of the number they bound.  The middle
+box is what the print is spaced at when Min and Max sit on it; move them apart
+and every image draws its own spacing uniformly from the range, one pitch per
+line and one gap per pair of lines.
+
 A space goes on a line through its own button rather than by typing one into
 the entry: a blank in a one-character box looks like an empty box, and there is
 no way to tell the two apart by looking.  How wide it is belongs to Tab 2, with
@@ -40,6 +46,10 @@ class LineEditor(QWidget):
     replacementsChanged = Signal(int, int, list)
     spacingChanged = Signal(int, float)
     gapChanged = Signal(int, float)
+    # (line index / upper line, "min" or "max", value) -- the bounds the value
+    # above is drawn between.
+    spacingBoundChanged = Signal(int, str, float)
+    gapBoundChanged = Signal(int, str, float)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -109,14 +119,33 @@ class LineEditor(QWidget):
 
         hl.addWidget(QLabel("Character spacing"))
 
-        spacing = QDoubleSpinBox()
-        spacing.setRange(0.0, 5000.0)
-        spacing.setDecimals(1)
-        spacing.setSingleStep(1.0)
-        spacing.setValue(line.char_spacing)
-        spacing.setSuffix(" px")
+        tip = (
+            "Centre to centre, in pixels.  Min and Max sitting on the middle\n"
+            "box space every image alike; apart, each image draws one spacing\n"
+            "for this whole line, uniformly across the range."
+        )
+
+        lo = self._spin(line.char_spacing_min, 5000.0, 1, 1.0)
+        lo.setToolTip(tip)
+        lo.valueChanged.connect(
+            lambda v, i=index: self.spacingBoundChanged.emit(i, "min", v)
+        )
+
+        spacing = self._spin(line.char_spacing, 5000.0, 1, 1.0, suffix=" px")
+        spacing.setToolTip(tip)
         spacing.valueChanged.connect(lambda v, i=index: self.spacingChanged.emit(i, v))
+
+        hi = self._spin(line.char_spacing_max, 5000.0, 1, 1.0)
+        hi.setToolTip(tip)
+        hi.valueChanged.connect(
+            lambda v, i=index: self.spacingBoundChanged.emit(i, "max", v)
+        )
+
+        hl.addWidget(self._bound_label("min"))
+        hl.addWidget(lo)
         hl.addWidget(spacing)
+        hl.addWidget(self._bound_label("max"))
+        hl.addWidget(hi)
 
         hl.addStretch(1)
 
@@ -173,14 +202,34 @@ class LineEditor(QWidget):
         arrow_left.setStyleSheet("font-family: Consolas, monospace; color: #2d6edc;")
         lay.addWidget(arrow_left)
 
-        spin = QDoubleSpinBox()
-        spin.setRange(0.0, 100.0)
-        spin.setDecimals(2)
-        spin.setSingleStep(0.5)
-        spin.setValue(gap.coeff)
-        spin.setToolTip("Line spacing = coefficient x the vertical distance unit")
+        tip = (
+            "Line spacing = coefficient x the vertical distance unit.\n"
+            "Min and Max sitting on the middle box put every image's lines the\n"
+            "same distance apart; apart, each image draws one coefficient for\n"
+            "this gap, uniformly across the range."
+        )
+
+        lo = self._spin(gap.coeff_min, 100.0, 2, 0.5)
+        lo.setToolTip(tip)
+        lo.valueChanged.connect(
+            lambda v, u=gap.upper: self.gapBoundChanged.emit(u, "min", v)
+        )
+
+        spin = self._spin(gap.coeff, 100.0, 2, 0.5)
+        spin.setToolTip(tip)
         spin.valueChanged.connect(lambda v, u=gap.upper: self.gapChanged.emit(u, v))
+
+        hi = self._spin(gap.coeff_max, 100.0, 2, 0.5)
+        hi.setToolTip(tip)
+        hi.valueChanged.connect(
+            lambda v, u=gap.upper: self.gapBoundChanged.emit(u, "max", v)
+        )
+
+        lay.addWidget(self._bound_label("min"))
+        lay.addWidget(lo)
         lay.addWidget(spin)
+        lay.addWidget(self._bound_label("max"))
+        lay.addWidget(hi)
 
         arrow_right = QLabel("---->")
         arrow_right.setStyleSheet("font-family: Consolas, monospace; color: #2d6edc;")
@@ -189,6 +238,38 @@ class LineEditor(QWidget):
         lay.addWidget(QLabel(f"line{gap.lower}"))
         lay.addStretch(1)
         return w
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _spin(
+        value: float,
+        maximum: float,
+        decimals: int,
+        step: float,
+        suffix: str = "",
+    ) -> QDoubleSpinBox:
+        """One number box, its value set *before* anything is connected to it.
+
+        The editor is rebuilt from scratch whenever the state changes, so a
+        ``setValue`` on a box that was already wired would fire the signal that
+        caused the rebuild all over again.
+        """
+        spin = QDoubleSpinBox()
+        spin.setRange(0.0, maximum)
+        spin.setDecimals(decimals)
+        spin.setSingleStep(step)
+        spin.setValue(float(value))
+
+        if suffix:
+            spin.setSuffix(suffix)
+
+        return spin
+
+    @staticmethod
+    def _bound_label(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("hint")
+        return label
 
     def _add_char(self, line_index: int, entry: QLineEdit) -> None:
         text = entry.text().strip()

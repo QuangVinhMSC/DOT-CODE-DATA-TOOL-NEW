@@ -1,0 +1,19 @@
+{
+ "iou": 0.6362788747443962,
+ "sampling": {
+  "patch_radius": 6,
+  "roi_r": 5,
+  "threshold": 110
+ },
+ "geometry": {
+  "spacing1": 37.5,
+  "spacing2": 35.0,
+  "gap": 7.78125,
+  "dist.h": 6.0,
+  "dist.v": 10.0125,
+  "tilt.x": -1.3125,
+  "tilt.y": -6.65,
+  "persp.h": -0.010925,
+  "persp.v": -0.022275
+ }
+}

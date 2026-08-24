@@ -243,10 +243,18 @@ GROUPS: dict[str, str] = {
     "tilt": "Perspective / Tilt",
     "curve": "Curve",
     "dist": "Distance",
+    "line": "Line",
     "bg": "Background separation",
 }
 
-GROUP_ORDER = ["Dot", "Perspective / Tilt", "Curve", "Distance", "Background separation"]
+GROUP_ORDER = [
+    "Dot",
+    "Perspective / Tilt",
+    "Curve",
+    "Distance",
+    "Line",
+    "Background separation",
+]
 
 
 def group_of(key: str) -> str:
@@ -284,6 +292,16 @@ def default_params() -> ParamSet:
     p.add(RangeParam("dist.dev_h", "Horizontal deviation", "px", 0, 0, 0, 0, 100, step=0.1))
     p.add(RangeParam("dist.dev_v", "Vertical deviation", "px", 0, 0, 0, 0, 100, step=0.1))
 
+    # --- whole-line rotation (Tab 4, never measured) ------------------
+    # Left enabled with all three handles on zero: a bar the user drags in Tab 4
+    # has to take effect on the next render, and a disabled param collapses to
+    # its mean.  Zero mean, zero min and zero max is the neutral state, and
+    # ``RangeParam.sample`` draws no randomness at all from a bar like that.
+    # Bounded like ``tilt.x`` / ``tilt.y``: 45 degrees each way is every angle a
+    # print is crooked by, and a wider track would only make the few degrees
+    # that matter harder to drag onto.
+    p.add(RangeParam("line.rot", "Line rotation", "deg", 0, 0, 0, -45, 45, step=0.1))
+
     # --- background separation (filled by Phase 9) --------------------
     p.add(RangeParam("bg.brightness", "BG brightness", "", 0, 0, 0, 0, 255, step=1))
     p.add(RangeParam("bg.contrast", "BG contrast", "", 0, 0, 0, 0, 255, step=1))
@@ -320,6 +338,21 @@ def build_compare_sets(params: ParamSet) -> tuple[ParamSet, ParamSet]:
         bottom[key] = b
 
     return top, bottom
+
+
+def format_number(value: float) -> str:
+    """One bare number, as Tab 3's fields show it and expect it typed back.
+
+    Deliberately not :func:`format_value`'s rounding: that one is a readout and
+    may round 11.234 to 11.2, but a field is also an *input*, and a field that
+    shows less than it holds loses the rest the moment the user presses Enter.
+    """
+    if not np.isfinite(value):
+        return "0"
+
+    text = f"{value:.3f}".rstrip("0").rstrip(".")
+
+    return "0" if text in ("", "-", "-0") else text
 
 
 def format_value(p: RangeParam) -> str:

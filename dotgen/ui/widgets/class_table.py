@@ -1,4 +1,4 @@
-"""ClassTable -- the Tab 5 class list.
+"""ClassTable -- the Tab 6 class list.
 
 Columns: Name | Kind | Enabled | Min defects | Delete.
 ``Min defects`` is editable only for fail classes; line classes carry a

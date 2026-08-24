@@ -1,0 +1,25 @@
+{
+  "out_dir": "C:/Users/dangq/OneDrive/Desktop/background/te",
+  "seed": 1234,
+  "classes": [
+    "1",
+    "line1"
+  ],
+  "images": 100,
+  "boxes": 200,
+  "requested": 100,
+  "class_counts": {
+    "1": 100,
+    "line1": 100
+  },
+  "split_counts": {
+    "train": 100,
+    "val": 0,
+    "test": 0
+  },
+  "empty_classes": [],
+  "skipped": [],
+  "skipped_images": 0,
+  "elapsed_s": 2.058,
+  "cancelled": false
+}

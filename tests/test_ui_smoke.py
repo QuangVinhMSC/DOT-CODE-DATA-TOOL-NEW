@@ -10,26 +10,30 @@ import os
 import numpy as np
 import pytest
 from PySide6.QtCore import QEvent, QPointF, Qt
-from PySide6.QtGui import QMouseEvent
+from PySide6.QtGui import QFocusEvent, QMouseEvent
 
 from dotgen.core.models import (
     DEFAULT_SPACE_COEFF,
+    DEFECT_KINDS,
     SPACE_CHAR,
     CharFormat,
     DotLink,
     DotSequence,
     Quad,
 )
+from dotgen.core.params import format_number
 from dotgen.core.registry import get_engines
 from dotgen.ui.main_window import MainWindow
 from dotgen.ui.tabs.tab1_sample import Tab1Sample
 from dotgen.ui.tabs.tab2_matrix import Tab2Matrix
 from dotgen.ui.tabs.tab3_summary import Tab3Summary
 from dotgen.ui.tabs.tab4_job import Tab4Job
-from dotgen.ui.tabs.tab5_class import Tab5Class
-from dotgen.ui.tabs.tab6_export import Tab6Export
+from dotgen.ui.tabs.tab5_defect import Tab5Defect
+from dotgen.ui.tabs.tab6_class import Tab6Class
+from dotgen.ui.tabs.tab7_export import Tab7Export
 from dotgen.ui.widgets.image_canvas import ImageCanvas, ToolMode
 from dotgen.ui.widgets.range_bar import RangeBar
+from dotgen.ui.widgets.value_row import NumberField, ValueRow
 
 
 def click(canvas, scene_pt: QPointF, button=Qt.LeftButton) -> None:
@@ -47,20 +51,51 @@ def click(canvas, scene_pt: QPointF, button=Qt.LeftButton) -> None:
     )
 
 
+
+def field_of(tab, key: str, name: str) -> NumberField:
+    return tab.bars.bars[key].fields[name]
+
+
+def type_value(tab, key: str, name: str, text: str) -> None:
+    """What a user does to a Tab 3 field: click it, type, press Enter."""
+    edit = field_of(tab, key, name)
+    press(edit)
+    edit.setText(text)
+    edit.returnPressed.emit()
+
+
+def press(widget, button=Qt.LeftButton) -> None:
+    """One left click in the middle of a widget."""
+    pos = QPointF(widget.rect().center())
+    widget.mousePressEvent(
+        QMouseEvent(
+            QEvent.MouseButtonPress,
+            pos,
+            widget.mapToGlobal(pos.toPoint()),
+            button,
+            button,
+            Qt.NoModifier,
+        )
+    )
+
+
 # ======================================================================
 # construction
 # ======================================================================
 
 
-def test_main_window_builds_six_tabs(state):
+def test_main_window_builds_seven_tabs(state):
     w = MainWindow(state)
-    assert w.tabs.count() == 6
+    assert w.tabs.count() == 7
     assert w.tabs.tabText(0).startswith("1")
-    assert w.tabs.tabText(5).startswith("6")
+    assert w.tabs.tabText(6).startswith("7")
+    assert w.tabs.tabText(4) == "5 - Defect generation"
+    assert w.tabs.tabText(5) == "6 - Class definition"
 
 
 @pytest.mark.parametrize(
-    "factory", [Tab1Sample, Tab2Matrix, Tab3Summary, Tab4Job, Tab5Class, Tab6Export]
+    "factory",
+    [Tab1Sample, Tab2Matrix, Tab3Summary, Tab4Job, Tab5Defect, Tab6Class, Tab7Export],
 )
 def test_every_tab_constructs_on_an_empty_state(state, factory):
     factory(state)
@@ -796,22 +831,107 @@ def test_tab4_no_longer_carries_a_parameter_panel(qtbot, state):
     assert not hasattr(tab, "bars")
 
 
-def test_tab3_bars_are_editable_and_cover_every_group(qtbot, state):
+def test_tab3_rows_are_typed_fields_covering_every_group(qtbot, state):
+    """Three fields per parameter, and no bar to drag anywhere in the list."""
     tab = Tab3Summary(state)
     qtbot.addWidget(tab)
 
-    assert all(b.track.editable for b in tab.bars.bars.values())
+    assert tab.bars.bars
+    assert all(isinstance(b, ValueRow) for b in tab.bars.bars.values())
+    assert all(set(b.fields) == {"min", "mean", "max"} for b in tab.bars.bars.values())
+    assert all(f.editable for b in tab.bars.bars.values() for f in b.fields.values())
 
     groups = {k.split(".", 1)[0] for k in tab.bars.bars}
     assert {"dot", "dist", "persp", "tilt", "curve"} <= groups
 
 
-def test_a_tab3_drag_stays_out_of_the_state_until_load(qtbot, state):
+def test_a_tab3_field_is_locked_until_it_is_clicked(qtbot, state):
+    """Tab 2's rule: a click opens the field, Enter applies it and locks it."""
+    tab = Tab3Summary(state)
+    qtbot.addWidget(tab)
+
+    edit = field_of(tab, "dist.h", "max")
+
+    assert edit.is_locked() and edit.isReadOnly()
+
+    press(edit)
+
+    assert not edit.is_locked() and not edit.isReadOnly()
+    assert edit.selectedText() == edit.text()  # the first keystroke replaces it
+
+    edit.setText("33")
+    edit.returnPressed.emit()
+
+    assert edit.is_locked() and edit.isReadOnly()
+    assert tab.bars.draft["dist.h"].max == 33.0
+    assert edit.text() == "33"
+
+
+def test_a_tab3_field_applies_nothing_until_enter(qtbot, state):
+    """Typing is not applying -- Escape and clicking away both put it back."""
+    tab = Tab3Summary(state)
+    qtbot.addWidget(tab)
+
+    before = tab.bars.draft["dist.h"].max
+    edit = field_of(tab, "dist.h", "max")
+
+    press(edit)
+    edit.setText("33")
+    qtbot.keyClick(edit, Qt.Key_Escape)
+
+    assert tab.bars.draft["dist.h"].max == before
+    assert edit.is_locked()
+    assert edit.text() != "33"
+
+    press(edit)
+    edit.setText("44")
+    edit.focusOutEvent(QFocusEvent(QEvent.FocusOut))  # what clicking away does
+
+    assert tab.bars.draft["dist.h"].max == before
+    assert edit.is_locked()
+    assert tab.bars.edited_keys() == []
+
+
+def test_a_typo_in_a_tab3_field_is_reported_and_leaves_the_value_alone(qtbot, state):
+    tab = Tab3Summary(state)
+    qtbot.addWidget(tab)
+
+    said = []
+    tab.statusMessage.connect(said.append)
+
+    before = tab.bars.draft["dist.h"].max
+    type_value(tab, "dist.h", "max", "twelve")
+
+    assert tab.bars.draft["dist.h"].max == before
+    assert tab.bars.edited_keys() == []
+    assert said and "not a number" in said[-1]
+
+    # Still open, with the old number selected: the correction is one retype.
+    edit = field_of(tab, "dist.h", "max")
+    assert not edit.is_locked()
+
+
+def test_a_tab3_field_shows_what_the_parameter_accepted(qtbot, state):
+    """min above max is not rejected -- set_field reorders, the fields follow."""
+    tab = Tab3Summary(state)
+    qtbot.addWidget(tab)
+
+    type_value(tab, "dist.h", "max", "20")
+    type_value(tab, "dist.h", "min", "30")
+
+    p = tab.bars.draft["dist.h"]
+
+    assert p.min <= p.mean <= p.max
+    assert field_of(tab, "dist.h", "min").text() == format_number(p.min)
+    assert field_of(tab, "dist.h", "max").text() == format_number(p.max)
+
+
+def test_a_tab3_edit_stays_out_of_the_state_until_load(qtbot, state):
     """The whole point of the Load button: previewing is not committing."""
     tab = Tab3Summary(state)
     qtbot.addWidget(tab)
 
-    tab.bars.bars["dist.h"].track.dragged.emit("max", 33.0)
+    type_value(tab, "dist.h", "max", "33")
 
     assert tab.bars.draft["dist.h"].max == 33.0
     assert state.params["dist.h"].max != 33.0
@@ -831,7 +951,7 @@ def test_a_tab3_edit_is_previewed_before_it_is_loaded(qtbot, state):
 
     before = tab.min_canvas.pixmap_item.pixmap().toImage()
 
-    tab.bars.bars["dist.h"].track.dragged.emit("mean", 40.0)
+    type_value(tab, "dist.h", "mean", "40")
 
     assert tab.min_canvas.pixmap_item.pixmap().toImage() != before
     assert state.params["dist.h"].mean != 40.0
@@ -842,7 +962,7 @@ def test_a_tab3_revert_throws_the_unloaded_edit_away(qtbot, state):
     qtbot.addWidget(tab)
 
     measured = state.params["dist.h"].max
-    tab.bars.bars["dist.h"].track.dragged.emit("max", 33.0)
+    type_value(tab, "dist.h", "max", "33")
     tab._revert_params()
 
     assert tab.bars.edited_keys() == []
@@ -859,7 +979,7 @@ def test_a_loaded_tab3_adjustment_survives_a_tab1_recompute(qtbot, state):
     tab = Tab3Summary(state)
     qtbot.addWidget(tab)
 
-    tab.bars.bars["dist.h"].track.dragged.emit("max", 33.0)
+    type_value(tab, "dist.h", "max", "33")
     tab._load_params()
     state.add_dot_sequence(DotSequence.pair((10, 10), (24, 10), "h"))
 
@@ -877,13 +997,13 @@ def test_an_unloaded_tab3_edit_survives_a_tab1_recompute(qtbot, state):
     tab = Tab3Summary(state)
     qtbot.addWidget(tab)
 
-    tab.bars.bars["dist.h"].track.dragged.emit("max", 33.0)
+    type_value(tab, "dist.h", "max", "33")
     state.add_dot_sequence(DotSequence.pair((10, 10), (24, 10), "h"))
 
     assert tab.bars.draft["dist.h"].max == 33.0
     assert tab.bars.edited_keys() == ["dist.h"]
 
-    # All three numbers are held, not just the handle that was dragged: that is
+    # All three numbers are held, not just the field that was typed into: that is
     # ParamSet.merge's rule for a hand-set bar, and the draft is the same rule
     # one step earlier.  Everything else is the fresh measurement.
     assert tab.bars.draft["dist.h"].mean != state.params["dist.h"].mean
@@ -1192,12 +1312,39 @@ def test_tab3_lists_every_parameter_with_a_compare_box(state):
 
     assert set(tab.bars.bars) == set(state.params)
     assert all(bar.compare_box is not None for bar in tab.bars.bars.values())
-    assert all(bar.track.editable is True for bar in tab.bars.bars.values())
+    assert all(
+        f.editable is True for bar in tab.bars.bars.values() for f in bar.fields.values()
+    )
 
 
 # ======================================================================
 # Tab 4
 # ======================================================================
+
+
+def prepare_tab4_job(state, backgrounds) -> None:
+    """A background with a quad, two lines with a class each -- enough to
+    compose a preview that actually has boxes in it."""
+    from dotgen.core.classes import build_classes
+    from dotgen.core.models import CharFormat, DotLink
+
+    state.add_background("a.png", backgrounds[0])
+    state.set_base_quad(0, Quad([(4, 4), (120, 4), (120, 90), (4, 90)]))
+    state.add_line()
+    state.add_char(0, "1")
+    state.add_line()
+    state.add_char(1, "2")
+
+    for char in state.job_characters():
+        state.save_char_format(
+            CharFormat(
+                char=char,
+                dots=[(0, 0), (1, 0), (0, 1), (1, 1)],
+                links=[DotLink(0, 1, "h", 1.0), DotLink(0, 2, "v", 1.0)],
+            )
+        )
+
+    state.set_classes(build_classes(state.job_characters(), state.lines))
 
 
 def test_tab4_upload_and_resize_the_whole_set(state, backgrounds):
@@ -1254,6 +1401,29 @@ def test_tab4_line_editor_drives_the_state(state, backgrounds):
     assert state.line_gaps[0].coeff == 3.0
 
 
+def test_tab4_spacing_bounds_drive_the_state(state, backgrounds):
+    tab = Tab4Job(state)
+    state.add_background("a.png", backgrounds[0])
+
+    tab.line_editor.addLineRequested.emit()
+    tab.line_editor.addLineRequested.emit()
+    tab.line_editor.spacingChanged.emit(0, 25.0)
+    tab.line_editor.spacingBoundChanged.emit(0, "min", 15.0)
+    tab.line_editor.spacingBoundChanged.emit(0, "max", 35.0)
+    tab.line_editor.gapChanged.emit(1, 3.0)
+    tab.line_editor.gapBoundChanged.emit(1, "min", 2.0)
+    tab.line_editor.gapBoundChanged.emit(1, "max", 4.0)
+
+    line, gap = state.lines[0], state.line_gaps[0]
+
+    assert (line.char_spacing_min, line.char_spacing, line.char_spacing_max) == (
+        15.0,
+        25.0,
+        35.0,
+    )
+    assert (gap.coeff_min, gap.coeff, gap.coeff_max) == (2.0, 3.0, 4.0)
+
+
 def test_tab4_puts_a_space_on_a_line_without_giving_it_a_class(state, backgrounds):
     tab = Tab4Job(state)
     state.add_background("a.png", backgrounds[0])
@@ -1282,6 +1452,88 @@ def test_tab4_defect_spinboxes_push_into_the_state(state):
     assert state.defects.any_enabled()
 
 
+def test_tab4_box_pad_spinbox_pushes_into_the_state(state):
+    tab = Tab4Job(state)
+
+    tab.box_pad.setValue(2.5)
+
+    assert state.box_pad == pytest.approx(2.5)
+    assert state.snapshot_job("j").box_pad == pytest.approx(2.5)
+
+
+def test_tab4_box_pad_takes_a_value_of_either_sign(state):
+    """One value, no bounds: 0 is the printed size, below it shrinks."""
+    tab = Tab4Job(state)
+
+    tab.box_pad.setValue(-40.0)
+
+    assert state.box_pad == pytest.approx(-40.0)
+
+
+def test_tab4_box_pad_follows_a_loaded_job(state, backgrounds):
+    tab = Tab4Job(state)
+    prepare_tab4_job(state, backgrounds)
+    state.set_box_pad(7.0)
+    state.save_job("a")
+    state.set_box_pad(0.0)
+
+    state.load_job(0)
+
+    assert tab.box_pad.value() == pytest.approx(7.0)
+
+
+def test_tab4_draws_no_boxes_until_they_are_asked_for(state, backgrounds):
+    tab = Tab4Job(state)
+    prepare_tab4_job(state, backgrounds)
+    tab.refresh()
+
+    assert tab._box_items == []
+
+    tab.show_boxes.setChecked(True)
+
+    assert len(tab._box_items) == 4, "one per character, one per line"
+    assert tab.canvas.overlays == [tab._quad_item] + tab._box_items
+
+    tab.show_boxes.setChecked(False)
+
+    assert tab._box_items == []
+    assert tab.canvas.overlays == [tab._quad_item], "the base quadrilateral survives"
+
+
+def test_tab4_box_overlays_are_drawn_where_the_labels_landed(state, backgrounds):
+    tab = Tab4Job(state)
+    prepare_tab4_job(state, backgrounds)
+    tab.show_boxes.setChecked(True)
+    tab._sync_box_overlay(
+        [("1", 0.4, 0.45, 0.6, 0.45, 0.6, 0.55, 0.4, 0.55)],
+        np.zeros((480, 640, 3), np.uint8),
+    )
+
+    rect = tab._box_items[0].polygon().boundingRect()
+
+    assert (rect.x(), rect.y(), rect.width(), rect.height()) == (256.0, 216.0, 128.0, 48.0)
+
+
+def test_tab4_draws_a_tilted_label_tilted(state, backgrounds):
+    """The overlay is the polygon the exporter writes, corner for corner.
+
+    A rectangle here would have shown a box a third bigger than the label on a
+    tilted job, which is the one thing this checkbox exists to let the user
+    check.
+    """
+    tab = Tab4Job(state)
+    prepare_tab4_job(state, backgrounds)
+    tab.show_boxes.setChecked(True)
+    tab._sync_box_overlay(
+        [("1", 0.4, 0.5, 0.5, 0.4, 0.6, 0.5, 0.5, 0.6)],
+        np.zeros((480, 640, 3), np.uint8),
+    )
+
+    corners = [(p.x(), p.y()) for p in tab._box_items[0].polygon()]
+
+    assert corners == [(256.0, 240.0), (320.0, 192.0), (384.0, 240.0), (320.0, 288.0)]
+
+
 def test_tab4_preview_shows_characters_on_the_background(state, backgrounds):
     tab = Tab4Job(state)
     state.add_background("a.png", backgrounds[0])
@@ -1306,8 +1558,155 @@ def prepare_job(state, backgrounds) -> None:
     state.add_char(1, "2")
 
 
-def test_tab5_load_class_builds_the_expected_list(state, backgrounds):
-    tab = Tab5Class(state)
+def test_tab5_defect_builds_a_card_for_every_kind(state):
+    tab = Tab5Defect(state)
+
+    assert list(tab.cards) == list(DEFECT_KINDS)
+
+
+def test_tab5_ticking_a_card_reaches_the_state_once(state):
+    tab = Tab5Defect(state)
+    fired = []
+    state.lineDefectsChanged.connect(lambda: fired.append(1))
+
+    tab.cards["squeeze"].enable.setChecked(True)
+
+    assert state.line_defects.get("squeeze").enabled is True
+    assert len(fired) == 1, "one tick is one change"
+
+
+def test_tab5_card_edits_reach_the_state(state):
+    tab = Tab5Defect(state)
+    card = tab.cards["ink_cover"]
+
+    card.enable.setChecked(True)
+    card.p_line.setValue(0.4)
+    card.max_lines.setValue(2)
+    card.amount_lo.setValue(0.85)
+    card.amount_hi.setValue(1.0)
+    card.span_lo.setValue(0.3)
+    card.span_hi.setValue(0.6)
+    card.side.setCurrentIndex(card.side.findData("left"))
+
+    d = state.line_defects.get("ink_cover")
+
+    assert (d.enabled, d.p_line, d.max_lines) == (True, 0.4, 2)
+    assert d.amount == (0.85, 1.0)
+    assert d.span == (0.3, 0.6)
+    assert d.side == "left"
+
+
+def test_tab5_cards_follow_a_state_change_they_did_not_make(state):
+    """A loaded configuration or a restored job has to show up in the cards."""
+    tab = Tab5Defect(state)
+    state.set_line_defect("char_loss", enabled=True, p_line=0.25, max_lines=3)
+
+    card = tab.cards["char_loss"]
+
+    assert card.enable.isChecked() is True
+    assert card.p_line.value() == pytest.approx(0.25)
+    assert card.max_lines.value() == 3
+
+
+def test_tab5_summary_lists_the_extra_classes(state):
+    tab = Tab5Defect(state)
+
+    assert "No defect kinds enabled" in tab.summary.text()
+
+    state.set_line_defect("squeeze", enabled=True, p_line=0.2, max_lines=1)
+    state.set_line_defect("ink_cover", enabled=True, p_line=0.2, max_lines=1)
+
+    text = tab.summary.text()
+
+    assert "2 defect kinds enabled" in text
+    assert "line_ink_cover, line_squeeze" in text, "DEFECT_KINDS order, not tick order"
+
+
+def test_tab5_warns_about_a_kind_that_can_never_fire(state):
+    tab = Tab5Defect(state)
+    state.set_line_defect("top_loss", enabled=True, p_line=0.0)
+
+    assert "can never fire" in tab.banner.text()
+
+    state.set_line_defect("top_loss", p_line=0.3)
+
+    assert tab.banner.text() == ""
+
+
+def test_tab5_warns_when_the_class_list_no_longer_matches(state, backgrounds):
+    from dotgen.core.classes import build_classes
+
+    tab = Tab5Defect(state)
+    prepare_job(state, backgrounds)
+    state.set_classes(build_classes(state.job_characters(), state.lines))
+
+    assert tab.banner.text() == ""
+
+    state.set_line_defect("squeeze", enabled=True, p_line=0.3, max_lines=1)
+
+    assert "Load class" in tab.banner.text()
+
+
+def test_tab5_preview_survives_an_empty_state(state):
+    """A preview must never crash the tab -- there may be no background at all."""
+    tab = Tab5Defect(state)
+    tab.refresh()
+
+    assert tab.canvas.has_image() is False
+
+
+def test_tab5_preview_composes_the_job(state, backgrounds):
+    tab = Tab5Defect(state)
+    prepare_job(state, backgrounds)
+    tab.refresh()
+
+    assert tab.canvas.has_image()
+    assert tab.canvas.overlays == [], "no boxes until they are asked for"
+
+
+def test_tab5_draws_the_composed_boxes_where_they_landed(state, backgrounds):
+    """The one rule of this feature a picture alone cannot show: which boxes
+    survived, and which class the surviving line box carries."""
+    tab = Tab5Defect(state)
+    prepare_job(state, backgrounds)
+    tab.refresh()
+
+    tab._draw_boxes(
+        [
+            ("1", 0.4, 0.45, 0.6, 0.45, 0.6, 0.55, 0.4, 0.55),
+            ("line_squeeze", 0.2, 0.4, 0.8, 0.4, 0.8, 0.6, 0.2, 0.6),
+        ],
+        (640, 480),
+    )
+
+    assert len(tab.canvas.overlays) == 2
+
+    rect = tab.canvas.overlays[0].polygon().boundingRect()
+
+    assert (rect.x(), rect.y(), rect.width(), rect.height()) == (256.0, 216.0, 128.0, 48.0)
+
+    plain = tab.canvas.overlays[0].pen().color()
+    defect = tab.canvas.overlays[1].pen().color()
+
+    assert plain != defect, "a defect class is drawn apart from a character class"
+
+
+def test_tab5_reroll_advances_the_preview_seed(state):
+    tab = Tab5Defect(state)
+    before = tab.seed_spin.value()
+
+    tab._reroll()
+
+    assert tab.seed_spin.value() == before + 1
+
+
+# ======================================================================
+# Tab 6
+# ======================================================================
+
+
+def test_tab6_load_class_builds_the_expected_list(state, backgrounds):
+    tab = Tab6Class(state)
     prepare_job(state, backgrounds)
     tab._load()
 
@@ -1317,8 +1716,8 @@ def test_tab5_load_class_builds_the_expected_list(state, backgrounds):
     assert tab.summary.text() == "3 char classes + 3 fail classes + 2 line classes = 8 total"
 
 
-def test_tab5_load_is_blocked_until_tab4_is_complete(state, backgrounds):
-    tab = Tab5Class(state)
+def test_tab6_load_is_blocked_until_tab4_is_complete(state, backgrounds):
+    tab = Tab6Class(state)
     assert tab.load_button.isEnabled() is False
 
     state.add_background("a.png", backgrounds[0])
@@ -1330,8 +1729,8 @@ def test_tab5_load_is_blocked_until_tab4_is_complete(state, backgrounds):
     assert tab.load_button.isEnabled() is True
 
 
-def test_tab5_classes_can_be_deleted_and_disabled(state, backgrounds):
-    tab = Tab5Class(state)
+def test_tab6_classes_can_be_deleted_and_disabled(state, backgrounds):
+    tab = Tab6Class(state)
     prepare_job(state, backgrounds)
     tab._load()
 
@@ -1343,8 +1742,8 @@ def test_tab5_classes_can_be_deleted_and_disabled(state, backgrounds):
     assert state.classes[0].enabled is False
 
 
-def test_tab5_validation_unlocks_tab6(state, backgrounds):
-    tab = Tab5Class(state)
+def test_tab6_validation_unlocks_tab7(state, backgrounds):
+    tab = Tab6Class(state)
     prepare_job(state, backgrounds)
     tab._load()
 
@@ -1353,16 +1752,16 @@ def test_tab5_validation_unlocks_tab6(state, backgrounds):
 
 
 # ======================================================================
-# Tab 6
+# Tab 7
 # ======================================================================
 
 
-def test_tab6_save_job_snapshots_and_clears(state, backgrounds, monkeypatch):
+def test_tab7_save_job_snapshots_and_clears(state, backgrounds, monkeypatch):
     from PySide6.QtWidgets import QMessageBox
 
     monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
 
-    tab = Tab6Export(state)
+    tab = Tab7Export(state)
     prepare_job(state, backgrounds)
     tab._save_job()
 
@@ -1371,12 +1770,12 @@ def test_tab6_save_job_snapshots_and_clears(state, backgrounds, monkeypatch):
     assert tab.job_list.count() == 1
 
 
-def test_tab6_export_is_gated_on_jobs_and_a_directory(state, backgrounds, monkeypatch, tmp_path):
+def test_tab7_export_is_gated_on_jobs_and_a_directory(state, backgrounds, monkeypatch, tmp_path):
     from PySide6.QtWidgets import QMessageBox
 
     monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
 
-    tab = Tab6Export(state)
+    tab = Tab7Export(state)
     assert tab.export_button.isEnabled() is False
 
     prepare_job(state, backgrounds)
@@ -1406,14 +1805,14 @@ def exportable_job(state, backgrounds) -> None:
     state.set_classes(build_classes(state.job_characters(), state.lines))
 
 
-def test_tab6_writes_a_yolo_folder(state, backgrounds, monkeypatch, tmp_path):
+def test_tab7_writes_a_yolo_folder(state, backgrounds, monkeypatch, tmp_path):
     """The button now runs the Phase 8 exporter on a worker thread."""
     from PySide6.QtWidgets import QMessageBox
 
     monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
     monkeypatch.setattr(QMessageBox, "exec", lambda *a, **k: QMessageBox.Ok)
 
-    tab = Tab6Export(state)
+    tab = Tab7Export(state)
     exportable_job(state, backgrounds)
     tab._save_job()
     state.set_export(out_dir=str(tmp_path), images_per_job=4)
@@ -1441,7 +1840,7 @@ def test_tab6_writes_a_yolo_folder(state, backgrounds, monkeypatch, tmp_path):
             assert all(0.0 <= float(v) <= 1.0 for v in parts[1:])
 
 
-def test_tab6_export_reports_a_failed_preflight_instead_of_writing(
+def test_tab7_export_reports_a_failed_preflight_instead_of_writing(
     state, backgrounds, monkeypatch, tmp_path
 ):
     from PySide6.QtWidgets import QMessageBox
@@ -1452,7 +1851,7 @@ def test_tab6_export_reports_a_failed_preflight_instead_of_writing(
     monkeypatch.setattr(QMessageBox, "critical", lambda p, t, m, *a, **k: shown.append(m))
     monkeypatch.setattr(QMessageBox, "exec", lambda *a, **k: QMessageBox.Ok)
 
-    tab = Tab6Export(state)
+    tab = Tab7Export(state)
     prepare_job(state, backgrounds)  # no classes, no character formats
     tab._save_job()
     state.set_export(out_dir=str(tmp_path / "out"), images_per_job=2)
@@ -1464,12 +1863,12 @@ def test_tab6_export_reports_a_failed_preflight_instead_of_writing(
     assert tab.export_button.isEnabled() is True  # re-enabled for another try
 
 
-def test_tab6_worker_stops_when_cancelled_and_reports_failure(
+def test_tab7_worker_stops_when_cancelled_and_reports_failure(
     state, backgrounds, monkeypatch, tmp_path
 ):
     """The Cancel button's whole path: a flag the running export reads."""
     from PySide6.QtWidgets import QMessageBox
-    from dotgen.ui.tabs.tab6_export import _ExportWorker
+    from dotgen.ui.tabs.tab7_export import _ExportWorker
 
     monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
 
@@ -1496,14 +1895,14 @@ def test_tab6_worker_stops_when_cancelled_and_reports_failure(
     assert messages and messages[0].lstrip().startswith("-")
 
 
-def test_tab6_hint_warns_about_problems_before_the_export_is_started(
+def test_tab7_hint_warns_about_problems_before_the_export_is_started(
     state, backgrounds, monkeypatch, tmp_path
 ):
     from PySide6.QtWidgets import QMessageBox
 
     monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
 
-    tab = Tab6Export(state)
+    tab = Tab7Export(state)
     prepare_job(state, backgrounds)
     tab._save_job()
     state.set_export(out_dir=str(tmp_path))
@@ -1511,19 +1910,83 @@ def test_tab6_hint_warns_about_problems_before_the_export_is_started(
     assert "Export will refuse" in tab.export_hint.text()
 
 
-def test_tab6_dataset_class_panel_lists_the_union(state, backgrounds, monkeypatch):
+def test_tab7_dataset_class_panel_lists_the_union(state, backgrounds, monkeypatch):
     from PySide6.QtWidgets import QMessageBox
     from dotgen.core.classes import build_classes
 
     monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
 
-    tab = Tab6Export(state)
+    tab = Tab7Export(state)
     prepare_job(state, backgrounds)
     state.set_classes(build_classes(state.job_characters(), state.lines))
     tab._save_job()
 
     assert tab.class_list.count() == 8
     assert tab.class_list.item(0).text().endswith("1")
+
+
+def test_tab7_job_tooltip_names_the_enabled_defects(state, backgrounds, monkeypatch):
+    """A saved job's defects, readable without loading it back into Tabs 1-6."""
+    from PySide6.QtWidgets import QMessageBox
+    from dotgen.core.classes import build_classes
+
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+
+    tab = Tab7Export(state)
+    prepare_job(state, backgrounds)
+    state.set_line_defect("squeeze", enabled=True, p_line=0.5)
+    state.set_classes(
+        build_classes(state.job_characters(), state.lines, line_defects=state.line_defects)
+    )
+    tab._save_job()
+
+    tip = tab.job_list.item(0).toolTip()
+
+    assert "Line horizontally squeezed" in tip
+    assert "Top of line lost" not in tip
+
+
+def test_tab7_job_tooltip_says_none_when_nothing_is_armed(state, backgrounds, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+
+    tab = Tab7Export(state)
+    prepare_job(state, backgrounds)
+    tab._save_job()
+
+    assert tab.job_list.item(0).toolTip().endswith("Defects: none")
+
+
+def test_tab7_asks_before_exporting_a_probably_empty_defect_class(
+    state, backgrounds, monkeypatch, tmp_path
+):
+    """The warning is a question, and Cancel means nothing is written."""
+    from PySide6.QtWidgets import QMessageBox
+    from dotgen.core.classes import build_classes
+
+    asked: list[str] = []
+
+    def question(parent, title, text, *a, **k):
+        asked.append(text)
+        return QMessageBox.Cancel if asked[-1].startswith("This export") else QMessageBox.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", question)
+    monkeypatch.setattr(QMessageBox, "exec", lambda *a, **k: QMessageBox.Ok)
+
+    tab = Tab7Export(state)
+    exportable_job(state, backgrounds)
+    state.set_line_defect("top_loss", enabled=True, p_line=0.01)
+    state.set_classes(
+        build_classes(state.job_characters(), state.lines, line_defects=state.line_defects)
+    )
+    tab._save_job()
+    state.set_export(out_dir=str(tmp_path), images_per_job=2)
+
+    tab._export()
+
+    assert any("line_top_loss" in t for t in asked)
+    assert not (tmp_path / "data.yaml").exists()
 
 
 # ======================================================================
@@ -1560,15 +2023,17 @@ def test_gating_opens_tabs_as_the_definition_progresses(state, backgrounds, dott
     assert w.tabs.isTabEnabled(2) is True
 
     assert w.tabs.isTabEnabled(4) is False
+    assert w.tabs.isTabEnabled(5) is False
     prepare_job(state, backgrounds)
     assert w.tabs.isTabEnabled(4) is True
+    assert w.tabs.isTabEnabled(5) is True, "the defect tab and the class tab open together"
 
-    assert w.tabs.isTabEnabled(5) is False
+    assert w.tabs.isTabEnabled(6) is False
 
     from dotgen.core.classes import build_classes
 
     state.set_classes(build_classes(state.job_characters(), state.lines))
-    assert w.tabs.isTabEnabled(5) is True
+    assert w.tabs.isTabEnabled(6) is True
 
 
 def test_gating_reason_is_reported_for_each_locked_tab(state):
@@ -1578,10 +2043,11 @@ def test_gating_reason_is_reported_for_each_locked_tab(state):
     assert "distance" in reasons[1]
     assert "character format" in reasons[2]
     assert "background" in reasons[4]
-    assert "class list" in reasons[5]
+    assert reasons[5] == reasons[4], "one reason gates the defect tab and the class tab"
+    assert "class list" in reasons[6]
 
 
-def test_tab6_updates_the_progress_dialog_on_the_gui_thread(state, tmp_path, make_job):
+def test_tab7_updates_the_progress_dialog_on_the_gui_thread(state, tmp_path, make_job):
     """The export freeze: a closure slot is not a QObject, so Qt called it in
     the worker thread and every dialog.setValue() touched a widget from there.
     """
@@ -1599,7 +2065,7 @@ def test_tab6_updates_the_progress_dialog_on_the_gui_thread(state, tmp_path, mak
     state.jobs = [make_job(("12",)), make_job(("34",))]
     state.set_export(out_dir=str(tmp_path), images_per_job=2)
 
-    tab = Tab6Export(state)
+    tab = Tab7Export(state)
     tab._show_report = lambda report: None
 
     QProgressDialog.setValue = spy
