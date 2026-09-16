@@ -29,9 +29,19 @@ from .models import ROI, DotSample
 class ExtractConfig:
     patch_radius: int = 7
     threshold: int = 150
+    auto_threshold: bool = False
     min_component_area: int = 8
     edge_margin: int = 5
     support_blur: int = 5
+
+
+@dataclass
+class ThresholdCalibration:
+    bg_level: float
+    dot_level: float
+    threshold: float
+    dot_radius: float
+    patch_radius: int
 
 
 NO_COMPONENT = "No dark component inside that outline."
@@ -67,7 +77,19 @@ def extract_dot_ex(
     win_x, win_y, gray, mask_win = window
     r = cfg.patch_radius
 
-    _, binary = cv2.threshold(gray, cfg.threshold, 255, cv2.THRESH_BINARY_INV)
+    threshold = cfg.threshold
+
+    if cfg.auto_threshold:
+        masked_pixels = gray[mask_win > 0]
+
+        if masked_pixels.size == 0:
+            return None, BAD_INPUT
+
+        threshold, _ = cv2.threshold(
+            masked_pixels.reshape(-1, 1), 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
+        )
+
+    _, binary = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY_INV)
     binary = cv2.bitwise_and(binary, mask_win)
 
     core_mask = _pick_component(binary, roi, win_x, win_y, cfg)
@@ -116,6 +138,109 @@ def extract_dot_ex(
     )
 
     return sample, ""
+
+
+@dataclass
+class DotExtent:
+    radius: float
+    ink_level: float
+    area: int
+
+
+def locate_dot(
+    img: np.ndarray, roi: ROI, min_component_area: int = 4
+) -> DotExtent | None:
+    """Find the dot inside a loosely-drawn outline; ``None`` if none is there.
+
+    The outline only has to contain the dot somewhere near its centre -- an
+    Otsu cut restricted to the outline's own pixels separates it from
+    whatever background surrounds it inside the mask, the same trick
+    :attr:`ExtractConfig.auto_threshold` uses for a whole extraction, but here
+    only to *locate* the dot rather than to extract it.  The component
+    nearest the outline's centre is "the dot"; its ink level is read back off
+    just those pixels, not the outline as a whole, so it stays accurate
+    however much background the outline also caught.
+    """
+    gray = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    vals = gray[roi.mask > 0]
+
+    if vals.size == 0:
+        return None
+
+    otsu_t, _ = cv2.threshold(
+        vals.reshape(-1, 1), 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
+    )
+
+    _, binary = cv2.threshold(gray, otsu_t, 255, cv2.THRESH_BINARY_INV)
+    binary = cv2.bitwise_and(binary, roi.mask)
+
+    n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        binary, connectivity=8
+    )
+
+    if n_labels <= 1:
+        return None
+
+    target = np.array(roi.center, dtype=np.float64)
+    best_label, best_dist = None, float("inf")
+
+    for i in range(1, n_labels):
+        if stats[i, cv2.CC_STAT_AREA] < min_component_area:
+            continue
+
+        dist = float(np.linalg.norm(centroids[i] - target))
+
+        if dist < best_dist:
+            best_dist = dist
+            best_label = i
+
+    if best_label is None:
+        return None
+
+    area = int(stats[best_label, cv2.CC_STAT_AREA])
+    ink_level = float(np.median(gray[labels == best_label]))
+
+    return DotExtent(radius=float(np.sqrt(area / np.pi)), ink_level=ink_level, area=area)
+
+
+def calibrate_threshold(
+    img: np.ndarray, bg_roi: ROI, dot_roi: ROI, edge_margin: int = 5
+) -> ThresholdCalibration | None:
+    """Suggest a threshold and a patch size from a background patch and a dot outline.
+
+    The background patch should be a small, clean sample; the dot outline can
+    be drawn generously, exactly like the Circle/Rect/Lasso sample tools --
+    :func:`locate_dot` finds the real dot inside it regardless of how much
+    background the outline also caught, and its measured radius plus the
+    dilation :func:`_support_mask` will apply (``edge_margin``) plus a couple
+    of pixels of clean border is the patch radius that keeps the dot from
+    filling its own canvas edge-to-edge.  ``None`` means a patch was empty, no
+    dot was found inside the outline, or the dot was not actually darker than
+    the background (picked the wrong way round, or both landed on the same
+    surface).
+    """
+    gray = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    bg_vals = gray[bg_roi.mask > 0]
+
+    if bg_vals.size == 0:
+        return None
+
+    bg_level = float(np.median(bg_vals))
+    extent = locate_dot(gray, dot_roi)
+
+    if extent is None:
+        return None
+
+    if bg_level - extent.ink_level < 2:
+        return None
+
+    threshold = (bg_level + extent.ink_level) / 2.0
+    patch_radius = int(np.ceil(extent.radius + edge_margin)) + 2
+
+    return ThresholdCalibration(
+        bg_level, extent.ink_level, threshold, extent.radius, patch_radius
+    )
 
 
 # ----------------------------------------------------------------------

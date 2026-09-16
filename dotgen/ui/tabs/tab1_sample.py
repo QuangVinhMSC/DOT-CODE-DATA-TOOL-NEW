@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
 
 from ...core import curve as curve_engine
 from ...core import perspective, registry, spacing
-from ...core.dot_extract import ExtractConfig
+from ...core.dot_extract import ExtractConfig, calibrate_threshold
 from ...core.imageops import load_image, white_canvas
 from ...core.ink import paste_ink_rect
 from ...core.models import CurveSpec, DotSequence, Quad, ROI
@@ -74,6 +74,13 @@ class Tab1Sample(QWidget):
         # the select tool hands back an item and this is how it becomes state.
         self._overlay_refs: list[tuple[object, str, int]] = []
         self._test_image: np.ndarray | None = None
+
+        # Threshold calibration: the last background/dot patch picked, and the
+        # overlay markers showing them.  Reset whenever the overlays are
+        # rebuilt (image switch, Clear ROIs, ...) since a stale patch from a
+        # different view would silently mis-calibrate the next pick.
+        self._calib_rois: dict[str, ROI | None] = {"bg": None, "dot": None}
+        self._calib_markers: dict[str, object | None] = {"bg": None, "dot": None}
 
         # The panel is redrawn from scratch on every click, so the untouched
         # background has to survive: pasting ink is destructive, and the
@@ -339,6 +346,8 @@ class Tab1Sample(QWidget):
             ToolMode.QUAD: "Drag a rectangle, then drag its corners onto the printed rectangle.",
             ToolMode.CURVE: "Draw along a wavy line. Two curves are used for the waviness fit.",
             ToolMode.RULER: "Left click each dot of a row or column; right click to end the run.",
+            ToolMode.CALIB_BG: "Drag a small rectangle over clean background.",
+            ToolMode.CALIB_DOT: "Drag a rectangle around one dot -- it can be larger than the dot.",
             ToolMode.SELECT: "Click a drawn shape to select it. " + SELECT_HINT,
             ToolMode.NONE: "",
         }
@@ -431,6 +440,9 @@ class Tab1Sample(QWidget):
                 "That run is too close to the diagonal to classify. Pick dots in one row or one column."
             )
 
+        elif kind in ("calib_bg", "calib_dot"):
+            self._on_calibrate_pick(kind, payload)
+
     def _sequence_message(self, seq: DotSequence) -> str:
         """What the ruler just measured, and what it now means for both bars.
 
@@ -497,6 +509,67 @@ class Tab1Sample(QWidget):
 
         self.state.add_row_spacing(value)
         self.statusMessage.emit(f"Row scan: pitch {value:.2f} px, added to dist.h.")
+
+    def _on_calibrate_pick(self, kind: str, roi: ROI) -> None:
+        """One half of a threshold + patch-size calibration.
+
+        The background pick should be a small, clean patch; the dot pick can
+        be drawn generously around the whole dot, like the Circle/Rect/Lasso
+        sample tools -- :func:`calibrate_threshold` finds the real dot inside
+        it via :func:`locate_dot` rather than assuming the outline is already
+        tight.  Both picks have to land on the same image before there is
+        anything to compute, so the first just records itself and waits; the
+        second triggers the calibration and, on success, pushes the result
+        straight into the Advanced panel the same way a manual edit would.
+        """
+        img = self.state.active_array()
+
+        if img is None:
+            return
+
+        which = "bg" if kind == "calib_bg" else "dot"
+        label = "BG" if which == "bg" else "DOT"
+
+        old_marker = self._calib_markers[which]
+
+        if old_marker is not None:
+            self.canvas.remove_overlay(old_marker)
+
+        x, y, w, h = roi.bbox
+        marker = RoiMarkerItem("rect", [(x, y), (x + w, y + h)], label)
+        self.canvas.add_overlay(marker)
+        self._calib_markers[which] = marker
+        self._calib_rois[which] = roi
+
+        bg_roi = self._calib_rois["bg"]
+        dot_roi = self._calib_rois["dot"]
+
+        if bg_roi is None or dot_roi is None:
+            still_needed = "an outline around a dot" if bg_roi is not None else "a background patch"
+            self.statusMessage.emit(f"{label} picked. Now pick {still_needed}.")
+            return
+
+        cfg = self.extract_panel.cfg
+        result = calibrate_threshold(img, bg_roi, dot_roi, edge_margin=cfg.edge_margin)
+
+        if result is None:
+            self.statusMessage.emit(
+                "Could not calibrate: no dot clearly darker than the background "
+                "was found in that outline. Pick again."
+            )
+            return
+
+        cfg.threshold = int(round(result.threshold))
+        cfg.auto_threshold = False
+        cfg.patch_radius = result.patch_radius
+        self.extract_panel.setConfig(cfg)
+        self._on_extract_config(cfg)
+
+        self.statusMessage.emit(
+            f"Calibrated: background {result.bg_level:.0f}, dot {result.dot_level:.0f} "
+            f"(radius {result.dot_radius:.1f}px), threshold {cfg.threshold}, "
+            f"patch radius {cfg.patch_radius}."
+        )
 
     # ==================================================================
     # select tool
@@ -788,6 +861,8 @@ class Tab1Sample(QWidget):
     def _rebuild_overlays(self) -> None:
         self.canvas.clear_overlays()
         self._overlay_refs = []
+        self._calib_rois = {"bg": None, "dot": None}
+        self._calib_markers = {"bg": None, "dot": None}
         i = self.state.active_image
 
         if i < 0:

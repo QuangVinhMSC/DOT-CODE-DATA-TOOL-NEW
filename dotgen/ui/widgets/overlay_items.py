@@ -220,7 +220,7 @@ class _LabelItem(QGraphicsSimpleTextItem):
 
 
 class RoiMarkerItem(SelectableItem, QGraphicsObject):
-    def __init__(self, kind: str, points: Sequence[tuple[float, float]], number: int):
+    def __init__(self, kind: str, points: Sequence[tuple[float, float]], number: int | str):
         super().__init__()
         self.kind = kind
         self.points = [QPointF(x, y) for x, y in points]

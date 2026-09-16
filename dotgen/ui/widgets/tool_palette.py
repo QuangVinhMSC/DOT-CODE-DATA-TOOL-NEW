@@ -21,6 +21,13 @@ TOOLS: list[tuple[ToolMode, str, str]] = [
     (ToolMode.QUAD, "▱", "Quadrilateral: perspective rule + tilt (Tab 1.5)"),
     (ToolMode.CURVE, "∿", "Curve: line waviness (Tab 1.6)"),
     (ToolMode.RULER, "↔", "Ruler: click a run of dots, right click to end it (Tab 1.8)"),
+    (ToolMode.CALIB_BG, "▦", "Pick a small background patch (threshold calibration)"),
+    (
+        ToolMode.CALIB_DOT,
+        "●",
+        "Pick a dot: draw loosely around it, the dot's real size is measured "
+        "(threshold + patch size calibration)",
+    ),
 ]
 
 SEPARATE_TOOL = "separate"

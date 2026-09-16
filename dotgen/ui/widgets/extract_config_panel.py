@@ -9,7 +9,14 @@ boxes rather than range bars, attached through ``RangeBarList.add_section``.
 from __future__ import annotations
 
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import QFormLayout, QLabel, QSpinBox, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QFormLayout,
+    QLabel,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
 
 from ...core.dot_extract import ExtractConfig
 from .. import theme
@@ -53,6 +60,18 @@ class ExtractConfigPanel(QWidget):
             self.boxes[name] = box
             form.addRow(label, box)
 
+            if name == "threshold":
+                self.auto_threshold_box = QCheckBox("Auto (Otsu)")
+                self.auto_threshold_box.setToolTip(
+                    "Pick the threshold per-dot from the ROI's own brightness "
+                    "histogram instead of the fixed value above -- use this "
+                    "when images vary in exposure or contrast."
+                )
+                self.auto_threshold_box.setChecked(bool(self.cfg.auto_threshold))
+                self.auto_threshold_box.toggled.connect(self._on_auto_threshold)
+                form.addRow("", self.auto_threshold_box)
+                box.setEnabled(not self.cfg.auto_threshold)
+
         outer.addLayout(form)
 
         hint = QLabel("Changes apply to the next sample you take.")
@@ -71,6 +90,11 @@ class ExtractConfigPanel(QWidget):
         setattr(self.cfg, name, int(value))
         self.configChanged.emit(self.cfg)
 
+    def _on_auto_threshold(self, checked: bool) -> None:
+        self.cfg.auto_threshold = checked
+        self.boxes["threshold"].setEnabled(not checked)
+        self.configChanged.emit(self.cfg)
+
     def setConfig(self, cfg: ExtractConfig) -> None:
         self.cfg = cfg
 
@@ -78,3 +102,8 @@ class ExtractConfigPanel(QWidget):
             box.blockSignals(True)
             box.setValue(int(getattr(cfg, name)))
             box.blockSignals(False)
+
+        self.auto_threshold_box.blockSignals(True)
+        self.auto_threshold_box.setChecked(bool(cfg.auto_threshold))
+        self.auto_threshold_box.blockSignals(False)
+        self.boxes["threshold"].setEnabled(not cfg.auto_threshold)

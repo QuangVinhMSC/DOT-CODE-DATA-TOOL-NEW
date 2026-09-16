@@ -36,9 +36,16 @@ class ToolMode(Enum):
     QUAD = "quad"
     CURVE = "curve"
     RULER = "ruler"
+    CALIB_BG = "calib_bg"
+    CALIB_DOT = "calib_dot"
 
 
 SAMPLE_TOOLS = (ToolMode.CIRCLE, ToolMode.RECT, ToolMode.LASSO)
+
+# Small-rectangle picks that calibrate the extraction threshold from two
+# hand-picked patches rather than sampling a training dot.
+CALIB_TOOLS = (ToolMode.CALIB_BG, ToolMode.CALIB_DOT)
+CALIB_DEFAULT_RADIUS = 10
 
 # Hit-testing slack, in screen pixels: at 500x zoom a scene-unit tolerance
 # would be invisible, and at 0.1x it would swallow the whole image.
@@ -523,11 +530,11 @@ class ImageCanvas(QGraphicsView):
 
         p = self.mapToScene(event.pos())
 
-        if self._tool in (ToolMode.CIRCLE, ToolMode.RECT, ToolMode.QUAD):
-            self.rubber.set_points(
-                "circle" if self._tool is ToolMode.CIRCLE else self._tool.value,
-                [self._start, p],
-            )
+        if self._tool is ToolMode.CIRCLE:
+            self.rubber.set_points("circle", [self._start, p])
+        elif self._tool in (ToolMode.RECT, ToolMode.QUAD) + CALIB_TOOLS:
+            rubber_kind = "quad" if self._tool is ToolMode.QUAD else "rect"
+            self.rubber.set_points(rubber_kind, [self._start, p])
         else:
             self._points.append(p)
             self.rubber.set_points("lasso", self._points)
@@ -575,6 +582,9 @@ class ImageCanvas(QGraphicsView):
         elif self._tool is ToolMode.CURVE:
             self._finish_curve(self._points)
 
+        elif self._tool in CALIB_TOOLS:
+            self._finish_calib(self._tool, self._start, p)
+
         self._start = None
         self._points = []
         event.accept()
@@ -595,6 +605,24 @@ class ImageCanvas(QGraphicsView):
 
     def _finish_lasso(self, points: list[QPointF]) -> None:
         self._emit_roi(build_roi("lasso", points, self._image_size))
+
+    def _finish_calib(self, tool: ToolMode, a: QPointF, b: QPointF) -> None:
+        # A plain click (no real drag) means "sample a small patch here",
+        # exactly like the circle tool's single-click convenience -- these
+        # patches are meant to be a handful of pixels, so most users will
+        # click rather than drag one out.
+        if math.dist((a.x(), a.y()), (b.x(), b.y())) < 3:
+            r = CALIB_DEFAULT_RADIUS
+            cx, cy = a.x(), a.y()
+            a, b = QPointF(cx - r, cy - r), QPointF(cx + r, cy + r)
+
+        roi = build_roi("rect", [a, b], self._image_size)
+
+        if roi is None:
+            return
+
+        kind = "calib_bg" if tool is ToolMode.CALIB_BG else "calib_dot"
+        self.roiFinished.emit(kind, roi)
 
     def _finish_quad(self, a: QPointF, b: QPointF) -> None:
         x1, x2 = sorted((a.x(), b.x()))
