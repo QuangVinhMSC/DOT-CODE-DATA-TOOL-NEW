@@ -418,45 +418,97 @@ def _render_line(
 ) -> list[_Raw]:
     """Every drawable character of one line, in the block-local frame.
 
-    Lifted out of :func:`_render_block` unchanged so the line defects have a
-    list of one line's characters to work on; the cursor arithmetic, the space
-    advances and the empty-slot rule are exactly as they were.
+    Lifted out of :func:`_render_block` so the line defects have a list of one
+    line's characters to work on.
+
+    The spacing is the blank between two characters' ink, edge to edge along
+    the line -- not the distance between their centres.  A narrow ``1`` and a
+    wide ``8`` then sit exactly as far apart as two ``8`` s do, which is what the
+    user measures off a printed sample.  The slots are all rendered first,
+    because an empty one needs the line's typical width to keep its place.
 
     The spacing is drawn once, here, and every slot on the line advances by it:
     a printed line has one pitch, and characters that each took their own would
     not read as one code.  The draw is uniform between the line's Min and Max
     (:meth:`LineSpec.sample_spacing`), and costs nothing at all while those two
     sit on the mean.
+
+    A space adds its own width of blank on top of the ordinary gap.  A slot
+    that draws nothing -- no saved format, or every dot missing -- is held open
+    as a character of the line's median width, so removing a format does not
+    slide the rest of its line.
     """
-    out: list[_Raw] = []
-    t = 0.0
     spacing = line.sample_spacing(rng)
+    slots: list[tuple[str, tuple | None]] = []
 
     for spec in line.chars:
         char = _pick_char(spec, rng)
-        drawn = _render_one(job, char, rng)
+        slots.append((char, _render_one(job, char, rng)))
 
-        if drawn is not None:
-            ink, defects, quad = drawn
+    extents = [
+        None if drawn is None else _extent_along(drawn[0], drawn[2], along)
+        for _, drawn in slots
+    ]
+    widths = [hi - lo for lo, hi in filter(None, extents)]
+    blank = float(np.median(widths)) if widths else 0.0
 
-            out.append(
-                _Raw(
-                    char=char,
-                    ink=ink,
-                    offset=(
-                        t * along[0] + v * across[0],
-                        t * along[1] + v * across[1],
-                    ),
-                    defects=defects,
-                    line=i,
-                    quad=quad,
-                    cursor=t,
-                )
+    out: list[_Raw] = []
+    edge = 0.0  # where the next character's leading edge goes
+
+    for (char, drawn), extent in zip(slots, extents):
+        if char in spaces:
+            edge += spaces[char]
+            continue
+
+        if drawn is None:
+            edge += blank + spacing
+            continue
+
+        ink, defects, quad = drawn
+        lo, hi = extent
+        t = edge - lo
+
+        out.append(
+            _Raw(
+                char=char,
+                ink=ink,
+                offset=(
+                    t * along[0] + v * across[0],
+                    t * along[1] + v * across[1],
+                ),
+                defects=defects,
+                line=i,
+                quad=quad,
+                cursor=t,
             )
+        )
 
-        t += spaces.get(char, spacing)
+        edge = t + hi + spacing
 
     return out
+
+
+def _extent_along(
+    ink: np.ndarray, quad: np.ndarray, along: tuple[float, float]
+) -> tuple[float, float]:
+    """Where a character's leading and trailing edges sit, along its line.
+
+    Both are measured from the centre of the ink crop -- the point ``offset``
+    places -- and read off the character's label rather than its upright box.
+    The label hugs the dots with the character's own axes, so its left side
+    ``TL-BL`` and right side ``TR-BR`` are the edges a reader sees; taking them
+    at mid-height means two glyphs the page tilt has sheared the same way keep
+    the same blank between them from top to bottom, where the upright box of a
+    sheared glyph would count the slant as width and push them apart.
+    """
+    h, w = ink.shape[:2]
+    q = np.asarray(quad, dtype=np.float64).reshape(4, 2) - (w / 2.0, h / 2.0)
+    a = np.asarray(along, dtype=np.float64)
+
+    lo = float((q[0] + q[3]) @ a) / 2.0
+    hi = float((q[1] + q[2]) @ a) / 2.0
+
+    return min(lo, hi), max(lo, hi)
 
 
 def _render_block(
@@ -466,18 +518,16 @@ def _render_block(
 ) -> list[_Raw]:
     """Every character of every line, positioned in the block-local frame.
 
-    Characters advance by the line's character spacing centre to centre along
+    Characters are spaced by the line's character spacing edge to edge along
     the line direction; line ``i+1`` sits ``gap.coeff * dist.v`` across from
     line ``i``.  Both are drawn once per image, uniformly between their own Min
     and Max -- one pitch for a line, one gap for a pair of lines.
     An empty slot still advances the cursor, so removing a character's format
     does not slide the rest of its line.
 
-    A space is the one slot that advances by something else: its own
-    ``space_coeff * dist.h``, which is what lets a line be broken into words
-    without the whole line having to change its character spacing.  A line of
-    ordinary characters lands exactly where ``j * char_spacing`` used to put
-    it, so nothing that predates spaces moves by a pixel.
+    A space adds its own ``space_coeff * dist.h`` of blank on top of the gap,
+    which is what lets a line be broken into words without the whole line
+    having to change its character spacing.
 
     When a ``plan`` is given, each line's characters pass through
     :func:`line_defects.apply_geometry` while they are still in the block-local

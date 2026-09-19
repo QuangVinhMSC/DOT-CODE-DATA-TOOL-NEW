@@ -39,6 +39,22 @@ def inside(quad: Quad, box) -> bool:
     )
 
 
+def edges(char, along=(1.0, 0.0)) -> tuple[float, float]:
+    """A placed character's leading and trailing edge, projected on ``along``.
+
+    Read off its label at mid-height -- the same sides the layout spaces by.
+    """
+    q = np.asarray(char.quad, dtype=np.float64)
+    a = np.asarray(along, dtype=np.float64)
+
+    return float((q[0] + q[3]) @ a) / 2.0, float((q[1] + q[2]) @ a) / 2.0
+
+
+def gaps(chars, along=(1.0, 0.0)) -> list[float]:
+    """The blank between each pair of neighbours, edge to edge."""
+    return [edges(b, along)[0] - edges(a, along)[1] for a, b in zip(chars, chars[1:])]
+
+
 def dot_count(ink: np.ndarray) -> int:
     n, _ = cv2.connectedComponents((ink > INK_FLOOR).astype(np.uint8))
     return n - 1  # label 0 is the background
@@ -104,13 +120,26 @@ def test_a_missing_base_quad_falls_back_to_the_whole_image(make_job):
 # ----------------------------------------------------------------------
 
 
-def test_char_spacing_is_measured_centre_to_centre(make_job):
+def test_char_spacing_is_measured_edge_to_edge(make_job):
     job = make_job(lines=("123",), spacing=37.0)
     chars = run(job, 1)[0].chars
 
+    assert gaps(chars) == pytest.approx([37.0, 37.0])
+
     for a, b in zip(chars, chars[1:]):
-        assert b.pos[0] - a.pos[0] == pytest.approx(37.0)
         assert b.pos[1] - a.pos[1] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_a_narrow_character_keeps_the_same_blank_as_a_wide_one(make_job):
+    """Edge to edge means the gap does not depend on how wide the glyphs are."""
+    job = make_job(lines=("121",), spacing=20.0)
+    job.char_formats["1"].dots = [(2, r) for r in range(7)]  # one column wide
+
+    chars = run(job, 2)[0].chars
+    one, two, _ = chars
+
+    assert gaps(chars) == pytest.approx([20.0, 20.0])
+    assert (edges(one)[1] - edges(one)[0]) < (edges(two)[1] - edges(two)[0])
 
 
 def test_line_gap_is_the_coefficient_times_the_vertical_distance(make_job):
@@ -144,8 +173,9 @@ def test_line_direction_follows_tilt_x(make_job):
     a, b = run(job, 4)[0].chars
     dx = b.pos[0] - a.pos[0]
     dy = b.pos[1] - a.pos[1]
+    along = (math.cos(math.radians(12.0)), math.sin(math.radians(12.0)))
 
-    assert math.hypot(dx, dy) == pytest.approx(50.0)
+    assert gaps([a, b], along) == pytest.approx([50.0])
     assert math.degrees(math.atan2(dy, dx)) == pytest.approx(12.0)
 
 
@@ -164,12 +194,12 @@ def test_lines_are_horizontal_when_tilt_is_switched_off(make_job):
 
 
 def pitches(job, seeds=range(200)):
-    """The centre-to-centre spacing of the first line, one per seed."""
+    """The edge-to-edge spacing of the first line, one per seed."""
     out = []
 
     for seed in seeds:
         chars = run(job, seed)[0].chars
-        out.append(chars[1].pos[0] - chars[0].pos[0])
+        out.append(gaps(chars[:2])[0])
 
     return out
 
@@ -232,8 +262,7 @@ def test_one_spacing_is_drawn_for_the_whole_line(make_job):
     job.lines[0].set_spacing_field("max", 60.0)
 
     for seed in range(20):
-        chars = run(job, seed)[0].chars
-        steps = [b.pos[0] - a.pos[0] for a, b in zip(chars, chars[1:])]
+        steps = gaps(run(job, seed)[0].chars)
 
         assert steps == pytest.approx([steps[0]] * len(steps))
 
@@ -249,8 +278,8 @@ def test_each_line_draws_its_own_spacing(make_job):
 
     for seed in range(20):
         first, second = run(job, seed)[:2]
-        a = first.chars[1].pos[0] - first.chars[0].pos[0]
-        b = second.chars[1].pos[0] - second.chars[0].pos[0]
+        a = gaps(first.chars)[0]
+        b = gaps(second.chars)[0]
 
         differ += abs(a - b) > 1.0
 
@@ -342,13 +371,15 @@ def test_a_character_whose_dots_all_vanish_is_not_placed(make_job):
 
 
 def test_characters_with_no_saved_format_are_skipped_but_still_advance(make_job):
+    """The empty slot is held open as a character of the line's own width."""
     job = make_job(lines=("121",), spacing=30.0)
     del job.char_formats["2"]
 
     chars = run(job, 6)[0].chars
+    lo, hi = edges(chars[0])
 
     assert [c.char for c in chars] == ["1", "1"]
-    assert chars[1].pos[0] - chars[0].pos[0] == pytest.approx(60.0)
+    assert gaps(chars) == pytest.approx([30.0 + (hi - lo) + 30.0])
 
 
 # ----------------------------------------------------------------------
@@ -682,7 +713,7 @@ def test_a_space_advances_the_line_by_its_own_width(make_job):
 
     one, two = run(job, 1)[0].chars
 
-    assert two.pos[0] - one.pos[0] == pytest.approx(37.0 + 3.0 * PLACED_DIST_H)
+    assert gaps([one, two]) == pytest.approx([37.0 + 3.0 * PLACED_DIST_H])
     assert two.pos[1] - one.pos[1] == pytest.approx(0.0, abs=1e-9)
 
 
@@ -692,7 +723,7 @@ def test_the_space_is_a_ratio_of_the_horizontal_unit(make_job):
         job = with_space(make_job(lines=("1 2",), spacing=37.0), coeff=coeff)
         one, two = run(job, 1)[0].chars
 
-        return two.pos[0] - one.pos[0] - 37.0
+        return gaps([one, two])[0] - 37.0
 
     assert width(4.0) == pytest.approx(2.0 * width(2.0))
     assert width(2.0) == pytest.approx(2.0 * PLACED_DIST_H)
@@ -714,14 +745,10 @@ def test_a_space_gets_no_class_of_its_own(make_job):
     assert all(c.cls_name != SPACE_CHAR for c in all_chars(run(job, 1)))
 
 
-def test_a_line_without_spaces_lays_out_exactly_as_before(make_job):
-    """The cursor must reduce to ``j * char_spacing`` when no slot is a space."""
+def test_a_line_without_spaces_has_one_blank_between_every_pair(make_job):
     job = make_job(lines=("123",), spacing=37.0)
-    chars = run(job, 7)[0].chars
 
-    origin = chars[0].pos[0]
-
-    assert [c.pos[0] - origin for c in chars] == pytest.approx([0.0, 37.0, 74.0])
+    assert gaps(run(job, 7)[0].chars) == pytest.approx([37.0, 37.0])
 
 
 def test_a_saved_but_unused_space_costs_no_randomness(make_job):

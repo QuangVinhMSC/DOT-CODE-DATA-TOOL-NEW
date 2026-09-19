@@ -56,6 +56,30 @@ def arm(job, kind: str, **over):
     return d
 
 
+def edges(char) -> tuple[float, float]:
+    """A placed character's leading and trailing edge along x, off its label."""
+    q = np.asarray(char.quad, dtype=np.float64)
+
+    return float(q[0, 0] + q[3, 0]) / 2.0, float(q[1, 0] + q[2, 0]) / 2.0
+
+
+def gaps(chars) -> list[float]:
+    """The blank between each pair of neighbours, edge to edge."""
+    return [edges(b)[0] - edges(a)[1] for a, b in zip(chars, chars[1:])]
+
+
+def raw_pitches(got) -> list[float]:
+    """Each undamaged centre-to-centre step of a line of raws.
+
+    What the layout would have spaced two neighbours at -- trailing half of
+    one, the line's spacing, leading half of the next -- measured on the same
+    glyphs, so a defect's re-spacing can be checked as a factor of it.
+    """
+    ext = [layout._extent_along(r.ink, r.quad, (1.0, 0.0)) for r in got]
+
+    return [a[1] + SPACING - b[0] for a, b in zip(ext, ext[1:])]
+
+
 def line_of(job, seed: int = 0, index: int = 0):
     return run(job, seed)[index]
 
@@ -113,12 +137,18 @@ def test_char_loss_leaves_the_survivors_on_their_original_pitch(make_job):
 
     for seed in range(10):
         chars = line_of(job, seed).chars
-        origin = chars[0].pos[0]
         kept = [TEXT.index(c.char) for c in chars]
+        hole = [j for j, (a, b) in enumerate(zip(kept, kept[1:])) if b - a > 1]
+        steps = gaps(chars)
 
-        assert [c.pos[0] - origin for c in chars] == pytest.approx(
-            [(i - kept[0]) * SPACING for i in kept]
-        )
+        assert len(hole) <= 1, f"seed {seed}: {kept}"
+
+        for j, g in enumerate(steps):
+            if j in hole:
+                # Four characters and their four gaps are still in there.
+                assert g > 4 * SPACING, f"seed {seed}: {steps}"
+            else:
+                assert g == pytest.approx(SPACING), f"seed {seed}: {steps}"
 
 
 def test_a_removed_character_takes_its_box_with_it(make_job):
@@ -173,8 +203,10 @@ def test_squeeze_narrows_the_pitch_by_the_same_factor_as_the_ink(make_job):
 
     chars = line_of(job, 3).chars
 
+    # The ink is resampled to whole pixels, so the edges move by up to one.
+    assert gaps(chars) == pytest.approx([SPACING * 0.5] * (len(chars) - 1), abs=1.0)
+
     for a, b in zip(chars, chars[1:]):
-        assert b.pos[0] - a.pos[0] == pytest.approx(SPACING * 0.5)
         assert b.pos[1] - a.pos[1] == pytest.approx(0.0, abs=1e-9)
 
 
@@ -242,8 +274,9 @@ def test_collapse_all_keeps_the_residual_pitch_it_was_given(make_job):
 
     assert len(got) == len(TEXT)
 
-    for a, b in zip(got, got[1:]):
-        assert b.cursor - a.cursor == pytest.approx(SPACING * 0.1)
+    steps = [b.cursor - a.cursor for a, b in zip(got, got[1:])]
+
+    assert steps == pytest.approx([p * 0.1 for p in raw_pitches(got)])
 
 
 # ----------------------------------------------------------------------
@@ -280,9 +313,10 @@ def test_collapse_side_crowds_its_end_and_leaves_the_rest_on_pitch(make_job):
 
     got = raws(job, 1)
     steps = [b.cursor - a.cursor for a, b in zip(got, got[1:])]
+    pitch = raw_pitches(got)
 
-    assert steps[0] == pytest.approx(SPACING * 0.1)          # the crowded pair
-    assert steps[2:] == pytest.approx([SPACING] * len(steps[2:]))  # still readable
+    assert steps[0] == pytest.approx(pitch[0] * 0.1)  # the crowded pair
+    assert steps[2:] == pytest.approx(pitch[2:])      # still readable
 
 
 def test_collapse_side_narrows_a_line_less_than_collapse_all_does(make_job):

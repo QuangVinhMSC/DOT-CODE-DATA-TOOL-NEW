@@ -136,9 +136,10 @@ def test_only_fail_class_left_needs_no_threshold():
     assert validate_classes(classes) == []
 
 
-def test_a_list_without_line_classes_is_rejected():
+def test_a_list_without_line_classes_is_accepted():
+    """Every line class may be deleted: the lines are drawn, just not labelled."""
     classes = [c for c in build_classes(["1"], lines(1)) if c.kind != "line"]
-    assert any("line class" in e for e in validate_classes(classes))
+    assert validate_classes(classes) == []
 
 
 def test_empty_list_is_rejected():

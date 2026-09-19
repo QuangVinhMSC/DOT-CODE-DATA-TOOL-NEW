@@ -108,6 +108,10 @@ def validate_classes(
     hand-edited in the config file, and a character drawn with no class is a
     silently unlabelled object in the training set.
 
+    Line classes are optional: a line whose class was deleted or disabled is
+    still drawn, it just carries no box (:func:`resolve_line_class`), so a job
+    that only labels characters is a valid job.
+
     ``line_defects`` is checked the same way and for the same reason: a defect
     the user armed but never loaded a class for would damage lines that nothing
     in the label file accounts for.
@@ -144,9 +148,6 @@ def validate_classes(
                 f"Character '{char}' has no enabled class -- replacement characters "
                 f"need classes too. Press 'Load class' in Tab 6."
             )
-
-    if not any(c.kind == "line" for c in enabled):
-        errors.append("At least one line class is required.")
 
     have = {c.name for c in enabled if c.kind == "line"}
 

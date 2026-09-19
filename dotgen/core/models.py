@@ -321,9 +321,9 @@ class CharFormat:
     def space_width(self, dist_h: float) -> float:
         """How far this space moves the line cursor, in pixels.
 
-        Zero for a format that is not a space, because a drawn character does
-        not advance the cursor by its own width -- the line's character spacing
-        does that, and mixing the two would silently re-space every job.
+        Zero for a format that is not a space: a drawn character's width is
+        measured off its own ink, and this is the blank a space adds on top of
+        the line's ordinary character spacing.
         """
         if not self.is_space:
             return 0.0
@@ -985,7 +985,7 @@ class LineSpec:
         return float(self.char_spacing_max) - float(self.char_spacing_min) <= _RANGE_EPS
 
     def sample_spacing(self, rng: np.random.Generator) -> float:
-        """This image's centre-to-centre character spacing, in pixels."""
+        """This image's edge-to-edge character spacing, in pixels."""
         return _draw(
             float(self.char_spacing_min),
             float(self.char_spacing),

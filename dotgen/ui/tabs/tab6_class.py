@@ -73,6 +73,7 @@ class Tab6Class(QWidget):
 
         note = QLabel(
             "Line classes are listed one per line - no opposite class is created. "
+            "A line class can be deleted; that line is still drawn, just without a box. "
             "Characters selected as replacements in Tab 4 also get classes."
         )
         note.setObjectName("hint")

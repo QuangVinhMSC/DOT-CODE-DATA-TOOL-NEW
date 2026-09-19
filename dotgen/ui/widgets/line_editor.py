@@ -120,8 +120,9 @@ class LineEditor(QWidget):
         hl.addWidget(QLabel("Character spacing"))
 
         tip = (
-            "Centre to centre, in pixels.  Min and Max sitting on the middle\n"
-            "box space every image alike; apart, each image draws one spacing\n"
+            "Edge to edge -- the blank between one character's ink and the\n"
+            "next, in pixels.  Min and Max sitting on the middle box space\n"
+            "every image alike; apart, each image draws one spacing\n"
             "for this whole line, uniformly across the range."
         )
 
