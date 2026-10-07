@@ -43,7 +43,7 @@ import cv2
 import numpy as np
 
 from . import curve, matrix, perspective, polygons
-from .dot_pca import generate_pca_dot
+from .dot_pca import AREA_THRESHOLD, generate_pca_dot
 from .ink import shift_image
 from .models import CharFormat, DefectSpec, DotModel, RenderedChar
 from .params import ParamSet, RangeParam
@@ -209,34 +209,86 @@ def _geometry_params(params: ParamSet, mode: Mode) -> tuple[ParamSet, bool]:
     return out, neutral
 
 
+def _hand_set(
+    params: ParamSet, key: str, mode: Mode | None, rng: np.random.Generator
+) -> float | None:
+    """A ``dot.*`` bar's value, but only once the user has set it.
+
+    The PCA model already prints dots the way the samples were, so a measured,
+    untouched (or disabled) bar returns ``None`` and consumes no randomness --
+    which keeps every existing seed rendering bit-identically.
+    """
+    p = params.get(key)
+
+    if p is None or not p.enabled or not p.user_set:
+        return None
+
+    return float(p.sample(rng) if mode is None else p.value_for(mode))
+
+
+def _reference_patch(model: DotModel | None, radius: int) -> np.ndarray:
+    """The typical dot the bars are measured against."""
+    return model.mean_patch() if model is not None else _gaussian_blob(radius)
+
+
 def _ink_gain(
     params: ParamSet,
-    model: DotModel | None,
+    ref: np.ndarray,
     mode: Mode | None,
     rng: np.random.Generator,
 ) -> float:
     """How much to darken every dot so its peak lands on ``dot.max_ink``.
 
-    The PCA model already prints dots as dark as the samples were, so the bar
-    only does anything once the user has set it: a measured, untouched bar
-    returns exactly 1.0 and consumes no randomness, which keeps every existing
-    seed rendering bit-identically.  The gain is relative to the model's own
-    mean peak, so each dot keeps its PCA variation and the *typical* dot peaks
-    at the bar's value.
+    Relative to the typical dot's peak, so each dot keeps its PCA variation
+    and the *typical* one peaks at the bar's value.
     """
-    p = params.get("dot.max_ink")
+    target = _hand_set(params, "dot.max_ink", mode, rng)
+    peak = float(ref.max())
 
-    if p is None or not p.enabled or not p.user_set:
+    if target is None or peak <= _NEUTRAL_EPS:
         return 1.0
 
-    ref = float(model.mean_patch().max()) if model is not None else FALLBACK_PEAK
+    return max(target, 0.0) / peak
 
-    if ref <= _NEUTRAL_EPS:
+
+def _size_gain(
+    params: ParamSet,
+    ref: np.ndarray,
+    mode: Mode | None,
+    rng: np.random.Generator,
+) -> float:
+    """Linear scale that gives the typical dot ``dot.area`` pixels of ink.
+
+    Area goes with the square of a length, hence the root.  Measured with the
+    same threshold Tab 1 uses to report the bar, on ``ref`` as it will be
+    printed -- already darkened by ``dot.max_ink`` -- since a darker dot has
+    more of its rim above the threshold.
+    """
+    target = _hand_set(params, "dot.area", mode, rng)
+    area = int(np.count_nonzero(ref > AREA_THRESHOLD))
+
+    if target is None or area == 0:
         return 1.0
 
-    target = p.sample(rng) if mode is None else p.value_for(mode)
+    return float(np.sqrt(max(target, 0.0) / area))
 
-    return max(float(target), 0.0) / ref
+
+def _resize_dot(patch: np.ndarray, scale: float) -> np.ndarray:
+    """Grow or shrink a dot about its centre pixel, into an odd square canvas.
+
+    ``warpAffine`` rather than ``resize``: a resize has to land on a whole
+    (odd) number of pixels, which would round the scale -- and therefore the
+    area the user asked for -- by up to a pixel's width.
+    """
+    r = patch.shape[0] // 2
+    r_out = max(int(np.ceil(r * scale)), 1)
+    size = 2 * r_out + 1
+
+    m = np.array([[scale, 0.0, r_out - scale * r], [0.0, scale, r_out - scale * r]])
+
+    return cv2.warpAffine(
+        patch, m, (size, size), flags=cv2.INTER_LINEAR, borderValue=0.0
+    ).astype(np.float32)
 
 
 def _curve_enabled(params: ParamSet) -> bool:
@@ -568,11 +620,18 @@ def render_char(
     sigma = _resolve(params, "dot.pca_sigma", mode, rng, DEFAULT_PCA_SIGMA)
     dev_h = _deviation(params, "dist.dev_h", mode, rng)
     dev_v = _deviation(params, "dist.dev_v", mode, rng)
-    gain = _ink_gain(params, model, mode, rng)
 
     metrics = matrix.solve_metrics(fmt, dist_h, dist_v)
 
     radius = max(int(model.patch_radius) if model is not None else DEFAULT_PATCH_RADIUS, 1)
+    ref = _reference_patch(model, radius)
+    gain = _ink_gain(params, ref, mode, rng)
+    size_gain = _size_gain(params, np.clip(ref * gain, 0.0, 1.0), mode, rng)
+
+    # A dot grown by ``dot.area`` needs a wider frame or its rim is clipped.
+    if size_gain > 1.0:
+        radius = max(int(np.ceil(radius * size_gain)), radius)
+
     margin = radius + MARGIN
 
     n = len(fmt.dots)
@@ -632,7 +691,7 @@ def render_char(
     width = int(np.ceil(max_x - min_x)) + margin * 2
     height = int(np.ceil(max_y - min_y)) + margin * 2
 
-    fallback = None if model is not None else _gaussian_blob(radius)
+    fallback = None if model is not None else ref
 
     dot_centers: list[tuple[float, float]] = []
     placed: list[tuple[float, float, np.ndarray]] = []
@@ -649,6 +708,9 @@ def render_char(
 
         if i in plan.deformed:
             patch = _deform(patch, plan.scales[i])
+
+        if size_gain != 1.0:
+            patch = _resize_dot(patch, size_gain)
 
         if gain != 1.0:
             patch = np.clip(patch * gain, 0.0, 1.0).astype(np.float32)

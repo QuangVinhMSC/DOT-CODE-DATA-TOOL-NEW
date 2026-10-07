@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 import pytest
 
-from dotgen.core.dot_pca import build_pca_model
+from dotgen.core.dot_pca import AREA_THRESHOLD, build_pca_model
 from dotgen.core.models import CharFormat, DefectSpec, DotSample
 from dotgen.core.params import ParamSet, RangeParam
 from dotgen.core.render_char import (
@@ -746,3 +746,59 @@ def test_the_darkness_bar_also_drives_the_fallback_dot():
     res = render_char(row_format(), None, darkness(dist_params(), 0.5), "mean", rng(0))
 
     assert float(res.ink.max()) == pytest.approx(0.5, abs=1e-3)
+
+
+# ----------------------------------------------------------------------
+# dot.area -- the size bar
+# ----------------------------------------------------------------------
+
+
+def area_bar(params: ParamSet, value: float, user_set: bool = True, enabled: bool = True) -> ParamSet:
+    p = RangeParam("dot.area", "Dot area", "px", value, value, value, 0, 5000, step=1, enabled=enabled)
+    p.user_set = user_set
+    params.add(p)
+    return params
+
+
+def lone_dot_area(res) -> int:
+    """Ink pixels of one dot, by Tab 1's own rule."""
+    return int(np.count_nonzero(res.ink > AREA_THRESHOLD))
+
+
+def test_a_hand_set_area_sets_the_dot_area():
+    model = flat_model()
+    natural = lone_dot_area(render_char(row_format(1), model, dist_params(), "mean", rng(0)))
+
+    for target in (natural * 0.5, natural * 2.0):
+        res = render_char(row_format(1), model, area_bar(dist_params(), target), "mean", rng(0))
+        assert lone_dot_area(res) == pytest.approx(target, rel=0.08), target
+
+
+def test_a_grown_dot_is_framed_not_clipped():
+    res = render_char(row_format(1), flat_model(), area_bar(dist_params(), 2000), "mean", rng(0))
+    ink = res.ink
+
+    assert not ink[0].any() and not ink[-1].any()
+    assert not ink[:, 0].any() and not ink[:, -1].any()
+
+
+def test_area_and_darkness_combine():
+    params = darkness(area_bar(dist_params(), 200), 0.95)
+    res = render_char(row_format(1), pale_model(), params, "mean", rng(0))
+
+    assert float(res.ink.max()) == pytest.approx(0.95, abs=0.02)
+    assert lone_dot_area(res) == pytest.approx(200, rel=0.08)
+
+
+@pytest.mark.parametrize("user_set, enabled", [(False, True), (True, False)])
+def test_an_untouched_or_disabled_area_renders_bit_identically(user_set, enabled):
+    plain = render_char(row_format(), varied_model(), dist_params(), None, rng(3))
+    with_bar = render_char(
+        row_format(),
+        varied_model(),
+        area_bar(dist_params(), 900, user_set=user_set, enabled=enabled),
+        None,
+        rng(3),
+    )
+
+    assert np.array_equal(plain.ink, with_bar.ink)

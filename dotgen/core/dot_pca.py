@@ -45,7 +45,7 @@ _SINGULAR_EPS = 1e-7
 _STD_EPS = 1e-8
 
 # Ink above this level counts as covered area, matching the prototype.
-_AREA_THRESHOLD = 0.10
+AREA_THRESHOLD = 0.10
 
 
 def build_pca_model(samples: list[DotSample]) -> DotModel | None:
@@ -154,7 +154,7 @@ def dot_params(samples: list[DotSample], model: DotModel | None) -> ParamSet:
 
     for s in samples:
         ink = s.ink
-        area = int(np.count_nonzero(ink > _AREA_THRESHOLD))
+        area = int(np.count_nonzero(ink > AREA_THRESHOLD))
 
         areas.append(float(area))
         max_inks.append(float(ink.max()))
