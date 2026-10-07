@@ -258,8 +258,20 @@ def test_the_brush_size_is_in_patch_pixels(qtbot, app):
     stroke(qtbot, editor, [(5, 5)])
 
     assert int((editor.ink == 0.0).sum()) == 5  # a plus sign
-    assert editor.size_spin.minimum() == 1
+    assert editor.size_spin.minimum() == 0
     assert editor.size_spin.maximum() == 8
+
+
+def test_radius_zero_erases_exactly_one_pixel(qtbot, app):
+    strip = build_strip(qtbot, [make_sample(21)])
+    click_thumb(qtbot, strip, 0)
+
+    editor = strip._editor
+    editor.size_spin.setValue(0)
+    stroke(qtbot, editor, [(5, 5)])
+
+    assert int((editor.ink == 0.0).sum()) == 1
+    assert editor.ink[5, 5] == 0.0
 
 
 def test_the_eraser_toggle_gates_the_stroke(qtbot, app):

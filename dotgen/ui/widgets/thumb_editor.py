@@ -188,11 +188,13 @@ class ThumbEditor(QFrame):
         row.addWidget(size_label)
 
         # In patch pixels, not screen pixels -- the zoom must not change what
-        # a stroke actually erases.
+        # a stroke actually erases.  Radius 0 is a single pixel, so a stray
+        # speck can be picked off without nibbling its neighbours.
         self.size_spin = QSpinBox()
-        self.size_spin.setRange(1, 8)
+        self.size_spin.setRange(0, 8)
         self.size_spin.setValue(2)
-        self.size_spin.setToolTip("Eraser radius, in patch pixels")
+        self.size_spin.setSpecialValueText("1 px")
+        self.size_spin.setToolTip("Eraser radius, in patch pixels (minimum = one pixel)")
         row.addWidget(self.size_spin)
 
         row.addStretch(1)
