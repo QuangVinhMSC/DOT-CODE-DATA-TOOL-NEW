@@ -209,6 +209,36 @@ def _geometry_params(params: ParamSet, mode: Mode) -> tuple[ParamSet, bool]:
     return out, neutral
 
 
+def _ink_gain(
+    params: ParamSet,
+    model: DotModel | None,
+    mode: Mode | None,
+    rng: np.random.Generator,
+) -> float:
+    """How much to darken every dot so its peak lands on ``dot.max_ink``.
+
+    The PCA model already prints dots as dark as the samples were, so the bar
+    only does anything once the user has set it: a measured, untouched bar
+    returns exactly 1.0 and consumes no randomness, which keeps every existing
+    seed rendering bit-identically.  The gain is relative to the model's own
+    mean peak, so each dot keeps its PCA variation and the *typical* dot peaks
+    at the bar's value.
+    """
+    p = params.get("dot.max_ink")
+
+    if p is None or not p.enabled or not p.user_set:
+        return 1.0
+
+    ref = float(model.mean_patch().max()) if model is not None else FALLBACK_PEAK
+
+    if ref <= _NEUTRAL_EPS:
+        return 1.0
+
+    target = p.sample(rng) if mode is None else p.value_for(mode)
+
+    return max(float(target), 0.0) / ref
+
+
 def _curve_enabled(params: ParamSet) -> bool:
     """True when the user has switched the waviness group on."""
     for key in CURVE_KEYS:
@@ -538,6 +568,7 @@ def render_char(
     sigma = _resolve(params, "dot.pca_sigma", mode, rng, DEFAULT_PCA_SIGMA)
     dev_h = _deviation(params, "dist.dev_h", mode, rng)
     dev_v = _deviation(params, "dist.dev_v", mode, rng)
+    gain = _ink_gain(params, model, mode, rng)
 
     metrics = matrix.solve_metrics(fmt, dist_h, dist_v)
 
@@ -619,7 +650,10 @@ def render_char(
         if i in plan.deformed:
             patch = _deform(patch, plan.scales[i])
 
-        x = float(centres[i, 0]) + off_x
+        if gain != 1.0:
+            patch = np.clip(patch * gain, 0.0, 1.0).astype(np.float32)
+
+        x =float(centres[i, 0]) + off_x
         y = float(centres[i, 1]) + off_y
         dot_centers.append((x, y))
         placed.append((x, y, patch))

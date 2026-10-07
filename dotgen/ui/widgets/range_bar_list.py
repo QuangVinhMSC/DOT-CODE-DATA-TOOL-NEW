@@ -278,6 +278,7 @@ class RangeBarList(QWidget):
 
             if staged is not None:
                 old.mean, old.min, old.max = staged
+                old.user_set = True
 
             old.clamp()
 
@@ -292,6 +293,9 @@ class RangeBarList(QWidget):
             return
 
         p.set_field(field, value)
+        # The preview frames render from the draft, and a bar that only acts
+        # once hand-set (``dot.max_ink``) has to look hand-set there too.
+        p.user_set = True
         self._edited.add(key)
 
         bar = self.bars.get(key)

@@ -688,3 +688,61 @@ def test_two_seeds_scatter_the_dots_differently():
     b = render_char(fmt, flat_model(), params, "mean", rng(36))
 
     assert not np.array_equal(relative_centers(a), relative_centers(b))
+
+
+# ----------------------------------------------------------------------
+# dot.max_ink -- the darkness bar
+# ----------------------------------------------------------------------
+
+
+def pale_model():
+    """Identical dots peaking at 0.6, so a darker bar has room to work."""
+    return build_pca_model([sample(blob(amplitude=0.6)) for _ in range(6)])
+
+
+def darkness(params: ParamSet, value: float, user_set: bool = True, enabled: bool = True) -> ParamSet:
+    p = bar("dot.max_ink", value, 0, 1, enabled)
+    p.user_set = user_set
+    params.add(p)
+    return params
+
+
+def test_a_hand_set_max_darkness_sets_the_dot_peak():
+    res = render_char(row_format(), pale_model(), darkness(dist_params(), 0.9), "mean", rng(0))
+
+    assert float(res.ink.max()) == pytest.approx(0.9, abs=1e-3)
+
+
+def test_a_darker_bar_prints_darker_dots():
+    light = render_char(row_format(), pale_model(), darkness(dist_params(), 0.5), "mean", rng(0))
+    dark = render_char(row_format(), pale_model(), darkness(dist_params(), 0.95), "mean", rng(0))
+
+    assert float(dark.ink.max()) > float(light.ink.max()) + 0.4
+
+
+def test_full_darkness_saturates_at_black_rather_than_overflowing():
+    res = render_char(row_format(), pale_model(), darkness(dist_params(), 1.0), "mean", rng(0))
+
+    assert float(res.ink.max()) == pytest.approx(1.0)
+    assert float(res.ink.max()) <= 1.0
+
+
+@pytest.mark.parametrize("user_set, enabled", [(False, True), (True, False)])
+def test_an_untouched_or_disabled_bar_renders_bit_identically(user_set, enabled):
+    """Existing configs carry a measured bar; it must not move a single pixel."""
+    plain = render_char(row_format(), varied_model(), dist_params(), None, rng(3))
+    with_bar = render_char(
+        row_format(),
+        varied_model(),
+        darkness(dist_params(), 1.0, user_set=user_set, enabled=enabled),
+        None,
+        rng(3),
+    )
+
+    assert np.array_equal(plain.ink, with_bar.ink)
+
+
+def test_the_darkness_bar_also_drives_the_fallback_dot():
+    res = render_char(row_format(), None, darkness(dist_params(), 0.5), "mean", rng(0))
+
+    assert float(res.ink.max()) == pytest.approx(0.5, abs=1e-3)
