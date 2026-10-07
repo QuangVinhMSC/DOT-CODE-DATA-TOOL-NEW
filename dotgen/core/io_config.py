@@ -33,11 +33,12 @@ from .models import (
     DotSample,
     ExportSpec,
     Job,
-    LineDefectSpec,
     LineGap,
     LineSpec,
     Quad,
     SampleImage,
+    VariationSpec,
+    is_retired_class,
 )
 from .params import ParamSet, default_params
 
@@ -56,7 +57,11 @@ if TYPE_CHECKING:
 # 5: a job may carry "box_pad".  An older build ignores the key and exports
 # every box at its ink-tight size, which is a quietly different dataset from
 # the one that was configured, so it is told to refuse instead.
-SCHEMA = 5
+# 6: line-level defects and the "*_fail" classes are gone; a job carries
+# "variation" (dot variation and defect levels) instead.  An older build would
+# ignore the key and export undamaged dots, so it is told to refuse.  Reading a
+# schema-5 file still works: its line defects and fail classes are dropped.
+SCHEMA = 6
 CONFIG_FILTER = "DotGen configuration (*.dotcfg);;All files (*)"
 JOBS_FILTER = "DotGen jobs (*.dotjobs);;All files (*)"
 
@@ -167,7 +172,7 @@ def save_config(state: "AppState", path: str) -> None:
         "lines": [l.to_dict() for l in state.lines],
         "line_gaps": [g.to_dict() for g in state.line_gaps],
         "defects": state.defects.to_dict(),
-        "line_defects": state.line_defects.to_dict(),
+        "variation": state.variation.to_dict(),
         "box_pad": state.box_pad,
         "classes": [c.to_dict() for c in state.classes],
         "export": state.export.to_dict(),
@@ -271,9 +276,11 @@ def load_config(state: "AppState", path: str) -> None:
         state.lines = [LineSpec.from_dict(l) for l in meta.get("lines", [])]
         state.line_gaps = [LineGap.from_dict(g) for g in meta.get("line_gaps", [])]
         state.defects = DefectSpec.from_dict(meta.get("defects", {}))
-        state.line_defects = LineDefectSpec.from_dict(meta.get("line_defects", {}))
+        state.variation = VariationSpec.from_dict(meta.get("variation"))
         state.box_pad = float(meta.get("box_pad", 0.0))
-        state.classes = [ClassDef.from_dict(c) for c in meta.get("classes", [])]
+        state.classes = [
+            ClassDef.from_dict(c) for c in meta.get("classes", []) if not is_retired_class(c)
+        ]
         state.export = ExportSpec.from_dict(meta["export"]) if "export" in meta else ExportSpec()
         state.jobs = [Job.from_dict(j) for j in meta.get("jobs", [])]
 

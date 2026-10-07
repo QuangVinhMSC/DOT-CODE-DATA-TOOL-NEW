@@ -553,14 +553,13 @@ def test_class_counts_match_the_drawn_characters(export, job) -> None:
 
     expected = _expected_class_counts(job)
 
-    # Every class the job declares is in the report, and only the ones that were
-    # actually drawn carry boxes -- no defects were configured, so both fail
-    # classes must be empty rather than merely small.
+    # Every class the job declares is in the report, and every one of them was
+    # actually drawn -- there are no fail classes left to ship empty.
     assert report.class_counts == {
         name: expected.get(name, 0) for name in dataset_classes([job])
     }
     assert report.boxes == sum(expected.values())
-    assert set(report.empty_classes) == {"0_fail", "8_fail"}
+    assert report.empty_classes == []
 
     nc, names = _read_data_yaml(out_dir)
 
@@ -599,56 +598,54 @@ def test_same_seed_reproduces_identical_files(export, rerun) -> None:
 
 
 # ======================================================================
-# 5 -- the line defects, on the real photographs
+# 5 -- dot variation and yolo-obb-3op, on the real photographs
 # ======================================================================
 
-DEFECT_IMAGES = 6
+VARIED_IMAGES = 6
 
 
-def _armed(job: Job, kind: str = "ink_cover") -> Job:
-    """A copy of the e2e job with one defect kind firing on every line.
+def _varied(job: Job) -> Job:
+    """A copy of the e2e job with a quarter of its dots varied.
 
     A copy because ``job`` is module-scoped and every assertion above reads it;
-    arming the shared one would move the dataset those tests describe.
+    varying the shared one would move the dataset those tests describe.
     """
     out = copy.deepcopy(job)
-    defect = out.line_defects.get(kind)
-    defect.enabled, defect.p_line, defect.max_lines = True, 1.0, 9
-    out.classes = build_classes(out.characters(), out.lines, line_defects=out.line_defects)
+    out.variation.p_dot = 0.25
 
     return out
 
 
-def test_a_defect_export_of_the_photographs_is_still_reproducible(
+def test_a_3op_export_of_the_photographs_is_reproducible_and_graded(
     job, tmp_path_factory
 ) -> None:
-    """Phase 8: the seed still is the dataset once a defect draws from the rng."""
-    spec_fields = dict(fmt="yolo", images_per_job=DEFECT_IMAGES, seed=SEED, split=SPLIT)
+    """The seed still is the dataset once variation draws from the rng."""
+    spec_fields = dict(fmt="yolo-obb-3op", images_per_job=VARIED_IMAGES, seed=SEED, split=SPLIT)
 
-    first_dir = tmp_path_factory.mktemp("e2e_defect_a")
-    second_dir = tmp_path_factory.mktemp("e2e_defect_b")
+    first_dir = tmp_path_factory.mktemp("e2e_varied_a")
+    second_dir = tmp_path_factory.mktemp("e2e_varied_b")
 
-    first = run_export([_armed(job)], ExportSpec(out_dir=str(first_dir), **spec_fields))
-    second = run_export([_armed(job)], ExportSpec(out_dir=str(second_dir), **spec_fields))
+    first = run_export([_varied(job)], ExportSpec(out_dir=str(first_dir), **spec_fields))
+    run_export([_varied(job)], ExportSpec(out_dir=str(second_dir), **spec_fields))
 
-    expected = DEFECT_IMAGES * len(job.lines)
-
-    assert first.line_defects == second.line_defects == {"ink_cover": expected}
     assert _hash_tree(first_dir) == _hash_tree(second_dir)
+    assert first.defect_levels == job.variation.level_names()
 
-    # The damage is in the labels, not only in the report.
-    _, names = _read_data_yaml(first_dir)
-    smeared = str(names.index("line_ink_cover"))
+    levels = set()
 
     for split in SPLITS:
         for path in sorted((first_dir / "labels" / split).iterdir()):
-            assert smeared in {row.split()[0] for row in path.read_text().splitlines()}
+            for row in path.read_text().splitlines():
+                assert len(row.split()) == 10
+                levels.add(int(row.split()[9]))
+
+    assert -1 in levels and 0 in levels
+    assert levels - {-1, 0}, "a quarter of the dots varied, yet nothing above level 0"
 
 
-def test_the_undamaged_export_reports_no_line_defects(export) -> None:
-    """The twenty-image dataset every assertion above reads was drawn with no
-    kind armed, and the report has to say exactly that -- an ``ink_cover`` count
-    appearing here would mean a defect fired on a job that never asked for one."""
+def test_the_undamaged_export_is_unaffected_by_variation(export) -> None:
+    """The twenty-image dataset above was drawn with variation off, in plain
+    ``yolo`` -- it must carry no level bookkeeping at all."""
     _, report = export
 
-    assert report.line_defects == {}
+    assert report.defect_levels == [] and report.level_counts == {}

@@ -66,7 +66,6 @@ from dotgen.core.classes import build_classes
 from dotgen.core.compose import compose
 from dotgen.core.dot_pca import build_pca_model
 from dotgen.core.models import (
-    DEFECT_KINDS,
     BackgroundSpec,
     CharFormat,
     CharSpec,
@@ -107,15 +106,18 @@ QUAD_INSET = 0.08
 
 BASE_SEED = 20260817
 
-# plan2.md 9.3.  Composing with all seven line-level defect kinds armed must
-# stay within DEFECT_BUDGET times the undefected time, and the *overhead* the
-# defects add must not follow the size of the page: every one of them works on
-# a crop of the line's own band, so a 4000x3000 background must not cost more
-# per defect than a 640x480 one.  SIZE_TOLERANCE is loose because the
-# comparison it guards is not: the failure it exists to catch is an effect that
-# grows with the area, and these two pages differ in area by a factor of 39.
-DEFECT_BUDGET = 2.0
-DEFECT_P_LINE = 0.5
+# Composing with dot variation on (Tab 5) must stay within DEFECT_BUDGET times
+# the unvaried time, and the *overhead* it adds must not follow the size of the
+# page: variation works on one dot's patch at a time, so a 4000x3000 background
+# must not cost more per varied dot than a 640x480 one.  SIZE_TOLERANCE is loose
+# because the comparison it guards is not: the failure it exists to catch is an
+# effect that grows with the area, and these two pages differ in area by 39x.
+#
+# Measured when this was written: ~1 ms per varied dot, so at p_dot 0.2 a
+# 640x480 image went 17 -> 37 ms (2.1-2.3x) and a 4000x3000 one 30 -> 51 ms
+# (1.7x).  The budget leaves room for timing noise, not for a regression.
+DEFECT_BUDGET = 3.0
+DEFECT_P_DOT = 0.2
 DEFECT_IMAGES = 12
 SMALL_PAGE = (640, 480)
 LARGE_PAGE = (4000, 3000)
@@ -235,26 +237,10 @@ def build_bench_job(
     return job
 
 
-def arm_defects(job: Job, p_line: float = DEFECT_P_LINE) -> Job:
-    """A copy of ``job`` with all seven line-level defect kinds enabled.
-
-    ``max_lines`` is the number of lines rather than the default 1, so the cap
-    never truncates the draw and the measurement is of the kinds themselves.
-    The class list has to be rebuilt as well: a fired kind whose class does not
-    exist falls back to the plain line class, which is a cheaper path than the
-    one the exporter actually walks.
-    """
+def arm_defects(job: Job, p_dot: float = DEFECT_P_DOT) -> Job:
+    """A copy of ``job`` with dot variation on, every tool at its default max."""
     out = copy.deepcopy(job)
-
-    for kind in DEFECT_KINDS:
-        defect = out.line_defects.get(kind)
-        defect.enabled = True
-        defect.p_line = float(p_line)
-        defect.max_lines = len(out.lines)
-
-    out.classes = build_classes(
-        out.characters(), out.lines, out.classes, out.line_defects
-    )
+    out.variation.p_dot = float(p_dot)
 
     return out
 
@@ -528,7 +514,7 @@ def print_defect_report(costs: list[DefectCost]) -> bool:
     """The two verdicts of plan2.md 9.3.  Returns whether both passed."""
     print()
     print("-" * 72)
-    print(f"line-level defects -- plan2.md 9.3 (all seven armed, p_line {DEFECT_P_LINE})")
+    print(f"dot variation (p_dot {DEFECT_P_DOT}, every tool at its default maximum)")
     print("-" * 72)
     print(f"  {'page':>12}{'plain':>11}{'armed':>11}{'overhead':>11}{'ratio':>8}")
 
@@ -700,7 +686,8 @@ def test_bench_runs() -> None:
     default ``test_*.py`` discovery does not collect -- run it explicitly with
     ``pytest tests/bench_compose.py`` when you want it.
     """
-    job = build_bench_job(width=320, height=240)
+    # 640x480: the block is never shrunk to fit, and it does not fit 320x240.
+    job = build_bench_job(width=640, height=480)
     shape = verify_fits(job)
     result = run_benchmark(job, shape, images=2, warmup=0)
 
@@ -709,30 +696,28 @@ def test_bench_runs() -> None:
 
 
 def test_defects_stay_within_budget() -> None:
-    """plan2.md 9.3, at one small page: all seven kinds inside DEFECT_BUDGET.
+    """At one small page: dot variation inside DEFECT_BUDGET.
 
     Small enough to be worth running (a second or so) and still a real
     measurement.  Like ``test_bench_runs`` above it only runs when this file is
     named explicitly -- ``pytest tests/bench_compose.py`` -- because a wall-clock
     assertion in a suite that runs on whatever machine is free is a flake
-    waiting to happen.  The number it guards is not marginal: before the smear
-    was cropped to the line's band, this ratio was 14.
+    waiting to happen.
     """
     cost = measure_defect_cost(*SMALL_PAGE, images=6)
 
     assert cost.ratio <= DEFECT_BUDGET, (
-        f"all seven defects cost {cost.ratio:.2f}x the undefected image "
+        f"dot variation costs {cost.ratio:.2f}x the unvaried image "
         f"({cost.armed_ms:.1f} ms vs {cost.plain_ms:.1f} ms)"
     )
 
 
 def test_defect_cost_does_not_follow_the_page_size() -> None:
-    """plan2.md 9.3: the band crop, asserted from the outside.
+    """Variation cost per dot, asserted from the outside.
 
-    ``dfield.distance_bleed`` and ``dfield.line_spread`` both cost the area of
-    the array they are handed, so the only evidence that they are being handed
-    a line's band and not the page is that a page 39 times the area does not
-    cost 39 times the overhead.
+    Variation works on one dot's patch at a time, so the evidence that it never
+    touches the page is that a page 39 times the area does not cost 39 times
+    the overhead.
     """
     small = measure_defect_cost(*SMALL_PAGE, images=6)
     large = measure_defect_cost(*LARGE_PAGE, images=6)

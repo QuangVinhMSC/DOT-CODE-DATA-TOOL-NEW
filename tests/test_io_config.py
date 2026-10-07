@@ -16,8 +16,8 @@ from dotgen.core.models import (
     CharFormat,
     CurveSpec,
     DotLink,
+    DefectLevel,
     DotSequence,
-    LineDefectSpec,
     LineSpec,
     Quad,
 )
@@ -60,9 +60,10 @@ def populate(state: AppState, dotted_image, circle_roi, backgrounds) -> None:
     state.set_char_spacing(0, 18.0)
     state.set_char_spacing_field(0, "min", 12.0)
     state.set_char_spacing_field(0, "max", 24.0)
-    state.set_line_defect("top_loss", enabled=True, p_line=0.4, max_lines=2, amount=(0.2, 0.55))
-    state.set_line_defect("ink_cover", enabled=True, p_line=0.15, side="left")
-    state.set_line_defect("squeeze", enabled=True, p_line=0.3, amount=(0.35, 0.7))
+    state.update_variation(
+        p_dot=0.25, distribution="normal", wavy=0.06, tail=1.1,
+        levels=[DefectLevel("ok"), DefectLevel("scuffed", 0.12), DefectLevel("broken", 0.3)],
+    )
     state.set_classes(build_classes(state.job_characters(), state.lines))
     state.set_box_pad(-1.5)
     state.set_export(out_dir="out", images_per_job=7, seed=99)
@@ -113,9 +114,9 @@ def test_config_roundtrip_restores_every_tab(app, tmp_path, dotted_image, circle
     assert dst.box_pad == -1.5
 
     # Tab 5 / 6
-    assert dst.line_defects == src.line_defects
-    assert dst.line_defects.enabled_kinds() == ["top_loss", "ink_cover", "squeeze"]
-    assert dst.line_defects.get("ink_cover").side == "left"
+    assert dst.variation.to_dict() == src.variation.to_dict()
+    assert dst.variation.distribution == "normal"
+    assert dst.variation.level_names() == ["ok", "scuffed", "broken"]
     assert [c.name for c in dst.classes] == [c.name for c in src.classes]
     assert dst.export.images_per_job == 7 and dst.export.seed == 99
 
@@ -201,19 +202,26 @@ def test_a_schema_one_config_still_loads_its_dot_pairs(app, tmp_path):
     assert dst.dot_sequences[0].unit_spacing == 12.0
 
 
-def test_a_schema_three_config_loads_with_no_line_defects(app, tmp_path):
-    """The key predates nothing: a config written before Tab 5 has no defects."""
+def test_a_schema_five_config_drops_line_defects_and_fail_classes(app, tmp_path):
+    """Before variation: line defects and per-character fail classes."""
     src = AppState()
-    src.set_line_defect("char_loss", enabled=True, p_line=0.5)
-
     path = str(tmp_path / "old.dotcfg")
     save_config(src, path)
 
     with zipfile.ZipFile(path) as zf:
         meta = json.loads(zf.read("config.json"))
 
-    meta["schema"] = 3
-    del meta["line_defects"]
+    meta["schema"] = 5
+    meta.pop("variation")
+    meta["line_defects"] = {"squeeze": {"kind": "squeeze", "enabled": True, "p_line": 0.5}}
+    meta["classes"] = [
+        {"name": "1", "kind": "char_pass", "enabled": True, "min_defects": None,
+         "line_result": "pass", "source_char": "1"},
+        {"name": "1_fail", "kind": "char_fail", "enabled": True, "min_defects": 1,
+         "line_result": "pass", "source_char": "1"},
+        {"name": "line_squeeze", "kind": "line", "enabled": True, "min_defects": None,
+         "line_result": "pass", "source_char": ""},
+    ]
 
     with zipfile.ZipFile(path, "w") as zf:
         zf.writestr("config.json", json.dumps(meta))
@@ -221,8 +229,9 @@ def test_a_schema_three_config_loads_with_no_line_defects(app, tmp_path):
     dst = AppState()
     load_config(dst, path)
 
-    assert dst.line_defects == LineDefectSpec()
-    assert dst.line_defects.any_enabled() is False
+    assert [c.name for c in dst.classes] == ["1"]
+    assert dst.variation.any_enabled() is False
+    assert dst.variation.level_names() == ["ok", "minor", "severe"]
 
 
 def test_a_newer_schema_is_refused(app, tmp_path, dotted_image):

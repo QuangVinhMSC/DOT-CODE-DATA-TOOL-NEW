@@ -3,11 +3,13 @@ import pytest
 
 from dotgen.core.models import (
     CharFormat,
+    ClassDef,
     CurveSpec,
+    DefectSpec,
     DotLink,
     DotSequence,
-    LineDefectSpec,
     Quad,
+    VariationSpec,
 )
 from dotgen.core.state import (
     MAX_DOT_SAMPLES,
@@ -526,45 +528,56 @@ def test_a_committed_edit_survives_the_next_measurement(state):
 
 
 # ----------------------------------------------------------------------
-# line-level defects
+# Tab 5 -- dot variation and defect levels
 # ----------------------------------------------------------------------
 
 
-def test_setting_one_defect_field_emits_once(state):
+def test_updating_variation_emits_once(state):
     seen = []
-    state.lineDefectsChanged.connect(lambda: seen.append(1))
+    state.variationChanged.connect(lambda: seen.append(1))
 
-    state.set_line_defect("squeeze", enabled=True, p_line=0.4, amount=(0.35, 0.7))
+    state.update_variation(p_dot=0.4, wavy=0.05, distribution="normal")
 
     assert len(seen) == 1
-    assert state.line_defects.get("squeeze").amount == (0.35, 0.7)
-    assert state.line_defects.enabled_kinds() == ["squeeze"]
+    assert (state.variation.p_dot, state.variation.wavy) == (0.4, 0.05)
+    assert state.variation.distribution == "normal"
 
 
-def test_the_defect_class_list_follows_the_enabled_kinds(state):
-    state.set_line_defect("ink_cover", enabled=True, p_line=0.2)
-    state.set_line_defect("top_loss", enabled=True, p_line=0.2)
+def test_defective_dots_are_tab_5_settings_now(state):
+    seen = []
+    state.variationChanged.connect(lambda: seen.append(1))
 
-    assert state.line_defect_classes() == ["line_top_loss", "line_ink_cover"]
+    state.set_defects(DefectSpec(max_missing=2, p_missing=0.1))
+
+    assert seen == [1]
 
 
-def test_a_snapshot_is_a_deep_copy_of_the_defects(state):
-    state.set_line_defect("char_loss", enabled=True, p_line=0.3)
+def test_a_snapshot_is_a_deep_copy_of_the_variation(state):
+    state.update_variation(p_dot=0.3)
     job = state.save_job("j")
 
-    state.set_line_defect("char_loss", p_line=0.9)
+    state.update_variation(p_dot=0.9)
+    state.variation.levels[1].name = "renamed"
 
-    assert job.line_defects.get("char_loss").p_line == 0.3
+    assert job.variation.p_dot == 0.3
+    assert job.variation.levels[1].name == "minor"
 
 
-def test_reset_and_load_carry_the_defects(state):
-    state.set_line_defect("collapse_all", enabled=True, p_line=0.5, amount=(0.05, 0.2))
+def test_reset_and_load_carry_the_variation(state):
+    state.update_variation(p_dot=0.5, tail=1.5)
     state.save_job("j")
     state.reset_job_definition()
 
-    assert state.line_defects == LineDefectSpec()
+    assert state.variation.to_dict() == VariationSpec().to_dict()
 
     state.load_job(0)
 
-    assert state.line_defects.enabled_kinds() == ["collapse_all"]
-    assert state.line_defects.get("collapse_all").amount == (0.05, 0.2)
+    assert (state.variation.p_dot, state.variation.tail) == (0.5, 1.5)
+
+
+def test_retired_classes_never_enter_the_class_list(state):
+    state.set_classes(
+        [ClassDef("1", "char_pass"), ClassDef("1_fail", "char_fail"), ClassDef("line_squeeze", "line")]
+    )
+
+    assert [c.name for c in state.classes] == ["1"]

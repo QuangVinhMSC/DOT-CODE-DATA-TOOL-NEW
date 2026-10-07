@@ -51,7 +51,7 @@ from dataclasses import dataclass, field, replace
 import cv2
 import numpy as np
 
-from . import line_defects, polygons
+from . import polygons
 from .classes import resolve_char_class, resolve_line_class
 from .models import BackgroundSpec, CharSpec, Job, LineSpec, Quad
 from .params import ParamSet
@@ -85,11 +85,10 @@ class PlacedChar:
     ``ink`` is float32 0..1 cropped to ``bbox``'s size, so pasting it at the
     box's top-left corner puts every pixel exactly where the box says it is.
 
-    ``defect`` names the *line* defect that touched this character, if any --
-    ``defects`` is the unrelated per-dot tally that :mod:`render_char` fills in.
-    A character a line defect touched is still drawn and still counts toward its
-    line's box; it just carries no class of its own, because what it shows is
-    the damage rather than the character.
+    ``defects`` is the per-dot tally :mod:`render_char` fills in (missing /
+    deformed / jittered); ``score`` is the character's average dot score and
+    ``level`` the defect level it falls into under the job's
+    :class:`~dotgen.core.models.VariationSpec`.
 
     ``quad`` is the oriented label, in image coordinates -- the same polygon
     :mod:`render_char` fitted to the dot lattice, turned and scaled with the
@@ -104,7 +103,8 @@ class PlacedChar:
     bbox: tuple[float, float, float, float]  # x, y, w, h
     quad: np.ndarray | None = None  # (4, 2) float64, image coordinates
     defects: dict = field(default_factory=dict)
-    defect: str | None = None
+    score: float = 0.0
+    level: int = 0
 
     @property
     def defect_count(self) -> int:
@@ -118,22 +118,10 @@ class PlacedLine:
     ``scale`` is always 1.0 now -- the block is never resized to fit its quad.
     The field stays so callers that read it keep working.
 
-    ``defects`` lists the line-defect kinds that fired on this line, in
-    ``DEFECT_KINDS`` order -- the line's own damage, as opposed to the per-dot
-    tallies its characters carry.
-
     ``rot`` is the angle the block was turned by, in degrees -- the same for
     every line of an image, as ``scale`` is.  ``bbox`` is still the upright box
     around the turned line, and the oriented one the exporter writes is fitted
-    in :mod:`~dotgen.core.compose`.  It rides here so a smear dragged across the
-    line can be dragged along it rather than across it.
-
-    ``overlays`` carries ink that belongs to the line but is not a character:
-    an ``ink_cover`` smear is a splat of ink across the page, not a glyph, so it
-    has no ``char`` and no class of its own.  Each entry is ``((x, y), ink)``
-    pasted by :mod:`~dotgen.core.compose` after the line's characters, with the
-    same multiplicative rule; it joins the line's box, because a smear is part of
-    what went wrong with that line.
+    in :mod:`~dotgen.core.compose`.
     """
 
     index: int
@@ -142,24 +130,19 @@ class PlacedLine:
     cls_name: str | None
     scale: float = 1.0
     rot: float = 0.0
-    defects: list[str] = field(default_factory=list)
-    overlays: list[tuple[tuple[int, int], np.ndarray]] = field(default_factory=list)
 
 
 @dataclass
 class _Raw:
     """A rendered character before the block knows where it is going.
 
-    ``cursor`` is the same position along the line that built ``offset``, kept
-    beside it because the line defects re-space characters and doing that from
-    the two-dimensional offset would mean undoing the tilt at every step.
-    ``defect`` is the line defect that touched this character, if any.
+    ``cursor`` is the same position along the line that built ``offset``.
+    ``score`` is the character's average dot score from :mod:`render_char`.
 
     ``quad`` is the character's oriented label in the frame of its own cropped
     ``ink`` -- corner ``(0, 0)`` of the crop is the origin.  Keeping it local
-    rather than block-local is what lets the defects slide a character along
-    its line without having to touch its label at all: a move that only changes
-    ``offset`` cannot move the polygon relative to the ink it bounds.
+    rather than block-local means a move that only changes ``offset`` cannot
+    move the polygon relative to the ink it bounds.
     """
 
     char: str
@@ -169,8 +152,8 @@ class _Raw:
     line: int  # index into job.lines
     quad: np.ndarray  # (4, 2) float64, ink-crop coordinates
     cursor: float = 0.0  # position along the line, block-local
-    defect: str | None = None
     rot: float = 0.0  # degrees the whole block was turned by
+    score: float = 0.0
 
 
 # ----------------------------------------------------------------------
@@ -358,7 +341,7 @@ def _rotated(raws: list[_Raw], degrees: float) -> list[_Raw]:
 
 def _render_one(
     job: Job, char: str, rng: np.random.Generator
-) -> tuple[np.ndarray, dict, np.ndarray] | None:
+) -> tuple[np.ndarray, dict, np.ndarray, float] | None:
     """Draw one character and crop it to its own ink, or ``None`` if blank.
 
     Blank happens three ways: a space, a character Tab 2 has no format for yet,
@@ -377,7 +360,9 @@ def _render_one(
     if fmt is None or not fmt.dots:
         return None
 
-    rendered = render_char(fmt, job.dot_model, job.params, None, rng, job.defects)
+    rendered = render_char(
+        fmt, job.dot_model, job.params, None, rng, job.defects, job.variation
+    )
 
     if float(rendered.ink.max(initial=0.0)) <= INK_FLOOR:
         return None
@@ -393,7 +378,7 @@ def _render_one(
         else polygons.translated(rendered.quad, -x0, -y0)
     )
 
-    return ink, dict(rendered.defects), quad
+    return ink, dict(rendered.defects), quad, float(rendered.score)
 
 
 def _render_line(
@@ -407,9 +392,6 @@ def _render_line(
     rng: np.random.Generator,
 ) -> list[_Raw]:
     """Every drawable character of one line, in the block-local frame.
-
-    Lifted out of :func:`_render_block` so the line defects have a list of one
-    line's characters to work on.
 
     The spacing is the blank between two characters' ink, edge to edge along
     the line -- not the distance between their centres.  A narrow ``1`` and a
@@ -454,7 +436,7 @@ def _render_line(
             edge += blank + spacing
             continue
 
-        ink, defects, quad = drawn
+        ink, defects, quad, score = drawn
         lo, hi = extent
         t = edge - lo
 
@@ -470,6 +452,7 @@ def _render_line(
                 line=i,
                 quad=quad,
                 cursor=t,
+                score=score,
             )
         )
 
@@ -501,11 +484,7 @@ def _extent_along(
     return min(lo, hi), max(lo, hi)
 
 
-def _render_block(
-    job: Job,
-    rng: np.random.Generator,
-    plan: line_defects.ImagePlan | None = None,
-) -> list[_Raw]:
+def _render_block(job: Job, rng: np.random.Generator) -> list[_Raw]:
     """Every character of every line, positioned in the block-local frame.
 
     Characters are spaced by the line's character spacing edge to edge along
@@ -519,16 +498,9 @@ def _render_block(
     which is what lets a line be broken into words without the whole line
     having to change its character spacing.
 
-    When a ``plan`` is given, each line's characters pass through
-    :func:`line_defects.apply_geometry` while they are still in the block-local
-    frame -- before the block is scaled or translated, which is the only place
-    the geometry defects can re-space a line without having to undo a placement.
-
-    ``line.rot`` turns the finished block last, once every line is spaced and
-    the defects have had their say: the defects re-space a line *along* it, so
-    they have to run while the lines still lie on their own axis.  One angle for
-    the whole block, drawn with the other per-image decisions -- the lines of one
-    printed code are crooked together or not at all.
+    ``line.rot`` turns the finished block last, once every line is spaced.  One
+    angle for the whole block, drawn with the other per-image decisions -- the
+    lines of one printed code are crooked together or not at all.
 
     Rotating here rather than after the placement is what lets :func:`_place`
     fit the turned block: a rotated block is wider than the upright one it came
@@ -549,14 +521,7 @@ def _render_block(
             coeff = DEFAULT_GAP_COEFF if gap is None else gap.sample_coeff(rng)
             v += float(coeff) * dist_v
 
-        raws = _render_line(job, line, i, along, across, v, spaces, rng)
-
-        if plan is not None:
-            raws = line_defects.apply_geometry(
-                plan.for_line(i), raws, along, across, rng
-            )
-
-        out.extend(raws)
+        out.extend(_render_line(job, line, i, along, across, v, spaces, rng))
 
     return _rotated(out, degrees)
 
@@ -684,21 +649,10 @@ def layout_job(job: Job, bg: BackgroundSpec, rng: np.random.Generator) -> list[P
     raising: an empty page is a legitimate (if useless) state of Tab 4, while a
     block that will not fit is a real problem with the background.
 
-    The line-defect plan is drawn *before* :func:`_render_block`, so a job with
-    defects enabled shifts the random stream once, at a single documented point,
-    rather than at seven scattered ones inside the render loop.  A job with
-    nothing enabled makes :func:`line_defects.plan_defects` consume no
-    randomness at all, so every image produced before this feature existed still
-    renders identically from the same seed.
-
-    The ink stage runs last, on the finished list, because a band cut across a
-    line and a smear that crosses two of them are both statements about image
-    coordinates -- they cannot be made until :func:`_place` has decided where
-    the lines are.  It may return fewer lines than it was given: a cut that
-    takes a line's whole glyph band leaves nothing to label.
+    Each character's defect level is decided here, from the average dot score
+    :mod:`render_char` reported and the job's level thresholds (Tab 5).
     """
-    plan = line_defects.plan_defects(job, rng)
-    raws = _render_block(job, rng, plan)
+    raws = _render_block(job, rng)
 
     if not raws:
         return []
@@ -721,21 +675,19 @@ def layout_job(job: Job, bg: BackgroundSpec, rng: np.random.Generator) -> list[P
     rots: dict[int, float] = {}
 
     for r, box in zip(scaled, boxes):
-        defect_count = int(sum(r.defects.values()))
         rots[r.line] = r.rot
 
         by_line.setdefault(r.line, []).append(
             PlacedChar(
                 char=r.char,
-                cls_name=(
-                    None if r.defect else resolve_char_class(r.char, defect_count, job)
-                ),
+                cls_name=resolve_char_class(r.char, job),
                 ink=r.ink,
                 pos=(box[0] + box[2] / 2.0, box[1] + box[3] / 2.0),
                 bbox=box,
                 quad=polygons.translated(r.quad, box[0], box[1]),
                 defects=r.defects,
-                defect=r.defect,
+                score=r.score,
+                level=job.variation.level_of(r.score),
             )
         )
 
@@ -750,11 +702,10 @@ def layout_job(job: Job, bg: BackgroundSpec, rng: np.random.Generator) -> list[P
                 index=index,
                 chars=chars,
                 bbox=_union([c.bbox for c in chars]),
-                cls_name=resolve_line_class(index, job, plan.for_line(i).kinds()),
+                cls_name=resolve_line_class(index, job),
                 scale=scale,
                 rot=rots.get(i, 0.0),
-                defects=plan.for_line(i).kinds(),
             )
         )
 
-    return line_defects.apply_ink(plan, out, job, _image_size(bg), rng)
+    return out

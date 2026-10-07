@@ -312,7 +312,7 @@ def test_a_disabled_class_drops_the_box_but_still_draws_the_character(make_job):
     job = make_job(lines=("12",))
 
     for c in job.classes:
-        if c.name in ("2", "2_fail"):
+        if c.name == "2":
             c.enabled = False
 
     result = render(job, 0)
@@ -322,14 +322,28 @@ def test_a_disabled_class_drops_the_box_but_still_draws_the_character(make_job):
     assert (result.image.min(axis=2) < BG_LEVEL - 10).sum() > 0
 
 
-def test_a_defective_character_is_labelled_with_its_fail_class(make_job):
+def test_a_defective_character_keeps_its_class_and_gets_a_level(make_job):
+    """A missing dot scores 1, the worst there is: the top level, same class."""
     job = make_job(lines=("1",), defects=DefectSpec(max_missing=2, p_missing=1.0))
+    result = render(job, 0)
 
-    for c in job.classes:
-        if c.name == "1_fail":
-            c.min_defects = 2
+    assert [b[0] for b in result.boxes] == ["1", "line1"]
+    assert result.levels == [len(job.variation.levels) - 1, -1]
 
-    assert [b[0] for b in render(job, 0).boxes] == ["1_fail", "line1"]
+
+def test_levels_run_parallel_to_the_boxes_and_lines_get_minus_one(make_job):
+    result = render(make_job(lines=("12", "34")), 0)
+
+    assert len(result.levels) == len(result.boxes) == len(result.quads)
+
+    for (name, *_), level in zip(result.boxes, result.levels):
+        assert level == (-1 if name.startswith("line") else 0)
+
+
+def test_an_undamaged_job_is_all_level_zero(make_job):
+    result = render(make_job(lines=("12",)), 0)
+
+    assert result.meta["levels"] == {0: 2}
 
 
 def test_a_box_hanging_off_the_page_is_clipped_to_what_is_visible(make_job):

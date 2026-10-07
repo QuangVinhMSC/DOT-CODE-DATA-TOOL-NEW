@@ -1,9 +1,10 @@
 """Tab 6 -- Class definition.
 
-"Load class" reads Tab 4 and lists one pass class and one fail class per
-character (replacements included), plus one class per line.  Classes can be
-disabled or deleted; an enabled fail class needs a minimum defect count unless
-it is the character's only remaining class.
+"Load class" reads Tab 4 and lists one class per character (replacements
+included), plus one class per line.  Classes can be disabled or deleted.
+
+There are no fail classes: how defective a character is, is its defect level,
+which Tab 5 configures.
 """
 
 from __future__ import annotations
@@ -74,7 +75,8 @@ class Tab6Class(QWidget):
         note = QLabel(
             "Line classes are listed one per line - no opposite class is created. "
             "A line class can be deleted; that line is still drawn, just without a box. "
-            "Characters selected as replacements in Tab 4 also get classes."
+            "Characters selected as replacements in Tab 4 also get classes. "
+            "Defects are not classes: Tab 5 grades each character with a defect level."
         )
         note.setObjectName("hint")
         note.setWordWrap(True)
@@ -95,11 +97,7 @@ class Tab6Class(QWidget):
             self.statusMessage.emit("Define at least one character in Tab 4 first.")
             return
 
-        self.state.set_classes(
-            build_classes(
-                chars, self.state.lines, self.state.classes, self.state.line_defects
-            )
-        )
+        self.state.set_classes(build_classes(chars, self.state.lines, self.state.classes))
         self.statusMessage.emit(f"Loaded {len(self.state.classes)} classes from Tab 4.")
 
     def _on_class_changed(self, row: int, fields: dict) -> None:
@@ -124,7 +122,7 @@ class Tab6Class(QWidget):
         self._update_load_button()
 
         errors = (
-            validate_classes(self.state.classes, line_defects=self.state.line_defects)
+            validate_classes(self.state.classes)
             if self.state.classes
             else ["No classes loaded yet."]
         )

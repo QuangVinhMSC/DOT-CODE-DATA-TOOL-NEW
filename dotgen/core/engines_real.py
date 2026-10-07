@@ -23,6 +23,7 @@ from .models import (
     ComposedImage,
     CurveSpec,
     DefectSpec,
+    VariationSpec,
     DotModel,
     DotSequence,
     DotSample,
@@ -102,8 +103,9 @@ class RealRenderEngines(RealGeometryEngines):
         mode: Mode | None,
         rng: np.random.Generator,
         defects: DefectSpec | None = None,
+        variation: VariationSpec | None = None,
     ) -> RenderedChar:
-        return render_char.render_char(fmt, model, params, mode, rng, defects)
+        return render_char.render_char(fmt, model, params, mode, rng, defects, variation)
 
 
 class RealComposeEngines(RealRenderEngines):

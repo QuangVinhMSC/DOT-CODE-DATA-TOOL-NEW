@@ -25,6 +25,7 @@ from .models import (
     ROI,
     RenderedChar,
     DefectSpec,
+    VariationSpec,
 )
 from .params import ParamSet, RangeParam
 
@@ -77,6 +78,7 @@ class Engines(Protocol):
         mode: Mode | None,
         rng: np.random.Generator,
         defects: DefectSpec | None = None,
+        variation: VariationSpec | None = None,
     ) -> RenderedChar: ...
 
     # -- Phase 7 -------------------------------------------------------
@@ -244,6 +246,7 @@ class StubEngines:
         mode: Mode | None,
         rng: np.random.Generator,
         defects: DefectSpec | None = None,
+        variation: VariationSpec | None = None,
     ) -> RenderedChar:
         m: Mode = "mean" if mode is None else mode
         dist_h = params.value_for("dist.h", m, 12.0) or 12.0

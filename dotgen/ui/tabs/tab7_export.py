@@ -39,7 +39,6 @@ from ...core.exporter import (
     report_text,
     run_export,
 )
-from ...core.models import DEFECT_LABELS
 from ...core.state import AppState
 from .. import theme
 
@@ -128,12 +127,15 @@ class Tab7Export(QWidget):
         self.format_combo = QComboBox()
         self.format_combo.addItems(list(FORMATS))
         self.format_combo.setToolTip(
-            "yolo      -- axis-aligned:  <class> cx cy w h\n"
-            "yolo-obb  -- oriented:      <class> x1 y1 x2 y2 x3 y3 x4 y4\n\n"
-            "Both write the same images, folders and data.yaml; only the shape "
-            "of a label line differs. Characters are upright either way, so the "
-            "oriented format is what tilts a line's box with the surface it "
-            "sits on."
+            "yolo          -- axis-aligned:  <class> cx cy w h\n"
+            "yolo-obb      -- oriented:      <class> x1 y1 x2 y2 x3 y3 x4 y4\n"
+            "yolo-obb-3op  -- oriented + defect level:\n"
+            "                 <class> x1 y1 x2 y2 x3 y3 x4 y4 <level>\n\n"
+            "All write the same images and folders; only the label line differs.\n"
+            "yolo-obb-3op also adds nd and defect_names to data.yaml. A character's\n"
+            "level comes from its average dot score and the levels set in Tab 5;\n"
+            "lines get -1 (not labeled). Train it with the yolo-adjust-3op trainer\n"
+            "only -- stock ultralytics drops images with a tenth column."
         )
         self.format_combo.setCurrentText(self.state.export.fmt)
         self.format_combo.currentTextChanged.connect(self._set_format)
@@ -274,7 +276,7 @@ class Tab7Export(QWidget):
 
     def _save_job(self) -> None:
         errors = (
-            validate_classes(self.state.classes, line_defects=self.state.line_defects)
+            validate_classes(self.state.classes)
             if self.state.classes
             else ["no classes defined"]
         )
@@ -498,13 +500,16 @@ class Tab7Export(QWidget):
                 f"{len(job.classes)} class(es)"
             )
 
-            # A saved job's defects are otherwise invisible from here -- seeing
-            # them would mean loading it back into Tabs 1-6 and discarding
+            # A saved job's defect settings are otherwise invisible from here --
+            # seeing them would mean loading it back into Tabs 1-6 and discarding
             # whatever is being defined now.
-            kinds = job.line_defects.enabled_kinds()
+            v = job.variation
             item.setToolTip(
-                f"{job.name}\nDefects: "
-                + (", ".join(DEFECT_LABELS[k] for k in kinds) if kinds else "none")
+                f"{job.name}\n"
+                f"Dot variation: "
+                + (f"{v.p_dot:.0%} of dots ({v.distribution})" if v.any_enabled() else "off")
+                + f"\nDefect levels: "
+                + ", ".join(f"{lv.name} >= {lv.min_score:g}" for lv in v.levels)
             )
             self.job_list.addItem(item)
 
@@ -523,11 +528,10 @@ class Tab7Export(QWidget):
             self.export_hint.setText("Choose an output directory.")
         else:
             fmt = self.state.export.fmt
-            shape = (
-                "<class> x1 y1 x2 y2 x3 y3 x4 y4"
-                if fmt == "yolo-obb"
-                else "<class> cx cy w h"
-            )
+            shape = {
+                "yolo-obb": "<class> x1 y1 x2 y2 x3 y3 x4 y4",
+                "yolo-obb-3op": "<class> x1 y1 x2 y2 x3 y3 x4 y4 <defect level>",
+            }.get(fmt, "<class> cx cy w h")
             text = (
                 f"{len(self.state.jobs)} job(s) x {self.state.export.images_per_job} images "
                 f"= {len(self.state.jobs) * self.state.export.images_per_job} images, "

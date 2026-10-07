@@ -6,7 +6,8 @@ bounding-box controls: **Show bounding boxes**, which draws the labels this job
 would export, and **Box size**, one number of pixels added to every edge of
 every one of them.  They belong together and belong here -- a pad is a number
 you can only sensibly choose while looking at the boxes it moves.
-Right: lines, characters, replacements, spacings and the defective-dot settings.
+Right: lines, characters, replacements, spacings and the line rotation.  The
+defective-dot settings moved to Tab 5, with the rest of the defect setup.
 
 The Min / Mean / Max bars used to have a third column here.  They live in Tab 3
 now, next to the two frames that show what moving them does -- a handle you drag
@@ -40,7 +41,7 @@ from PySide6.QtWidgets import (
 from ...core import registry
 from ...core.imageops import load_image
 from ...core.layout import LayoutError
-from ...core.models import DEFECT_CLASS_PREFIX, DefectSpec, Quad
+from ...core.models import Quad
 from ...core.params import RangeParam
 from ...core.state import AppState
 from .. import theme
@@ -92,6 +93,8 @@ class Tab4Job(QWidget):
 
         state.backgroundsChanged.connect(self.refresh)
         state.linesChanged.connect(self.refresh)
+        # Tab 5's variation changes the dots this preview draws.
+        state.variationChanged.connect(lambda: self._preview_timer.start())
 
         # A bar emits on every mouse move of a drag and the preview composes a
         # full-size photograph, so the redraw waits for the hand to stop.
@@ -238,7 +241,6 @@ class Tab4Job(QWidget):
 
         lay.addWidget(box, 1)
         lay.addWidget(self._build_rotation())
-        lay.addWidget(self._build_defects())
         return w
 
     def _build_rotation(self) -> QWidget:
@@ -282,66 +284,6 @@ class Tab4Job(QWidget):
         p = self.state.params.get("line.rot")
 
         return p if p is not None else RangeParam("line.rot", "Line rotation", "deg")
-
-    def _build_defects(self) -> QWidget:
-        box = QGroupBox("Defective dots")
-        grid = QGridLayout(box)
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(3)
-
-        grid.addWidget(QLabel("Set a maximum to 0 to switch that type off."), 0, 0, 1, 4)
-
-        def spin_int(value: int, maximum: int = 99) -> QSpinBox:
-            s = QSpinBox()
-            s.setRange(0, maximum)
-            s.setValue(value)
-            s.valueChanged.connect(self._push_defects)
-            return s
-
-        def spin_float(value: float, maximum: float = 1.0, step: float = 0.01) -> QDoubleSpinBox:
-            s = QDoubleSpinBox()
-            s.setRange(0.0, maximum)
-            s.setDecimals(3)
-            s.setSingleStep(step)
-            s.setValue(value)
-            s.valueChanged.connect(self._push_defects)
-            return s
-
-        d = self.state.defects
-
-        grid.addWidget(QLabel("Type 1 - missing dots"), 1, 0)
-        grid.addWidget(QLabel("max / character"), 1, 1)
-        self.max_missing = spin_int(d.max_missing)
-        grid.addWidget(self.max_missing, 1, 2)
-        grid.addWidget(QLabel("probability per dot"), 1, 3)
-        self.p_missing = spin_float(d.p_missing)
-        grid.addWidget(self.p_missing, 1, 4)
-
-        grid.addWidget(QLabel("Type 2 - deformed dots"), 2, 0)
-        grid.addWidget(QLabel("max / character"), 2, 1)
-        self.max_deformed = spin_int(d.max_deformed)
-        grid.addWidget(self.max_deformed, 2, 2)
-        grid.addWidget(QLabel("probability per dot"), 2, 3)
-        self.p_deformed = spin_float(d.p_deformed)
-        grid.addWidget(self.p_deformed, 2, 4)
-
-        grid.addWidget(QLabel("Type 3 - strongly jittered dots"), 3, 0)
-        grid.addWidget(QLabel("max / character"), 3, 1)
-        self.max_jitter = spin_int(d.max_jitter)
-        grid.addWidget(self.max_jitter, 3, 2)
-        grid.addWidget(QLabel("probability per dot"), 3, 3)
-        self.p_jitter = spin_float(d.p_jitter)
-        grid.addWidget(self.p_jitter, 3, 4)
-
-        grid.addWidget(QLabel("jitter level"), 4, 3)
-        self.jitter_px = spin_float(d.jitter_px, maximum=50.0, step=0.5)
-        self.jitter_px.setSuffix(" px")
-        grid.addWidget(self.jitter_px, 4, 4)
-
-        note = QLabel("Defective dots are configured here and rendered from Phase 6 onward.")
-        note.setObjectName("hint")
-        grid.addWidget(note, 5, 0, 1, 5)
-        return box
 
     # ==================================================================
     # backgrounds
@@ -421,19 +363,6 @@ class Tab4Job(QWidget):
     def _add_line(self) -> None:
         self.state.add_line()
 
-    def _push_defects(self) -> None:
-        self.state.set_defects(
-            DefectSpec(
-                max_missing=self.max_missing.value(),
-                p_missing=self.p_missing.value(),
-                max_deformed=self.max_deformed.value(),
-                p_deformed=self.p_deformed.value(),
-                max_jitter=self.max_jitter.value(),
-                jitter_px=self.jitter_px.value(),
-                p_jitter=self.p_jitter.value(),
-            )
-        )
-
     # ==================================================================
     # refresh
     # ==================================================================
@@ -496,6 +425,7 @@ class Tab4Job(QWidget):
         """Background plus the characters and lines, drawn at its centre."""
         image = spec.array
         quads: list[tuple] = []
+        levels: list[int] = []
         alarm: str | None = None
 
         if image is not None and self.state.has_content():
@@ -507,6 +437,7 @@ class Tab4Job(QWidget):
                 )
                 image = composed.image
                 quads = list(composed.quads)
+                levels = list(composed.levels)
             except LayoutError:
                 alarm = (
                     f"Background #{self.active_bg + 1}: the dot code does not fit "
@@ -524,13 +455,13 @@ class Tab4Job(QWidget):
         self.canvas.set_image(image, keep_view=not first)
         self._shown_bg = self.active_bg
         self._sync_quad_overlay(spec, rebuilt=first)
-        self._sync_box_overlay(quads, image)
+        self._sync_box_overlay(quads, image, levels)
 
     def _set_fit_alarm(self, text: str | None) -> None:
         self.fit_alarm.setText(text or "")
         self.fit_alarm.setVisible(bool(text))
 
-    def _sync_box_overlay(self, quads, image) -> None:
+    def _sync_box_overlay(self, quads, image, levels=()) -> None:
         """The composed labels, drawn where they landed -- pad included.
 
         The polygons come back from ``compose`` already padded, so what is on
@@ -543,6 +474,9 @@ class Tab4Job(QWidget):
         this polygon's upright envelope, which is exactly what the drawn shape
         spans -- and on a job with no tilt the two are the same rectangle they
         always were.
+
+        A character above defect level 0 (Tab 5) is drawn amber, so damaged
+        characters can be spotted on the preview.
 
         Items are dropped one by one rather than through
         ``canvas.clear_overlays()``: the base quadrilateral shares this scene
@@ -558,7 +492,7 @@ class Tab4Job(QWidget):
 
         width, height = float(image.shape[1]), float(image.shape[0])
 
-        for name, *coords in quads:
+        for i_obj, (name, *coords) in enumerate(quads):
             item = QGraphicsPolygonItem(
                 QPolygonF(
                     [
@@ -567,7 +501,7 @@ class Tab4Job(QWidget):
                     ]
                 )
             )
-            defect = name.startswith(DEFECT_CLASS_PREFIX)
+            defect = i_obj < len(levels) and levels[i_obj] > 0
             item.setPen(cosmetic_pen(theme.WARN_AMBER if defect else theme.BOUND_BLUE))
             item.setZValue(20.0)
             self.canvas.add_overlay(item)

@@ -42,10 +42,10 @@ from typing import Iterable, Literal
 import cv2
 import numpy as np
 
-from . import curve, matrix, perspective, polygons
+from . import curve, dot_variation, matrix, perspective, polygons
 from .dot_pca import AREA_THRESHOLD, generate_pca_dot
 from .ink import shift_image
-from .models import CharFormat, DefectSpec, DotModel, RenderedChar
+from .models import CharFormat, DefectSpec, DotModel, RenderedChar, VariationSpec
 from .params import ParamSet, RangeParam
 
 Mode = Literal["mean", "min", "max"]
@@ -67,6 +67,11 @@ INK_FLOOR = 0.05
 # squashed anisotropically; either alone is too subtle to read as a defect.
 DEFORM_SIGMA_BOOST = 3.0
 DEFORM_SCALE_RANGE = (0.8, 1.3)
+
+# Fixed variation scores of the two outright dot defects (Tab 5).  A varied dot
+# is scored by dot_variation instead; a jittered one is not scored at all.
+MISSING_SCORE = 1.0
+DEFORMED_SCORE = 0.1
 
 # Fallback units, used only when the key is absent or non-positive: a pitch of
 # zero would pile every dot of the character on one spot.
@@ -530,9 +535,7 @@ def ink_points(ink: np.ndarray, ox: float = 0.0, oy: float = 0.0) -> np.ndarray:
 
     Corners rather than centres: pixel ``i`` occupies ``[i, i + 1]``, so a box
     that stopped at ``xs.max()`` would stop half way through the pixel it was
-    fitted to.  :mod:`~dotgen.core.line_defects` reads the ink it has just cut
-    or bled through the same function, so every box in the project is closed
-    onto ink the same way.
+    fitted to.
 
     Only the convex hull of the inked pixels is returned, which loses nothing:
     the callers use these points to take a maximum of ``n . p`` over them, and
@@ -602,8 +605,12 @@ def render_char(
     mode: Mode | None,
     rng: np.random.Generator,
     defects: DefectSpec | None = None,
+    variation: VariationSpec | None = None,
 ) -> RenderedChar:
     """Render ``fmt`` into an ink map, with its bbox and its dot centres.
+
+    ``variation`` (Tab 5) distorts randomly chosen dots; every dot is scored,
+    and their average comes back as ``score`` (jittered dots left out).
 
     ``mode`` picks min / mean / max off every bar; ``None`` draws each bar
     afresh from its range, which is how the exporter varies one character
@@ -627,6 +634,12 @@ def render_char(
     ref = _reference_patch(model, radius)
     gain = _ink_gain(params, ref, mode, rng)
     size_gain = _size_gain(params, np.clip(ref * gain, 0.0, 1.0), mode, rng)
+
+    # A varied dot may grow a tail, so its canvas -- and the character's
+    # margin -- is sized for the longest tail the settings allow.
+    vary = variation is not None and variation.any_enabled()
+    vary_radius = dot_variation.required_radius(variation, ref) if vary else radius
+    radius = max(radius, vary_radius)
 
     # A dot grown by ``dot.area`` needs a wider frame or its rim is clipped.
     if size_gain > 1.0:
@@ -696,8 +709,15 @@ def render_char(
     dot_centers: list[tuple[float, float]] = []
     placed: list[tuple[float, float, np.ndarray]] = []
 
+    # One score per dot; the character's score is their *average* (an untouched
+    # dot counts as 0).  A missing dot scores MISSING_SCORE, a deformed one
+    # DEFORMED_SCORE, a varied one what dot_variation measures.  Jittered dots
+    # are left out of the average altogether -- for now they are not graded.
+    scores: list[float] = []
+
     for i in range(n):
         if i in plan.missing:
+            scores.append(MISSING_SCORE)
             continue
 
         if model is not None:
@@ -706,8 +726,22 @@ def render_char(
         else:
             patch = fallback
 
+        score = 0.0
+
         if i in plan.deformed:
             patch = _deform(patch, plan.scales[i])
+            score = DEFORMED_SCORE
+
+        # ``rng`` is only touched when variation is on, so every job without it
+        # renders exactly as it did before the feature existed.
+        if vary and rng.random() < variation.p_dot:
+            patch, varied, _ = dot_variation.vary_dot(patch, variation, rng, vary_radius)
+            score = max(score, varied)
+
+        jx, jy = (float(v) for v in plan.jitter[i])
+
+        if not (jx or jy):
+            scores.append(score)
 
         if size_gain != 1.0:
             patch = _resize_dot(patch, size_gain)
@@ -738,4 +772,5 @@ def render_char(
         bbox=_measure_bbox(ink),
         defects=dict(plan.counts),
         quad=quad,
+        score=float(np.mean(scores)) if scores else 0.0,
     )

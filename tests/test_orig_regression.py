@@ -115,27 +115,17 @@ def test_the_saved_fit_still_reproduces_orig_png(measured_iou):
     assert round(measured_iou, PLACES) == round(expected, PLACES) == 0.636
 
 
-def test_the_dataset_job_declares_no_line_defects(at_repo_root):
+def test_the_dataset_job_declares_no_dot_variation(at_repo_root):
     """``make_dataset`` builds the fitted job, and the fitted job is undamaged.
 
     The IoU above is only evidence about the default path if the job it scores
     is on the default path.  This is that premise, asserted rather than assumed:
-    ``plan_defects`` returns an empty plan for this job and touches no ``rng``.
+    variation is off, so :mod:`render_char` never draws from ``rng`` for it.
     """
     import make_dataset
-
-    import numpy as np
-
-    from dotgen.core.line_defects import plan_defects
 
     state = make_dataset.build_state()
     state.jobs = []
     job = state.save_job("regression")
 
-    assert job.line_defects.enabled_kinds() == []
-
-    rng = np.random.default_rng(0)
-    before = rng.bit_generator.state
-
-    assert plan_defects(job, rng).lines == {}
-    assert rng.bit_generator.state == before
+    assert job.variation.any_enabled() is False

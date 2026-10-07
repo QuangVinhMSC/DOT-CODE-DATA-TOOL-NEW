@@ -4,11 +4,14 @@ Everything that knows what a YOLO folder looks like lives here: the directory
 layout, ``data.yaml``, the numbers of a label line, the split assignment and the
 report.  :mod:`exporter` drives it; the GUI drives :mod:`exporter`.
 
-Two label formats share all of that.  ``yolo`` writes the axis-aligned
+Three label formats share all of that.  ``yolo`` writes the axis-aligned
 ``<cls> cx cy w h``; ``yolo-obb`` writes ultralytics' oriented
-``<cls> x1 y1 x2 y2 x3 y3 x4 y4``.  Only the label line differs: same folders,
-same ``data.yaml``, same class indices, same images -- so a dataset can be
-re-exported in the other format without renumbering anything, and the report
+``<cls> x1 y1 x2 y2 x3 y3 x4 y4``; ``yolo-obb-3op`` writes the oriented line
+plus a tenth number, the object's defect level (``-1`` for a line, which is not
+graded), and adds ``nd`` / ``defect_names`` to ``data.yaml`` -- the layout
+``yolo-adjust-3op/data-form.md`` specifies.  Otherwise the label line is all
+that differs: same folders, same class indices, same images -- so a dataset can
+be re-exported in another format without renumbering anything, and the report
 counts the same objects either way.
 
 Three properties this module exists to guarantee:
@@ -54,8 +57,9 @@ SPLITS = ("train", "val", "test")
 
 # What ``spec.fmt`` may be.  The GUI's format list and the pre-flight both read
 # this, so adding a format here is the only place it has to be named.
-FORMATS = ("yolo", "yolo-obb")
+FORMATS = ("yolo", "yolo-obb", "yolo-obb-3op")
 OBB = "yolo-obb"
+OBB_3OP = "yolo-obb-3op"
 
 # The golden-ratio sequence spreads image indices over the splits evenly even
 # for a handful of images; a plain ``index % 100`` would put a 6-image export
@@ -69,6 +73,7 @@ __all__ = [
     "FORMATS",
     "GOLDEN",
     "OBB",
+    "OBB_3OP",
     "SPLITS",
     "image_seed",
     "label_lines",
@@ -103,10 +108,10 @@ class ExportReport:
     requested: int = 0
     class_counts: dict[str, int] = field(default_factory=dict)
     split_counts: dict[str, int] = field(default_factory=dict)
-    # Lines hit per defect kind over the whole run, summed off each composed
-    # image's ``meta["line_defects"]``.  Not derivable from ``class_counts``: a
-    # line that fired two kinds carries the class of only the first of them.
-    line_defects: dict[str, int] = field(default_factory=dict)
+    # Defect levels (``yolo-obb-3op`` only): their names, and per split how
+    # many labelled objects carry each level -- ``-1`` included.
+    defect_levels: list[str] = field(default_factory=list)
+    level_counts: dict[str, dict[int, int]] = field(default_factory=dict)
     skipped: list[dict] = field(default_factory=list)
     elapsed: float = 0.0
     cancelled: bool = False
@@ -120,6 +125,17 @@ class ExportReport:
     def skipped_images(self) -> int:
         return int(sum(int(s.get("count", 0)) for s in self.skipped))
 
+    @property
+    def val_missing_levels(self) -> list[str]:
+        """Defect levels no val object carries -- data-form.md requires every
+        level in val, because the thresholds are checked there."""
+        if not self.defect_levels:
+            return []
+
+        val = self.level_counts.get("val", {})
+
+        return [n for k, n in enumerate(self.defect_levels) if not val.get(k)]
+
     def to_dict(self) -> dict:
         return {
             "out_dir": self.out_dir,
@@ -131,7 +147,11 @@ class ExportReport:
             "requested": self.requested,
             "class_counts": dict(self.class_counts),
             "split_counts": dict(self.split_counts),
-            "line_defects": dict(self.line_defects),
+            "defect_levels": list(self.defect_levels),
+            "level_counts": {
+                s: {str(k): n for k, n in sorted(c.items())} for s, c in self.level_counts.items()
+            },
+            "val_missing_levels": self.val_missing_levels,
             "empty_classes": self.empty_classes,
             "skipped": list(self.skipped),
             "skipped_images": self.skipped_images,
@@ -219,30 +239,40 @@ def quads_for(composed) -> list[tuple]:
     return [(name, *quad_from_box(box)) for name, *box in composed.boxes]
 
 
-def obb_label_lines(quads: Iterable[tuple], index: dict[str, int]) -> list[str]:
+def obb_label_lines(
+    quads: Iterable[tuple], index: dict[str, int], levels: Sequence[int] | None = None
+) -> list[str]:
     """``"<idx> x1 y1 x2 y2 x3 y3 x4 y4"`` per quad, in ultralytics' OBB format.
+
+    With ``levels`` (parallel to ``quads``) each line gets a tenth number, the
+    object's defect level -- the ``yolo-obb-3op`` line.  A quad with no level
+    (a producer that does not grade) gets ``-1``, data-form.md's "not labeled".
 
     Same rule as :func:`label_lines` for a class that is not in the index: the
     object stays drawn and goes unlabelled rather than shifting the numbering.
     """
     out: list[str] = []
 
-    for name, *coords in quads:
+    for i, (name, *coords) in enumerate(quads):
         if name not in index:
             continue
 
-        out.append(
-            f"{index[name]} " + " ".join(f"{_clip01(v):.6f}" for v in coords)
-        )
+        line = f"{index[name]} " + " ".join(f"{_clip01(v):.6f}" for v in coords)
+
+        if levels is not None:
+            line += f" {int(levels[i]) if i < len(levels) else -1}"
+
+        out.append(line)
 
     return out
 
 
-def write_data_yaml(out_dir: str, names: list[str]) -> str:
+def write_data_yaml(out_dir: str, names: list[str], defect_names: Sequence[str] | None = None) -> str:
     """The dataset descriptor ``ultralytics`` reads.  Returns its path.
 
-    The same file serves both formats -- an OBB dataset is told apart by the
-    task, not the descriptor -- so nothing here depends on ``spec.fmt``.
+    The same file serves ``yolo`` and ``yolo-obb`` -- an OBB dataset is told
+    apart by the task, not the descriptor.  ``defect_names`` (``yolo-obb-3op``)
+    adds ``nd`` and ``defect_names``, as data-form.md specifies.
 
     No ``path:`` key, deliberately.  ``ultralytics`` resolves a *relative*
     ``path`` against its own global datasets directory -- so the obvious
@@ -264,6 +294,13 @@ def write_data_yaml(out_dir: str, names: list[str]) -> str:
         for i, name in enumerate(names):
             fh.write(f"  {i}: {_yaml_scalar(name)}\n")
 
+        if defect_names:
+            fh.write(f"nd: {len(defect_names)}\n")
+            fh.write("defect_names:\n")
+
+            for i, name in enumerate(defect_names):
+                fh.write(f"  {i}: {_yaml_scalar(name)}\n")
+
     return path
 
 
@@ -277,6 +314,25 @@ def _yaml_scalar(name: str) -> str:
         return name
 
     return '"' + name.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def shared_defect_levels(jobs: Sequence[Job]) -> list[str]:
+    """The one set of defect level names every job agrees on.
+
+    Raises ``ValueError`` when two jobs define different levels -- a dataset
+    has a single ``nd``, and level 2 must mean the same thing in every label.
+    """
+    names = jobs[0].variation.level_names() if jobs else []
+
+    for job in jobs[1:]:
+        if job.variation.level_names() != names:
+            raise ValueError(
+                f"Job '{job.name}' defines different defect levels "
+                f"({', '.join(job.variation.level_names())}) from '{jobs[0].name}' "
+                f"({', '.join(names)}).  yolo-obb-3op needs one set for the whole dataset."
+            )
+
+    return names
 
 
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -312,8 +368,12 @@ def write_dataset(
     """Write every job into one YOLO dataset under ``spec.out_dir``.
 
     ``spec.fmt`` picks the label format -- ``"yolo"`` for axis-aligned boxes,
-    ``"yolo-obb"`` for oriented ones.  Everything else about the run, the images
-    included, is identical between the two.
+    ``"yolo-obb"`` for oriented ones, ``"yolo-obb-3op"`` for oriented ones with
+    a defect level.  Everything else about the run, the images included, is
+    identical between them.
+
+    ``yolo-obb-3op`` needs every job to define the same defect levels (names,
+    in order): one dataset has one ``nd``.
 
     ``progress(done, total)`` is called once per attempted image and returns
     ``False`` to cancel; the partial directory left behind is consistent (every
@@ -339,14 +399,16 @@ def write_dataset(
         raise ValueError("No enabled classes in any job.")
 
     index = class_index(names)
-    obb = spec.fmt == OBB
+    graded = spec.fmt == OBB_3OP
+    obb = spec.fmt in (OBB, OBB_3OP)
+    defect_names = shared_defect_levels(jobs) if graded else []
     started = time.perf_counter()
 
     for split in SPLITS:
         os.makedirs(os.path.join(out_dir, "images", split), exist_ok=True)
         os.makedirs(os.path.join(out_dir, "labels", split), exist_ok=True)
 
-    write_data_yaml(out_dir, names)
+    write_data_yaml(out_dir, names, defect_names or None)
 
     report = ExportReport(
         out_dir=out_dir,
@@ -356,6 +418,8 @@ def write_dataset(
         class_counts={n: 0 for n in names},
         split_counts={s: 0 for s in SPLITS},
         seed=int(spec.seed),
+        defect_levels=list(defect_names),
+        level_counts={s: {} for s in SPLITS} if graded else {},
     )
 
     stems = _stems(jobs)
@@ -410,8 +474,10 @@ def write_dataset(
 
             split = split_of(done, spec.split)
             name = f"{stem}_{bg_index}_{n:05d}"
+            quads = quads_for(composed)
+            levels = list(composed.levels) if graded else None
             lines = (
-                obb_label_lines(quads_for(composed), index)
+                obb_label_lines(quads, index, levels)
                 if obb
                 else label_lines(composed.boxes, index)
             )
@@ -434,8 +500,13 @@ def write_dataset(
                 if box[0] in report.class_counts:
                     report.class_counts[box[0]] += 1
 
-            for kind, n_lines in composed.meta.get("line_defects", {}).items():
-                report.line_defects[kind] = report.line_defects.get(kind, 0) + int(n_lines)
+            if graded:
+                counts = report.level_counts[split]
+
+                for i, (name, *_c) in enumerate(quads):
+                    if name in index:
+                        lv = int(levels[i]) if i < len(levels) else -1
+                        counts[lv] = counts.get(lv, 0) + 1
 
             done += 1
 

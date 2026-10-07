@@ -38,11 +38,10 @@ A line's quad is the minimum-area rectangle over the *character quads* on it,
 not over their rectangles: fitting to upright boxes would put the line's own
 corners back out where the characters' corners were not.
 
-*The two defect tallies are counted apart.*  ``meta["defects"]`` counts damaged
-**dots**, summed off every character; ``meta["line_defects"]`` counts damaged
-**lines**, one per kind per line it fired on.  They are different units of
-different failures and adding them together would be meaningless, which is why
-they never share a key.
+*Every label carries a defect level.*  ``levels`` runs parallel to ``boxes``
+and ``quads``: a character's level comes from its average dot score (Tab 5); a
+line gets ``-1``, data-form.md's "not labeled".  ``meta["defects"]`` counts the
+damaged dots, ``meta["levels"]`` the labelled characters per level.
 
 Numpy and OpenCV only.
 """
@@ -176,15 +175,13 @@ def compose(job: Job, bg_index: int, rng: np.random.Generator) -> ComposedImage:
 
     boxes: list[tuple[str, float, float, float, float]] = []
     quads: list[tuple[str, ...]] = []
+    levels: list[int] = []
     defect_totals: dict[str, int] = {}
-    line_totals: dict[str, int] = {}
+    level_totals: dict[int, int] = {}
     n_chars = 0
 
     for line in lines:
         drawn: list[np.ndarray] = []
-
-        for kind in line.defects:
-            line_totals[kind] = line_totals.get(kind, 0) + 1
 
         for char in line.chars:
             rect = _paste_rect(image, char)
@@ -204,17 +201,8 @@ def compose(job: Job, bg_index: int, rng: np.random.Generator) -> ComposedImage:
                 box, corners = label
                 boxes.append((char.cls_name, *box))
                 quads.append((char.cls_name, *corners))
-
-        # Ink that belongs to the line but is not a character: an ``ink_cover``
-        # smear.  It is pasted after the characters, so it lies over them the way
-        # it did on the label, and it joins ``drawn`` -- the smear is part of what
-        # went wrong with that line, and the line's box has to cover it.  It is
-        # deliberately not counted in ``n_chars``: nothing was printed here.
-        for (ox, oy), ink in line.overlays:
-            paste_ink_rect(image, ox, oy, ink)
-            drawn.append(
-                polygons.rect(ox, oy, float(ink.shape[1]), float(ink.shape[0]))
-            )
+                levels.append(int(char.level))
+                level_totals[char.level] = level_totals.get(char.level, 0) + 1
 
         if not drawn or line.cls_name is None:
             continue
@@ -225,11 +213,14 @@ def compose(job: Job, bg_index: int, rng: np.random.Generator) -> ComposedImage:
             box, corners = label
             boxes.append((line.cls_name, *box))
             quads.append((line.cls_name, *corners))
+            # Lines are not graded: -1 is data-form.md's "not labeled".
+            levels.append(-1)
 
     return ComposedImage(
         image=image,
         boxes=boxes,
         quads=quads,
+        levels=levels,
         meta={
             "bg_index": bg_index,
             "background": bg.path,
@@ -238,6 +229,6 @@ def compose(job: Job, bg_index: int, rng: np.random.Generator) -> ComposedImage:
             "lines": len(lines),
             "scale": lines[0].scale if lines else 1.0,
             "defects": defect_totals,
-            "line_defects": line_totals,
+            "levels": level_totals,
         },
     )

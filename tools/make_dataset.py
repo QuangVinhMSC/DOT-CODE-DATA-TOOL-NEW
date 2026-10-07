@@ -11,7 +11,6 @@ import argparse, json, os, sys, time
 import numpy as np
 
 from dotgen.core import io_config
-from dotgen.core.classes import FAIL_SUFFIX
 from dotgen.core.dot_pca import build_pca_model, dot_params
 from dotgen.core.exporter import ExportError, preflight, run_export, report_text
 from dotgen.core.models import CharFormat, CharSpec, ClassDef, LineGap, LineSpec
@@ -84,9 +83,8 @@ def build_state() -> AppState:
     ]
     state.line_gaps = [LineGap(1, 2, float(GEOM["gap"]))]
 
-    # -- Tab 5: character classes + line classes, no NG (_fail) classes ---
-    keep = [c for c in state.classes
-            if c.kind in ("char_pass", "line") and not c.name.endswith(FAIL_SUFFIX)]
+    # -- Tab 6: character classes + line classes ---------------------------
+    keep = [c for c in state.classes if c.kind in ("char_pass", "line")]
     for c in keep:
         c.enabled = True
     # The blank slot is a character of the job, so the validator wants a class
@@ -94,7 +92,7 @@ def build_state() -> AppState:
     # at an existing class keeps the exported class list to characters + lines.
     host = next(c for c in keep if c.kind == "char_pass")
     keep.append(ClassDef(name=host.name, kind="char_pass", enabled=True,
-                         min_defects=None, source_char=SPACE))
+                         source_char=SPACE))
     state.classes = keep
     return state
 

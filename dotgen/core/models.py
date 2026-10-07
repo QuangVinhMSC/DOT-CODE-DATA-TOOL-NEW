@@ -15,7 +15,9 @@ import numpy as np
 from .params import Mode, ParamSet
 
 Axis = Literal["h", "v"]
-ClassKind = Literal["char_pass", "char_fail", "line"]
+# "char_fail" classes are gone: a character's defect is its defect *level*
+# (Tab 5), written beside the class rather than as a second class.
+ClassKind = Literal["char_pass", "line"]
 
 
 # ======================================================================
@@ -608,243 +610,130 @@ class DefectSpec:
 
 
 # ======================================================================
-# Line-level defects (Tab 5 "Defect generation")
+# Dot variation and defect levels (Tab 5)
 # ======================================================================
 #
-# Not to be confused with ``DefectSpec`` above.  That one is Tab 4's and
-# damages individual *dots* inside a character -- a dot that did not fire, a
-# dot that landed askew.  The structures below damage whole *lines*: a print
-# head that lifted, a wet label that was touched, a web that slipped under the
-# head.  The two are configured in different tabs, applied by different modules
-# and produce different classes; keep them apart.
+# ``DefectSpec`` above damages chosen dots outright (missing / deformed /
+# jittered).  ``VariationSpec`` changes the *shape* of chosen dots -- see
+# :mod:`~dotgen.core.dot_variation` for the tools.  Both are scored on one
+# scale, and a character's average dot score picks its defect level, which the
+# ``yolo-obb-3op`` export writes as the tenth column of its label line.
 
 
-# The line-level defect kinds, in the order they are offered in the tab and in
-# the order that decides which class a line carries when two of them fire.
-DEFECT_KINDS = (
-    "top_loss",
-    "bottom_loss",
-    "ink_cover",
-    "char_loss",
-    "collapse_all",
-    "collapse_side",
-    "squeeze",
-)
+# The variation tools, in the order they are drawn and applied.  Changing the
+# order renumbers every random draw, so append rather than insert.
+VARIATION_TOOLS = ("wavy", "warp", "tail", "pale", "grain")
 
-DEFECT_LABELS = {
-    "top_loss":      "Top of line lost",
-    "bottom_loss":   "Bottom of line lost",
-    "ink_cover":     "Ink smear over characters",
-    "char_loss":     "Characters missing",
-    "collapse_all":  "Whole line collapsed",
-    "collapse_side": "One side collapsed",
-    "squeeze":       "Line horizontally squeezed",
-}
-
-DEFECT_CLASS_PREFIX = "line_"
-
-# The kinds whose ``span`` is forced to 1.0 -- the whole line, always.  A
-# half-collapsed "whole line collapsed" is a contradiction, and a squeeze that
-# narrowed only part of a line would tear it in two.
-DEFECT_FULL_SPAN = ("collapse_all", "squeeze")
-
-# The kinds that have no side to be anchored to.
-DEFECT_NO_SIDE = ("top_loss", "bottom_loss", "squeeze")
-
-DEFECT_SIDES = ("left", "right", "random")
-
-# The default ``amount`` / ``span`` range of each kind, as ``(amount, span)``.
-#
-# Phase 1 gave every kind the same ``(0.2, 0.5)`` pair because no kind had been
-# rendered yet.  These are the fitted replacements: ``tools/df_lines_sheet.py``
-# composes one panel per kind beside the photograph it is meant to reproduce,
-# and each pair below is the range whose panel matches its photograph.  The
-# span of a kind in ``DEFECT_FULL_SPAN`` is never read -- it is stored so the
-# tab and the serialised form keep one shape for all seven kinds -- but it is
-# still drawn, so changing it renumbers nothing.
-DEFECT_RANGES: dict[str, tuple[tuple[float, float], tuple[float, float]]] = {
-    #                  amount          span
-    "top_loss":      ((0.30, 0.55), (0.55, 1.00)),
-    "bottom_loss":   ((0.25, 0.50), (0.60, 1.00)),
-    "ink_cover":     ((0.85, 1.00), (0.08, 0.18)),
-    "char_loss":     ((0.20, 0.50), (0.20, 0.45)),
-    "collapse_all":  ((0.05, 0.20), (1.00, 1.00)),
-    "collapse_side": ((0.08, 0.25), (0.20, 0.40)),
-    "squeeze":       ((0.45, 0.75), (1.00, 1.00)),
-}
-
-# What a kind not in the table gets.  An eighth kind added without a measured
-# range still loads and still renders; it is simply not fitted yet.
-DEFECT_RANGE_FALLBACK = ((0.2, 0.5), (0.2, 0.5))
-
-
-def defect_range(kind: str) -> tuple[tuple[float, float], tuple[float, float]]:
-    """``(amount, span)`` defaults for ``kind``."""
-    return DEFECT_RANGES.get(kind, DEFECT_RANGE_FALLBACK)
-
-
-def defect_class_name(kind: str) -> str:
-    """The line class a fired ``kind`` gives its line."""
-    return DEFECT_CLASS_PREFIX + kind
+VARIATION_DISTRIBUTIONS = ("uniform", "normal")
 
 
 @dataclass
-class LineDefect:
-    """One defect kind's settings.
+class DefectLevel:
+    """One defect level: a dot score at or above ``min_score`` reaches it."""
 
-    ``amount`` and ``span`` mean different things per kind -- the table is
-    below and repeated in the tab's tooltips, because a shared pair of ranges
-    is what keeps the settings panel and the serialised form from growing seven
-    near-identical shapes.
+    name: str
+    min_score: float = 0.0
 
-    =============  =========================================  ========================================  =========================
-    kind           ``amount``                                 ``span``                                  ``side``
-    =============  =========================================  ========================================  =========================
-    top_loss       fraction of glyph height removed from the  fraction of the line's length affected    ignored
-                   top (0.15-0.6)                             (1.0 = the whole line)
-    bottom_loss    the same, measured from the bottom         as above                                  ignored
-    ink_cover      peak ink of the blob, 0..1 (0.85-1.0 for   fraction of the line's length the blob     which end the blob starts
-                   ``coverink.png``)                          covers                                    from
-    char_loss      ignored                                    fraction of the line's characters removed  which end the removed run
-                                                                                                        is anchored to
-    collapse_all   residual pitch factor ``k`` (0.05 = a      forced to 1.0                             direction collapsed toward
-                   hard blob, 0.3 = merely crowded)
-    collapse_side  residual pitch factor ``k``                fraction of the line collapsed            direction
-    squeeze        horizontal scale factor (0.35-0.7)         forced to 1.0                             ignored
-    =============  =========================================  ========================================  =========================
+    def to_dict(self) -> dict:
+        return {"name": self.name, "min_score": float(self.min_score)}
 
-    The character-level contract that goes with this: a character a defect
-    touches carries ``PlacedChar.defect = kind`` (the field arrives with the
-    geometry stage) and therefore no class of its own.  It is still drawn and
-    still counts toward its line's box -- it is on the page.
+    @staticmethod
+    def from_dict(d: dict) -> "DefectLevel":
+        return DefectLevel(str(d["name"]), float(d.get("min_score", 0.0)))
+
+
+def default_levels() -> list[DefectLevel]:
+    return [DefectLevel("ok", 0.0), DefectLevel("minor", 0.02), DefectLevel("severe", 0.06)]
+
+
+@dataclass
+class VariationSpec:
+    """Tab 5's dot variation and defect-level settings.
+
+    ``p_dot`` is the chance any one dot is varied; a varied dot goes through
+    every tool, each with a value drawn in ``[0, max]`` from ``distribution``.
+    The tool maxima are in the units :mod:`~dotgen.core.dot_variation` lists.
+
+    ``levels`` sorts a character's average dot score into a defect level: level
+    ``k`` is the highest whose ``min_score`` the score reaches.  Level 0 always
+    starts at 0, so every character has a level.
     """
 
-    kind: str
-    enabled: bool = False
-    p_line: float = 0.0                        # chance this kind hits any one line
-    max_lines: int = 1                         # cap on lines hit per image
-    amount: tuple[float, float] | None = None  # uniform draw, meaning per kind
-    span: tuple[float, float] | None = None    # fraction of the line covered
-    side: str = "random"                       # "left" | "right" | "random"
+    p_dot: float = 0.0
+    distribution: str = "uniform"
+    wavy: float = 0.08
+    warp: float = 0.6
+    tail: float = 0.8
+    pale: float = 0.3
+    grain: float = 0.15
+    levels: list[DefectLevel] = field(default_factory=default_levels)
 
-    def __post_init__(self) -> None:
-        """Fill the two ranges the caller left out from :data:`DEFECT_RANGES`.
+    def any_enabled(self) -> bool:
+        """True when dots can actually be varied -- and only then is ``rng`` used."""
+        return self.p_dot > 0.0 and any(getattr(self, t) > 0.0 for t in VARIATION_TOOLS)
 
-        ``None`` rather than a shared literal default because the fitted range
-        differs per kind, and a dataclass cannot otherwise tell "the caller
-        wants this kind's default" from "the caller wants 0.2 to 0.5".
-        """
-        amount, span = defect_range(self.kind)
+    def level_of(self, score: float) -> int:
+        """The defect level of a character whose dots average ``score``."""
+        level = 0
 
-        if self.amount is None:
-            self.amount = amount
+        for k, lv in enumerate(self.levels):
+            if k > 0 and score >= lv.min_score:
+                level = k
 
-        if self.span is None:
-            self.span = span
+        return level
 
-        self.amount = (float(self.amount[0]), float(self.amount[1]))
-        self.span = (float(self.span[0]), float(self.span[1]))
+    def level_names(self) -> list[str]:
+        return [lv.name for lv in self.levels]
 
-    def sample_amount(self, rng) -> float:
-        lo, hi = self.amount
-        return float(rng.uniform(min(lo, hi), max(lo, hi)))
+    def validate(self) -> list[str]:
+        """Problems that make the levels unusable for ``yolo-obb-3op``."""
+        errors: list[str] = []
 
-    def sample_span(self, rng) -> float:
-        """The span of one firing; 1.0 for the kinds that force it.
+        if len(self.levels) < 2:
+            errors.append("Define at least two defect levels.")
 
-        The draw is consumed either way, so forcing a span does not renumber
-        the kinds drawn after this one.
-        """
-        lo, hi = self.span
-        drawn = float(rng.uniform(min(lo, hi), max(lo, hi)))
+        names = [lv.name.strip() for lv in self.levels]
 
-        return 1.0 if self.kind in DEFECT_FULL_SPAN else drawn
+        if any(not n for n in names):
+            errors.append("Every defect level needs a name.")
 
-    def sample_side(self, rng) -> str:
-        """Resolves ``"random"`` to left or right.  Always consumes one draw."""
-        pick = "left" if rng.random() < 0.5 else "right"
+        if len(set(names)) != len(names):
+            errors.append("Defect level names must be different.")
 
-        return self.side if self.side in ("left", "right") else pick
+        for k in range(1, len(self.levels)):
+            if self.levels[k].min_score <= self.levels[k - 1].min_score:
+                errors.append(
+                    f"Level '{self.levels[k].name}' must start at a higher score than "
+                    f"'{self.levels[k - 1].name}' -- levels are ordered by severity."
+                )
+
+        return errors
+
+    def copy(self) -> "VariationSpec":
+        return VariationSpec.from_dict(self.to_dict())
 
     def to_dict(self) -> dict:
         return {
-            "kind": self.kind,
-            "enabled": self.enabled,
-            "p_line": self.p_line,
-            "max_lines": self.max_lines,
-            "amount": list(self.amount),
-            "span": list(self.span),
-            "side": self.side,
+            "p_dot": float(self.p_dot),
+            "distribution": self.distribution,
+            **{t: float(getattr(self, t)) for t in VARIATION_TOOLS},
+            "levels": [lv.to_dict() for lv in self.levels],
         }
 
     @staticmethod
-    def from_dict(d: dict) -> "LineDefect":
-        base = LineDefect(kind=d["kind"])
+    def from_dict(d: dict | None) -> "VariationSpec":
+        d = d or {}
+        base = VariationSpec()
+        dist = str(d.get("distribution", base.distribution))
+        levels = [DefectLevel.from_dict(x) for x in d.get("levels", [])] or default_levels()
+        levels[0].min_score = 0.0
 
-        return LineDefect(
-            kind=base.kind,
-            enabled=bool(d.get("enabled", base.enabled)),
-            p_line=float(d.get("p_line", base.p_line)),
-            max_lines=int(d.get("max_lines", base.max_lines)),
-            amount=tuple(float(x) for x in d.get("amount", base.amount)),
-            span=tuple(float(x) for x in d.get("span", base.span)),
-            side=str(d.get("side", base.side)),
+        return VariationSpec(
+            p_dot=float(d.get("p_dot", base.p_dot)),
+            distribution=dist if dist in VARIATION_DISTRIBUTIONS else base.distribution,
+            **{t: float(d.get(t, getattr(base, t))) for t in VARIATION_TOOLS},
+            levels=levels,
         )
-
-
-@dataclass
-class LineDefectSpec:
-    """Every kind's settings, keyed by kind.
-
-    Always holds all of DEFECT_KINDS so the tab can render a row per kind
-    without None-checking, and so a job written before a kind existed loads
-    with that kind disabled rather than absent.
-    """
-
-    defects: dict[str, LineDefect] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        for k in DEFECT_KINDS:
-            self.defects.setdefault(k, LineDefect(kind=k))
-
-    def get(self, kind: str) -> LineDefect:
-        return self.defects[kind]
-
-    def enabled_kinds(self) -> list[str]:
-        """DEFECT_KINDS order, filtered to enabled with ``p_line > 0`` and
-        ``max_lines > 0`` -- the same predicate the planner uses, so the class
-        list can never advertise a class the planner cannot produce."""
-        out: list[str] = []
-
-        for k in DEFECT_KINDS:
-            d = self.defects.get(k)
-
-            if d is not None and d.enabled and d.p_line > 0.0 and d.max_lines > 0:
-                out.append(k)
-
-        return out
-
-    def any_enabled(self) -> bool:
-        return bool(self.enabled_kinds())
-
-    def to_dict(self) -> dict:
-        return {k: self.defects[k].to_dict() for k in DEFECT_KINDS}
-
-    @staticmethod
-    def from_dict(d: dict) -> "LineDefectSpec":
-        src = d or {}
-        out: dict[str, LineDefect] = {}
-
-        for k in DEFECT_KINDS:
-            entry = src.get(k)
-            out[k] = (
-                LineDefect.from_dict(dict(entry, kind=k))
-                if isinstance(entry, dict)
-                else LineDefect(kind=k)
-            )
-
-        return LineDefectSpec(out)
-
 
 @dataclass
 class CharSpec:
@@ -1102,8 +991,6 @@ class ClassDef:
     name: str
     kind: ClassKind
     enabled: bool = True
-    min_defects: int | None = None
-    line_result: Literal["pass", "fail"] = "pass"
     source_char: str = ""
 
     def to_dict(self) -> dict:
@@ -1111,23 +998,52 @@ class ClassDef:
             "name": self.name,
             "kind": self.kind,
             "enabled": self.enabled,
-            "min_defects": self.min_defects,
-            "line_result": self.line_result,
             "source_char": self.source_char,
         }
 
     @staticmethod
     def from_dict(d: dict) -> "ClassDef":
-        return ClassDef(**d)
+        # Older configs also carry ``min_defects`` / ``line_result`` (the fail
+        # classes' settings); they are ignored rather than refused.
+        return ClassDef(
+            name=d["name"],
+            kind=d["kind"],
+            enabled=bool(d.get("enabled", True)),
+            source_char=str(d.get("source_char", "")),
+        )
+
+
+def is_retired_class(d: ClassDef | dict) -> bool:
+    """A class an older config may still list that no longer exists.
+
+    The per-character ``*_fail`` classes became defect levels, and the line
+    defect classes (``line_top_loss`` ...) went with the line-defect engine.
+    Loading a config drops them, so an export never lists a class nothing can
+    produce.
+    """
+    kind = d["kind"] if isinstance(d, dict) else d.kind
+    name = d["name"] if isinstance(d, dict) else d.name
+
+    return kind == "char_fail" or (kind == "line" and name in RETIRED_LINE_CLASSES)
+
+
+RETIRED_LINE_CLASSES = frozenset(
+    "line_" + k
+    for k in (
+        "top_loss", "bottom_loss", "ink_cover", "char_loss",
+        "collapse_all", "collapse_side", "squeeze",
+    )
+)
 
 
 @dataclass
 class ExportSpec:
     # "yolo" is the axis-aligned detection format (one box per line, five
     # numbers); "yolo-obb" is ultralytics' oriented format (four corners, eight
-    # numbers).  Both share the same ``data.yaml`` and the same class indices,
-    # so the choice is only about the shape of a label line.
-    fmt: Literal["yolo", "yolo-obb"] = "yolo"
+    # numbers); "yolo-obb-3op" is yolo-obb plus a tenth number, the defect
+    # level, and ``nd`` / ``defect_names`` in ``data.yaml`` (data-form.md).
+    # All share the same class indices.
+    fmt: Literal["yolo", "yolo-obb", "yolo-obb-3op"] = "yolo"
     out_dir: str = ""
     images_per_job: int = 100
     seed: int = 1234
@@ -1164,7 +1080,7 @@ class Job:
     lines: list[LineSpec] = field(default_factory=list)
     line_gaps: list[LineGap] = field(default_factory=list)
     defects: DefectSpec = field(default_factory=DefectSpec)
-    line_defects: LineDefectSpec = field(default_factory=LineDefectSpec)
+    variation: VariationSpec = field(default_factory=VariationSpec)
     classes: list[ClassDef] = field(default_factory=list)
     # Pixels added to every edge of every label box -- characters and lines
     # alike -- when :mod:`compose` writes it out.  0 is the measured ink box,
@@ -1198,7 +1114,7 @@ class Job:
             "lines": [l.to_dict() for l in self.lines],
             "line_gaps": [g.to_dict() for g in self.line_gaps],
             "defects": self.defects.to_dict(),
-            "line_defects": self.line_defects.to_dict(),
+            "variation": self.variation.to_dict(),
             "classes": [c.to_dict() for c in self.classes],
             "box_pad": self.box_pad,
         }
@@ -1216,8 +1132,8 @@ class Job:
             lines=[LineSpec.from_dict(l) for l in d["lines"]],
             line_gaps=[LineGap.from_dict(g) for g in d["line_gaps"]],
             defects=DefectSpec.from_dict(d["defects"]),
-            line_defects=LineDefectSpec.from_dict(d.get("line_defects") or {}),
-            classes=[ClassDef.from_dict(c) for c in d["classes"]],
+            variation=VariationSpec.from_dict(d.get("variation")),
+            classes=[ClassDef.from_dict(c) for c in d["classes"] if not is_retired_class(c)],
             box_pad=float(d.get("box_pad", 0.0)),
         )
 
@@ -1240,6 +1156,10 @@ class RenderedChar:
 
     ``quad`` is ``None`` only from an engine that does not model orientation --
     the stub one -- and every consumer falls back to ``bbox``'s corners there.
+
+    ``score`` is the character's average dot score: 0 for an untouched dot, 1
+    for a missing one, 0.1 for a deformed one, the measured distortion for a
+    varied one; jittered dots are left out.  It decides the defect level.
     """
 
     ink: np.ndarray  # float32 HxW 0..1
@@ -1248,6 +1168,7 @@ class RenderedChar:
     bbox: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
     defects: dict = field(default_factory=dict)
     quad: np.ndarray | None = None  # (4, 2) float64, ink-canvas coordinates
+    score: float = 0.0
 
     @property
     def defect_count(self) -> int:
@@ -1264,6 +1185,10 @@ class ComposedImage:
     ``yolo-obb`` without changing which objects get labelled or how the report
     counts them.  A producer that only knows axis-aligned boxes may leave it
     empty; the exporter then derives the corners from the boxes.
+
+    ``levels`` runs parallel to ``boxes`` too: each object's defect level,
+    ``-1`` where it is not labelled (lines).  Empty from a producer that does
+    not grade defects; the exporter then writes ``-1`` for everything.
     """
 
     image: np.ndarray  # BGR uint8
@@ -1272,3 +1197,4 @@ class ComposedImage:
         default_factory=list
     )
     meta: dict = field(default_factory=dict)
+    levels: list[int] = field(default_factory=list)

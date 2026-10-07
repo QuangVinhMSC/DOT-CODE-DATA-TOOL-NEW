@@ -690,17 +690,25 @@ def test_a_clean_character_carries_its_pass_class(make_job):
     assert [c.cls_name for c in chars] == ["1", "2"]
 
 
-def test_a_defective_character_carries_its_fail_class(make_job):
+def test_a_defective_character_keeps_its_class_and_averages_its_dots(make_job):
     job = make_job(lines=("1",), defects=DefectSpec(max_missing=2, p_missing=1.0))
-
-    for c in job.classes:
-        if c.name == "1_fail":
-            c.min_defects = 2
+    n_dots = len(job.char_formats["1"].dots)
 
     char = run(job, 0)[0].chars[0]
 
     assert char.defect_count == 2
-    assert char.cls_name == "1_fail"
+    assert char.cls_name == "1"
+    assert char.score == pytest.approx(2 * 1.0 / n_dots)  # two missing dots, averaged
+    assert char.level == job.variation.level_of(char.score)
+
+
+def test_a_varied_character_gets_the_level_of_its_score(make_job):
+    job = make_job(lines=("1234",))
+    job.variation.p_dot = 1.0
+
+    for char in all_chars(run(job, 3)):
+        assert char.score > 0.0
+        assert char.level == job.variation.level_of(char.score)
 
 
 def test_a_line_carries_its_own_class(make_job):

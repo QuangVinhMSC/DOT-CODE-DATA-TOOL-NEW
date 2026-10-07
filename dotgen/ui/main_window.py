@@ -52,7 +52,7 @@ TAB_TITLES = [
     "2 - Number matrix",
     "3 - Summary",
     "4 - Create job",
-    "5 - Defect generation",
+    "5 - Defect",
     "6 - Class definition",
     "7 - Save job and export",
 ]
@@ -110,7 +110,7 @@ class MainWindow(QMainWindow):
             self.state.charFormatsChanged,
             self.state.backgroundsChanged,
             self.state.linesChanged,
-            self.state.lineDefectsChanged,
+            self.state.variationChanged,
             self.state.classesChanged,
             self.state.jobsChanged,
         ):
@@ -418,9 +418,9 @@ class MainWindow(QMainWindow):
             "DOT-CODE-DATA-TOOL",
             "Synthetic dot-matrix character dataset generator.\n\n"
             "Seven tabs: sample the dots, draw the characters, check the\n"
-            "ranges, build the job, generate the defects, define the classes,\n"
-            "export the dataset.\n\n"
-            "PLAN.md phases 1-10 built the program.  plan2.md (phase 11) added\n"
-            "Tab 5's line-level defect generation and the classes that go with\n"
-            "it, and renumbered the two tabs after it.",
+            "ranges, build the job, vary the dots and set the defect levels,\n"
+            "define the classes, export the dataset.\n\n"
+            "Tab 5 distorts chosen dots, scores every dot, and grades each\n"
+            "character into a defect level -- the tenth column of the\n"
+            "yolo-obb-3op export.",
         )

@@ -32,13 +32,7 @@ from dotgen.core.exporter import (
     report_text,
     run_export,
 )
-from dotgen.core.models import (
-    DEFECT_LABELS,
-    ComposedImage,
-    ExportSpec,
-    Quad,
-    defect_class_name,
-)
+from dotgen.core.models import ComposedImage, ExportSpec, Quad
 
 
 # ----------------------------------------------------------------------
@@ -98,29 +92,10 @@ def image_files(out_dir) -> list[str]:
     return out
 
 
-# A quarter-size page.  The defect tests below export forty images through the
-# real engines, and the cost of that is the area of the page.
+# A quarter-size page.  The yolo-obb-3op tests below export through the real
+# engines, and the cost of that is the area of the page.
 SMALL = (320, 240)
 SMALL_QUAD = Quad([(30, 30), (290, 30), (290, 210), (30, 210)])
-
-
-def defect_job(make_job, kind: str, lines=("12",), **over):
-    """A job whose ``kind`` fires on every line, with a class list that says so.
-
-    ``p_line = 1.0`` and a ``max_lines`` past the line count is what makes the
-    label files predictable: every line of every image carries the defect, so
-    "some label file happens to have one" cannot pass by luck.
-    """
-    job = make_job(lines=lines, size=SMALL, quad=SMALL_QUAD)
-    defect = job.line_defects.get(kind)
-    defect.enabled, defect.p_line, defect.max_lines = True, 1.0, 9
-
-    for field_name, value in over.items():
-        setattr(defect, field_name, value)
-
-    job.classes = build_classes(job.characters(), job.lines, line_defects=job.line_defects)
-
-    return job
 
 
 def rows_of(path) -> list[list[str]]:
@@ -415,7 +390,7 @@ def test_two_jobs_share_one_class_index(make_job, tmp_path):
     names = read_yaml_names(tmp_path)
     index = class_index(names)
 
-    assert names == ["1", "2", "3", "1_fail", "2_fail", "3_fail", "line1"]
+    assert names == ["1", "2", "3", "line1"]
     assert sorted(index.values()) == list(range(len(names)))
 
     for path in label_files(tmp_path):
@@ -434,17 +409,17 @@ def test_every_box_is_a_character_or_a_line(make_job, tmp_path):
 def test_report_counts_every_class_and_flags_the_empty_ones(make_job, tmp_path):
     """Plan 8.5: an empty class silently shipped is the classic dataset bug."""
     job = make_job(("12",))
-    job.classes = build_classes(job.characters(), job.lines)
+    # A class for a character the job never draws: it can only ship empty.
+    job.classes = build_classes(job.characters() + ["9"], job.lines)
 
     report = write_dataset([job], spec_for(tmp_path, images_per_job=4))
 
     assert report.class_counts["1"] == 4
     assert report.class_counts["line1"] == 4
 
-    # No defects are configured, so the fail classes never fire -- and the
-    # report has to say so rather than let them ship as trained classes.
-    assert set(report.empty_classes) == {"1_fail", "2_fail"}
-    assert "1_fail" in report_text(report)
+    # The report has to say so rather than let it ship as a trained class.
+    assert report.empty_classes == ["9"]
+    assert "9" in report_text(report)
 
 
 def test_report_json_matches_the_report_object(make_job, tmp_path):
@@ -547,7 +522,7 @@ def test_disabled_classes_are_drawn_but_not_labelled(make_job, tmp_path):
 
     report = write_dataset([job], spec_for(tmp_path, images_per_job=2))
 
-    assert "2" not in report.classes and "2_fail" not in report.classes
+    assert "2" not in report.classes
     # per image: character '1' and the line; '2' is drawn with no box.
     assert report.boxes == 4
 
@@ -646,165 +621,166 @@ def test_empty_report_has_no_empty_class_noise():
 
 
 # ----------------------------------------------------------------------
-# line defects in the dataset (Phase 8)
+# yolo-obb-3op -- data-form.md
 # ----------------------------------------------------------------------
 
 
-def test_a_fired_defect_replaces_the_plain_line_class_in_every_label(make_job, tmp_path):
-    """The claim the feature is for: forty images, no undamaged line among them."""
-    job = defect_job(make_job, "ink_cover", lines=("12", "34"))
-    report = write_dataset([job], spec_for(tmp_path, images_per_job=40))
+def graded_job(make_job, p_dot=1.0, lines=("12",), **tools):
+    """A job whose every dot is varied, so higher defect levels really occur."""
+    job = make_job(lines=lines, size=SMALL, quad=SMALL_QUAD)
+    job.variation.p_dot = p_dot
 
-    names = read_yaml_names(tmp_path)
-    index = class_index(names)
-    smeared = str(index["line_ink_cover"])
-    plain = {str(index["line1"]), str(index["line2"])}
+    for name, value in tools.items():
+        setattr(job.variation, name, value)
 
-    assert report.images == 40
-    assert report.line_defects == {"ink_cover": 40 * len(job.lines)}
-
-    for path in label_files(tmp_path):
-        classes = {row[0] for row in rows_of(path)}
-
-        assert smeared in classes
-        assert not (classes & plain)
-
-    # And the plain classes say so afterwards, rather than shipping empty.
-    assert {"line1", "line2"} <= set(report.empty_classes)
+    return job
 
 
-def test_no_character_a_defect_touched_is_labelled_anywhere_in_the_export(
-    make_job, tmp_path
-):
-    """plan2.md 9.5: the first label rule, asserted over a whole dataset.
+def read_yaml_block(out_dir, key) -> list[str]:
+    """The values of one ``key:`` mapping block of data.yaml."""
+    out: list[str] = []
+    inside = False
 
-    ``squeeze`` is the kind that proves it hardest, because it touches *every*
-    character of the line it fires on -- so a correct export of forty images has
-    no character row in it at all, only the line's own. One escaped box in one
-    image of forty fails this; a per-image unit test can only say that the one
-    image it looked at was clean.
+    for raw in (out_dir / "data.yaml").read_text(encoding="utf-8").splitlines():
+        if raw.startswith(f"{key}:"):
+            inside = True
+            continue
 
-    The characters are still drawn and still inside the line's box: that is what
-    the second assertion is for. A rule implemented by not drawing the character
-    would pass the first one and be wrong.
-    """
-    job = defect_job(make_job, "squeeze", lines=("1234", "5678"), amount=(0.5, 0.5))
-    report = write_dataset([job], spec_for(tmp_path, images_per_job=40))
+        if inside:
+            if not raw.startswith("  "):
+                break
 
-    names = read_yaml_names(tmp_path)
-    index = class_index(names)
-    squeezed = str(index["line_squeeze"])
+            value = raw.split(":", 1)[1].strip()
+            out.append(value[1:-1] if value.startswith('"') else value)
 
-    assert report.line_defects == {"squeeze": 40 * len(job.lines)}
-
-    for path in label_files(tmp_path):
-        rows = rows_of(path)
-
-        assert rows, f"{path} is empty"
-        assert {row[0] for row in rows} == {squeezed}
-        assert len(rows) == len(job.lines)
-
-    # Every character class the job could have produced ships empty, which is
-    # the same fact seen from the report rather than from the label files.
-    assert set("12345678") <= set(report.empty_classes)
+    return out
 
 
-def test_data_yaml_lists_the_defect_classes_unquoted(make_job, tmp_path):
-    """``line_ink_cover`` is a plain YAML identifier; quoting it would be noise."""
-    job = defect_job(make_job, "ink_cover")
-    write_dataset([job], spec_for(tmp_path, images_per_job=2))
+def test_yolo_obb_3op_is_an_export_format():
+    assert "yolo-obb-3op" in FORMATS
 
-    names = read_yaml_names(tmp_path)
+
+def test_obb_label_lines_append_the_defect_level():
+    quads = [("1", *quad_from_box((0.5, 0.5, 0.1, 0.2))), ("line1", *quad_from_box((0.5, 0.5, 0.4, 0.3)))]
+    index = {"1": 0, "line1": 1}
+
+    assert [len(l.split()) for l in obb_label_lines(quads, index)] == [9, 9]
+
+    lines = obb_label_lines(quads, index, [2, -1])
+    assert [l.split()[-1] for l in lines] == ["2", "-1"]
+    assert all(len(l.split()) == 10 for l in lines)
+
+    # A producer that did not grade: -1, "not labeled".
+    assert [l.split()[-1] for l in obb_label_lines(quads, index, [])] == ["-1", "-1"]
+
+
+def test_a_3op_export_follows_data_form(make_job, tmp_path):
+    """Every rule of data-form.md's checklist that a single export can show."""
+    # 10 % of dots: some characters stay untouched (level 0), some do not.  With
+    # every dot varied, a character's worst dot is nearly always the top level.
+    job = graded_job(make_job, p_dot=0.1, lines=("12", "34"))
+    report = write_dataset([job], spec_for(tmp_path, images_per_job=12, fmt="yolo-obb-3op"))
+
     text = (tmp_path / "data.yaml").read_text(encoding="utf-8")
+    names = read_yaml_names(tmp_path)
+    nd = len(job.variation.levels)
 
-    assert "line_ink_cover" in names
-    assert f"  {names.index('line_ink_cover')}: line_ink_cover" in text
+    assert f"nd: {nd}" in text
+    assert read_yaml_block(tmp_path, "defect_names") == job.variation.level_names()
+    assert f"nc: {len(names)}" in text
+
+    line_classes = {str(i) for i, n in enumerate(names) if n.startswith("line")}
+    seen_levels = set()
+
+    for path in label_files(tmp_path):
+        for row in rows_of(path):
+            assert len(row) == 10
+            cls, coords, level = int(row[0]), [float(v) for v in row[1:9]], int(row[9])
+
+            assert 0 <= cls < len(names)
+            assert all(-0.01 <= v <= 1.01 for v in coords)
+            assert -1 <= level < nd
+
+            if row[0] in line_classes:
+                assert level == -1  # lines are not graded
+            else:
+                assert level >= 0
+                seen_levels.add(level)
+
+    assert report.defect_levels == job.variation.level_names()
+    assert len(seen_levels) > 1, "10 % of dots varied, yet only one level appeared"
 
 
-def test_the_report_and_its_json_carry_the_line_defect_counts(make_job, tmp_path):
-    job = defect_job(make_job, "squeeze", lines=("1234",), amount=(0.4, 0.4))
-    report = write_dataset([job], spec_for(tmp_path, images_per_job=5))
+def test_the_report_counts_levels_per_split(make_job, tmp_path):
+    job = graded_job(make_job)
+    report = write_dataset([job], spec_for(tmp_path, images_per_job=10, fmt="yolo-obb-3op"))
     data = json.loads((tmp_path / "export_report.json").read_text(encoding="utf-8"))
 
-    assert report.line_defects == {"squeeze": 5}
-    assert data["line_defects"] == {"squeeze": 5}
-    assert "Line defects: squeeze 5" in report_text(report)
+    rows = [int(r[9]) for p in label_files(tmp_path) for r in rows_of(p)]
+    counted = sum(n for split in report.level_counts.values() for n in split.values())
+
+    assert counted == len(rows)
+    assert data["defect_levels"] == job.variation.level_names()
+    assert set(data["level_counts"]) == {"train", "val", "test"}
+    assert "defect levels" in report_text(report)
 
 
-def test_a_report_with_no_defects_says_nothing_about_them(make_job, tmp_path):
-    report = write_dataset([make_job(("12",))], spec_for(tmp_path, images_per_job=2))
+def test_a_level_missing_from_val_is_reported(make_job, tmp_path):
+    """Nothing varied: every character is level 0, so val lacks the others."""
+    job = graded_job(make_job, p_dot=0.0)
+    report = write_dataset([job], spec_for(tmp_path, images_per_job=6, fmt="yolo-obb-3op"))
 
-    assert report.line_defects == {}
-    assert "Line defects" not in report_text(report)
-
-
-def test_preflight_refuses_a_defect_that_has_no_class(make_job, tmp_path):
-    """The mistake this feature makes possible: armed in Tab 5, never loaded in Tab 6."""
-    job = make_job(("12",))
-    defect = job.line_defects.get("top_loss")
-    defect.enabled, defect.p_line = True, 1.0
-
-    errors = preflight([job], spec_for(tmp_path))
-
-    assert len(errors) == 1
-    assert DEFECT_LABELS["top_loss"] in errors[0]
-    assert job.name in errors[0]
-
-    with pytest.raises(ExportError):
-        run_export([job], spec_for(tmp_path))
+    assert report.val_missing_levels == job.variation.level_names()[1:]
+    assert "missing from val" in report_text(report)
 
 
-def test_preflight_warns_when_a_defect_will_almost_never_fire(make_job, tmp_path):
-    """A warning, not an error: the export is legal, the class will just be empty."""
-    job = defect_job(make_job, "top_loss", p_line=0.01)
-    spec = spec_for(tmp_path, images_per_job=4)
+def test_plain_obb_is_unchanged_by_the_levels(make_job, tmp_path):
+    job = graded_job(make_job)
+    report = write_dataset([job], spec_for(tmp_path, images_per_job=3, fmt="yolo-obb"))
 
-    warnings = preflight_warnings([job], spec)
+    assert report.defect_levels == [] and report.level_counts == {}
+    assert "nd:" not in (tmp_path / "data.yaml").read_text(encoding="utf-8")
 
-    assert preflight([job], spec) == []
-    assert len(warnings) == 1
-    assert DEFECT_LABELS["top_loss"] in warnings[0]
-    assert defect_class_name("top_loss") in warnings[0]
-
-    # One line, forty images: forty expected firings, nothing to warn about.
-    assert preflight_warnings([job], spec_for(tmp_path, images_per_job=400)) == []
+    for path in label_files(tmp_path):
+        assert all(len(r) == 9 for r in rows_of(path))
 
 
-def test_preflight_warns_about_nothing_when_no_defect_is_armed(make_job, tmp_path):
-    assert preflight_warnings([make_job(("12",))], spec_for(tmp_path)) == []
+def test_preflight_refuses_unusable_levels(make_job, tmp_path):
+    job = graded_job(make_job)
+    job.variation.levels[2].min_score = job.variation.levels[1].min_score  # not rising
+
+    errors = preflight([job], spec_for(tmp_path, fmt="yolo-obb-3op"))
+    assert len(errors) == 1 and "Tab 5" in errors[0]
+
+    # The same levels are fine for a format that does not write them.
+    assert preflight([job], spec_for(tmp_path, fmt="yolo-obb")) == []
 
 
-def test_a_defect_export_is_byte_identical_when_re_exported(make_job, tmp_path):
+def test_preflight_refuses_jobs_with_different_levels(make_job, tmp_path):
+    a, b = graded_job(make_job), graded_job(make_job)
+    b.name = "other"
+    b.variation.levels[1].name = "light"
+
+    errors = preflight([a, b], spec_for(tmp_path, fmt="yolo-obb-3op"))
+    assert any("one set of levels" in e for e in errors)
+
+
+def test_preflight_warns_when_nothing_can_be_damaged(make_job, tmp_path):
+    job = graded_job(make_job, p_dot=0.0)
+
+    warnings = preflight_warnings([job], spec_for(tmp_path, fmt="yolo-obb-3op"))
+    assert len(warnings) == 1 and "level 0" in warnings[0]
+
+    assert preflight_warnings([graded_job(make_job)], spec_for(tmp_path, fmt="yolo-obb-3op")) == []
+    assert preflight_warnings([job], spec_for(tmp_path, fmt="yolo-obb")) == []
+
+
+def test_a_3op_export_is_byte_identical_when_re_exported(make_job, tmp_path):
     """The property most at risk: an ``rng`` drawn in the wrong order."""
     a, b = tmp_path / "a", tmp_path / "b"
 
-    write_dataset([defect_job(make_job, "ink_cover", lines=("12", "34"))], spec_for(a, seed=77))
-    write_dataset([defect_job(make_job, "ink_cover", lines=("12", "34"))], spec_for(b, seed=77))
+    write_dataset([graded_job(make_job, lines=("12", "34"))], spec_for(a, seed=77, fmt="yolo-obb-3op"))
+    write_dataset([graded_job(make_job, lines=("12", "34"))], spec_for(b, seed=77, fmt="yolo-obb-3op"))
 
     for pa, pb in zip(image_files(a) + label_files(a), image_files(b) + label_files(b)):
         assert open(pa, "rb").read() == open(pb, "rb").read()
-
-
-def test_an_obb_label_of_a_collapsed_line_is_a_real_quad(make_job, tmp_path):
-    """One merged blob is one degenerate-looking point set -- and must not be."""
-    job = defect_job(
-        make_job, "collapse_all", lines=("1234",), amount=(0.05, 0.05), side="left"
-    )
-    report = write_dataset([job], spec_for(tmp_path, images_per_job=3, fmt="yolo-obb"))
-
-    assert report.line_defects == {"collapse_all": 3}
-
-    for path in label_files(tmp_path):
-        rows = rows_of(path)
-
-        assert rows
-
-        for row in rows:
-            assert len(row) == 9
-
-            xs = [float(v) for v in row[1::2]]
-            ys = [float(v) for v in row[2::2]]
-
-            assert all(0.0 <= v <= 1.0 for v in xs + ys)
-            assert max(xs) > min(xs)
-            assert max(ys) > min(ys)

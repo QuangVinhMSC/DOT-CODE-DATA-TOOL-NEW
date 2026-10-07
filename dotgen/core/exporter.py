@@ -15,8 +15,8 @@ from __future__ import annotations
 import os
 
 from .classes import validate_classes
-from .export_yolo import FORMATS, ExportReport, Progress, write_dataset
-from .models import DEFECT_LABELS, ExportSpec, Job, defect_class_name
+from .export_yolo import FORMATS, OBB_3OP, ExportReport, Progress, write_dataset
+from .models import ExportSpec, Job
 
 __all__ = [
     "ExportError",
@@ -60,11 +60,12 @@ def preflight(jobs: list[Job], spec: ExportSpec) -> list[str]:
         )
 
     for job in jobs:
-        # ``job.line_defects`` is what makes an enabled defect with no enabled
-        # class an error; the check lives in ``validate_classes`` so the class
-        # tab and the export refuse for the same reason, in the same words.
-        for e in validate_classes(job.classes, job.characters(), job.line_defects):
+        for e in validate_classes(job.classes, job.characters()):
             errors.append(f"{job.name}: {e}")
+
+        if spec.fmt == OBB_3OP:
+            for e in job.variation.validate():
+                errors.append(f"{job.name}: {e} (Tab 5)")
 
         if not job.backgrounds:
             errors.append(f"{job.name}: no backgrounds -- nothing to draw on.")
@@ -79,6 +80,17 @@ def preflight(jobs: list[Job], spec: ExportSpec) -> list[str]:
                 f"{job.name}: no character format for {', '.join(repr(c) for c in missing)}."
             )
 
+    if spec.fmt == OBB_3OP and len(jobs) > 1:
+        first = jobs[0].variation.level_names()
+
+        for job in jobs[1:]:
+            if job.variation.level_names() != first:
+                errors.append(
+                    f"{job.name}: its defect levels ({', '.join(job.variation.level_names())}) "
+                    f"differ from {jobs[0].name}'s ({', '.join(first)}). "
+                    "yolo-obb-3op needs one set of levels for the whole dataset."
+                )
+
     return errors
 
 
@@ -89,29 +101,21 @@ def preflight_warnings(jobs: list[Job], spec: ExportSpec) -> list[str]:
     is a rare defect is still a valid export, and folding these into the error
     list would make the one list mean two things.
 
-    The check is the arithmetic a user does not do in their head.  A kind that
-    fires on ``p_line`` of the lines, over ``len(job.lines)`` lines and
-    ``images_per_job`` images, is expected to hit ``p_line * lines * images``
-    lines in total; below one, the class it labels will very likely have no box
-    anywhere in the finished dataset, and the four minutes have been spent
-    training nothing.  ``report.empty_classes`` says the same thing afterwards.
+    For ``yolo-obb-3op``: a job in which no dot can be damaged produces only
+    level 0, and data-form.md needs every level present in val.  The report's
+    ``val_missing_levels`` says the same thing afterwards, with real counts.
     """
     warnings: list[str] = []
-    images = max(int(spec.images_per_job), 0)
+
+    if spec.fmt != OBB_3OP:
+        return warnings
 
     for job in jobs:
-        n_lines = len(job.lines)
-
-        for kind in job.line_defects.enabled_kinds():
-            expected = job.line_defects.get(kind).p_line * n_lines * images
-
-            if expected < 1.0:
-                warnings.append(
-                    f"{job.name}: '{DEFECT_LABELS[kind]}' is expected to hit "
-                    f"{expected:.2f} line(s) over the whole run, so "
-                    f"'{defect_class_name(kind)}' will very likely be empty. "
-                    f"Raise its chance per line, or the images per job."
-                )
+        if not job.variation.any_enabled() and not job.defects.any_enabled():
+            warnings.append(
+                f"{job.name}: no dot variation or defective dots are enabled (Tab 5), "
+                "so every character will be level 0 -- the higher defect levels will be empty."
+            )
 
     return warnings
 
@@ -141,17 +145,20 @@ def report_text(report: ExportReport) -> str:
         "  " + "  ".join(f"{s}: {n}" for s, n in report.split_counts.items()),
     ]
 
-    if report.line_defects:
-        # Lines damaged per kind, worst first.  A kind that fired at all but
-        # whose class is still empty is a line that carried a higher-priority
-        # kind's class instead -- ``empty_classes`` below is where that shows.
-        lines.append(
-            "  Line defects: "
-            + ", ".join(
-                f"{k} {n}"
-                for k, n in sorted(report.line_defects.items(), key=lambda kv: (-kv[1], kv[0]))
+    if report.defect_levels:
+        for split in ("train", "val", "test"):
+            counts = report.level_counts.get(split, {})
+
+            if not counts:
+                continue
+
+            lines.append(
+                f"  {split} defect levels: "
+                + ", ".join(
+                    f"{report.defect_levels[k] if k >= 0 else 'unlabeled (-1)'} {counts[k]}"
+                    for k in sorted(counts)
+                )
             )
-        )
 
     if report.cancelled:
         lines.insert(
@@ -165,6 +172,13 @@ def report_text(report: ExportReport) -> str:
             "",
             "Classes with no boxes at all (they will train nothing):",
             "  " + ", ".join(report.empty_classes),
+        ]
+
+    if report.val_missing_levels:
+        lines += [
+            "",
+            "Defect levels missing from val (data-form.md needs every level there):",
+            "  " + ", ".join(report.val_missing_levels),
         ]
 
     if report.skipped:

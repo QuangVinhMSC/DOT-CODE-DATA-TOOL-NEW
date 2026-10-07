@@ -28,13 +28,13 @@ from .models import (
     DotSample,
     ExportSpec,
     Job,
-    LineDefectSpec,
     LineGap,
     LineSpec,
     Quad,
     SampleImage,
-    defect_class_name,
+    VariationSpec,
     is_blank_char,
+    is_retired_class,
 )
 from .params import Mode, ParamSet, default_params
 
@@ -55,7 +55,8 @@ class AppState(QObject):
     charFormatsChanged = Signal()
     backgroundsChanged = Signal()
     linesChanged = Signal()
-    lineDefectsChanged = Signal()
+    # Tab 5: dot variation, defective dots and defect levels.
+    variationChanged = Signal()
     classesChanged = Signal()
     jobsChanged = Signal()
     statusMessage = Signal(str)
@@ -87,7 +88,7 @@ class AppState(QObject):
         self.lines: list[LineSpec] = []
         self.line_gaps: list[LineGap] = []
         self.defects: DefectSpec = DefectSpec()
-        self.line_defects: LineDefectSpec = LineDefectSpec()
+        self.variation: VariationSpec = VariationSpec()
         # Pixels added to every edge of every label box -- see Job.box_pad.
         self.box_pad: float = 0.0
         self.classes: list[ClassDef] = []
@@ -632,8 +633,9 @@ class AppState(QObject):
             )
 
     def set_defects(self, defects: DefectSpec) -> None:
+        """Tab 5's defective dots (missing / deformed / jittered)."""
         self.defects = defects
-        self.linesChanged.emit()
+        self.variationChanged.emit()
 
     def set_box_pad(self, pad: float) -> None:
         """How much air every label box carries, in pixels.
@@ -670,36 +672,26 @@ class AppState(QObject):
         return any(line.chars for line in self.lines)
 
     # ==================================================================
-    # Tab 5 -- line-level defects
+    # Tab 5 -- dot variation and defect levels
     # ==================================================================
 
-    def set_line_defect(self, kind: str, **fields) -> None:
-        """Update one kind's settings and emit once.
+    def set_variation(self, spec: VariationSpec) -> None:
+        self.variation = spec.copy()
+        self.variationChanged.emit()
 
-        The tab sends whichever widgets moved, so a card that only toggled its
-        checkbox does not have to resend six spinboxes it never touched.
-        """
-        d = self.line_defects.get(kind)
-
+    def update_variation(self, **fields) -> None:
+        """Change some of the variation settings and emit once."""
         for k, v in fields.items():
-            setattr(d, k, v)
+            setattr(self.variation, k, v)
 
-        self.lineDefectsChanged.emit()
-
-    def set_line_defects(self, spec: LineDefectSpec) -> None:
-        self.line_defects = spec
-        self.lineDefectsChanged.emit()
-
-    def line_defect_classes(self) -> list[str]:
-        """The line classes the enabled kinds require, in DEFECT_KINDS order."""
-        return [defect_class_name(k) for k in self.line_defects.enabled_kinds()]
+        self.variationChanged.emit()
 
     # ==================================================================
-    # Tab 5 -- classes
+    # Tab 6 -- classes
     # ==================================================================
 
     def set_classes(self, classes: list[ClassDef]) -> None:
-        self.classes = list(classes)
+        self.classes = [c for c in classes if not is_retired_class(c)]
         self.classesChanged.emit()
 
     def remove_class(self, index: int) -> None:
@@ -721,9 +713,7 @@ class AppState(QObject):
     def classes_ready(self) -> bool:
         from .classes import validate_classes
 
-        return bool(self.classes) and not validate_classes(
-            self.classes, line_defects=self.line_defects
-        )
+        return bool(self.classes) and not validate_classes(self.classes)
 
     # ==================================================================
     # Tab 6 -- jobs
@@ -740,8 +730,8 @@ class AppState(QObject):
             lines=[LineSpec.from_dict(l.to_dict()) for l in self.lines],
             line_gaps=[g.copy() for g in self.line_gaps],
             defects=DefectSpec(**self.defects.to_dict()),
-            line_defects=LineDefectSpec.from_dict(self.line_defects.to_dict()),
-            classes=[ClassDef(**c.to_dict()) for c in self.classes],
+            variation=self.variation.copy(),
+            classes=[ClassDef.from_dict(c.to_dict()) for c in self.classes],
             box_pad=self.box_pad,
         )
 
@@ -782,8 +772,8 @@ class AppState(QObject):
         self.lines = [LineSpec.from_dict(l.to_dict()) for l in job.lines]
         self.line_gaps = [g.copy() for g in job.line_gaps]
         self.defects = DefectSpec(**job.defects.to_dict())
-        self.line_defects = LineDefectSpec.from_dict(job.line_defects.to_dict())
-        self.classes = [ClassDef(**c.to_dict()) for c in job.classes]
+        self.variation = job.variation.copy()
+        self.classes = [ClassDef.from_dict(c.to_dict()) for c in job.classes]
         self.box_pad = float(job.box_pad)
 
         self.emit_all()
@@ -804,7 +794,7 @@ class AppState(QObject):
         self.lines.clear()
         self.line_gaps.clear()
         self.defects = DefectSpec()
-        self.line_defects = LineDefectSpec()
+        self.variation = VariationSpec()
         self.classes.clear()
         self.box_pad = 0.0
         self.params = default_params()
@@ -826,6 +816,6 @@ class AppState(QObject):
         self.charFormatsChanged.emit()
         self.backgroundsChanged.emit()
         self.linesChanged.emit()
-        self.lineDefectsChanged.emit()
+        self.variationChanged.emit()
         self.classesChanged.emit()
         self.jobsChanged.emit()

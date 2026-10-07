@@ -14,7 +14,6 @@ from PySide6.QtGui import QFocusEvent, QMouseEvent
 
 from dotgen.core.models import (
     DEFAULT_SPACE_COEFF,
-    DEFECT_KINDS,
     SPACE_CHAR,
     CharFormat,
     DotLink,
@@ -89,7 +88,7 @@ def test_main_window_builds_seven_tabs(state):
     assert w.tabs.count() == 7
     assert w.tabs.tabText(0).startswith("1")
     assert w.tabs.tabText(6).startswith("7")
-    assert w.tabs.tabText(4) == "5 - Defect generation"
+    assert w.tabs.tabText(4) == "5 - Defect"
     assert w.tabs.tabText(5) == "6 - Class definition"
 
 
@@ -1438,18 +1437,10 @@ def test_tab4_puts_a_space_on_a_line_without_giving_it_a_class(state, background
     assert state.job_characters() == ["1", "2"]
 
 
-def test_tab4_defect_spinboxes_push_into_the_state(state):
+def test_tab4_has_no_defective_dot_controls_any_more(state):
     tab = Tab4Job(state)
 
-    tab.max_missing.setValue(2)
-    tab.p_missing.setValue(0.05)
-    tab.max_jitter.setValue(1)
-    tab.jitter_px.setValue(1.5)
-
-    assert state.defects.max_missing == 2
-    assert state.defects.p_missing == pytest.approx(0.05)
-    assert state.defects.jitter_px == pytest.approx(1.5)
-    assert state.defects.any_enabled()
+    assert not hasattr(tab, "max_missing")
 
 
 def test_tab4_box_pad_spinbox_pushes_into_the_state(state):
@@ -1558,93 +1549,153 @@ def prepare_job(state, backgrounds) -> None:
     state.add_char(1, "2")
 
 
-def test_tab5_defect_builds_a_card_for_every_kind(state):
+def test_tab5_controls_reach_the_state(state):
     tab = Tab5Defect(state)
 
-    assert list(tab.cards) == list(DEFECT_KINDS)
+    tab.p_dot.setValue(30.0)
+    tab.distribution.setCurrentIndex(tab.distribution.findData("normal"))
+    tab.tool_rows["wavy"].spin.setValue(0.05)
+    tab.tool_rows["tail"].slider.setValue(30)  # 30 * 0.05 = 1.5 radii
+
+    v = state.variation
+
+    assert v.p_dot == pytest.approx(0.30)
+    assert v.distribution == "normal"
+    assert v.wavy == pytest.approx(0.05)
+    assert v.tail == pytest.approx(1.5)
+    assert tab.tool_rows["tail"].spin.value() == pytest.approx(1.5)
 
 
-def test_tab5_ticking_a_card_reaches_the_state_once(state):
+def test_tab5_defective_dot_spinboxes_push_into_the_state(state):
+    """Moved here from Tab 4: every defect setting lives in one tab now."""
+    tab = Tab5Defect(state)
+
+    tab.max_missing.setValue(2)
+    tab.p_missing.setValue(0.05)
+    tab.max_jitter.setValue(1)
+    tab.jitter_px.setValue(1.5)
+
+    assert state.defects.max_missing == 2
+    assert state.defects.p_missing == pytest.approx(0.05)
+    assert state.defects.jitter_px == pytest.approx(1.5)
+    assert state.defects.any_enabled()
+
+
+def test_tab5_follows_a_state_change_it_did_not_make(state):
+    """A loaded configuration or a restored job has to show up in the controls."""
+    from dotgen.core.models import DefectLevel
+
+    tab = Tab5Defect(state)
+    state.update_variation(
+        p_dot=0.4, grain=0.2,
+        levels=[DefectLevel("ok"), DefectLevel("a", 0.1), DefectLevel("b", 0.2), DefectLevel("c", 0.4)],
+    )
+
+    assert tab.p_dot.value() == pytest.approx(40.0)
+    assert tab.tool_rows["grain"].spin.value() == pytest.approx(0.2)
+    assert tab.level_table.rowCount() == 4
+    assert tab.level_table.cellWidget(3, 1).text() == "c"
+
+
+def test_tab5_controls_do_not_echo_a_state_change_back(state):
     tab = Tab5Defect(state)
     fired = []
-    state.lineDefectsChanged.connect(lambda: fired.append(1))
+    state.variationChanged.connect(lambda: fired.append(1))
 
-    tab.cards["squeeze"].enable.setChecked(True)
+    state.update_variation(p_dot=0.4)
 
-    assert state.line_defects.get("squeeze").enabled is True
-    assert len(fired) == 1, "one tick is one change"
+    assert fired == [1], "syncing the widgets must not write the state again"
 
 
-def test_tab5_card_edits_reach_the_state(state):
+def test_tab5_levels_can_be_added_renamed_and_removed(state):
     tab = Tab5Defect(state)
-    card = tab.cards["ink_cover"]
+    assert tab.level_table.rowCount() == 3
+    assert tab.remove_level_button.isEnabled()
 
-    card.enable.setChecked(True)
-    card.p_line.setValue(0.4)
-    card.max_lines.setValue(2)
-    card.amount_lo.setValue(0.85)
-    card.amount_hi.setValue(1.0)
-    card.span_lo.setValue(0.3)
-    card.span_hi.setValue(0.6)
-    card.side.setCurrentIndex(card.side.findData("left"))
+    tab._add_level()
+    assert state.variation.level_names()[-1] == "level3"
+    assert state.variation.levels[3].min_score > state.variation.levels[2].min_score
 
-    d = state.line_defects.get("ink_cover")
+    name = tab.level_table.cellWidget(1, 1)
+    name.setText("scratched")
+    name.editingFinished.emit()
+    assert state.variation.levels[1].name == "scratched"
 
-    assert (d.enabled, d.p_line, d.max_lines) == (True, 0.4, 2)
-    assert d.amount == (0.85, 1.0)
-    assert d.span == (0.3, 0.6)
-    assert d.side == "left"
+    tab.level_table.cellWidget(2, 2).setValue(0.3)
+    assert state.variation.levels[2].min_score == pytest.approx(0.3)
+
+    tab._remove_level()
+    tab._remove_level()
+    assert len(state.variation.levels) == 2
+    assert tab.remove_level_button.isEnabled() is False, "two levels is the minimum"
+
+    tab._remove_level()
+    assert len(state.variation.levels) == 2
 
 
-def test_tab5_cards_follow_a_state_change_they_did_not_make(state):
-    """A loaded configuration or a restored job has to show up in the cards."""
+def test_tab5_number_of_levels_grows_and_shrinks_the_table(state):
     tab = Tab5Defect(state)
-    state.set_line_defect("char_loss", enabled=True, p_line=0.25, max_lines=3)
+    assert tab.level_count.value() == 3
 
-    card = tab.cards["char_loss"]
+    tab.level_count.setValue(5)
+    assert len(state.variation.levels) == 5
+    assert tab.level_table.rowCount() == 5
+    scores = [lv.min_score for lv in state.variation.levels]
+    assert scores == sorted(scores) and len(set(scores)) == 5, "new levels keep rising"
+    assert state.variation.validate() == []
 
-    assert card.enable.isChecked() is True
-    assert card.p_line.value() == pytest.approx(0.25)
-    assert card.max_lines.value() == 3
+    tab.level_count.setValue(2)
+    assert state.variation.level_names() == ["ok", "minor"], "the most severe go first"
+
+    assert tab.level_count.minimum() == 2
+    assert tab.add_level_button.isEnabled()
+    tab.level_count.setValue(tab.level_count.maximum())
+    assert tab.add_level_button.isEnabled() is False
 
 
-def test_tab5_summary_lists_the_extra_classes(state):
+def test_tab5_level_count_follows_a_loaded_config(state):
+    from dotgen.core.models import DefectLevel
+
+    tab = Tab5Defect(state)
+    state.update_variation(levels=[DefectLevel("ok"), DefectLevel("a", 0.1), DefectLevel("b", 0.2), DefectLevel("c", 0.3)])
+
+    assert tab.level_count.value() == 4
+
+def test_tab5_level_zero_always_starts_at_zero(state):
     tab = Tab5Defect(state)
 
-    assert "No defect kinds enabled" in tab.summary.text()
-
-    state.set_line_defect("squeeze", enabled=True, p_line=0.2, max_lines=1)
-    state.set_line_defect("ink_cover", enabled=True, p_line=0.2, max_lines=1)
-
-    text = tab.summary.text()
-
-    assert "2 defect kinds enabled" in text
-    assert "line_ink_cover, line_squeeze" in text, "DEFECT_KINDS order, not tick order"
+    assert tab.level_table.cellWidget(0, 2).isEnabled() is False
+    assert state.variation.levels[0].min_score == 0.0
 
 
-def test_tab5_warns_about_a_kind_that_can_never_fire(state):
+def test_tab5_shows_level_errors(state):
+    from dotgen.core.models import DefectLevel
+
     tab = Tab5Defect(state)
-    state.set_line_defect("top_loss", enabled=True, p_line=0.0)
+    state.update_variation(levels=[DefectLevel("ok"), DefectLevel("bad", 0.3), DefectLevel("worse", 0.2)])
 
-    assert "can never fire" in tab.banner.text()
+    assert "higher score" in tab.level_errors.text()
 
-    state.set_line_defect("top_loss", p_line=0.3)
+    state.update_variation(levels=[DefectLevel("ok"), DefectLevel("bad", 0.3)])
+
+    assert tab.level_errors.text() == ""
+
+
+def test_tab5_continuous_mode_is_not_offered_yet(state):
+    tab = Tab5Defect(state)
+
+    assert tab.mode_classes.isChecked()
+    assert tab.mode_continuous.isEnabled() is False
+
+
+def test_tab5_warns_when_nothing_can_be_damaged(state):
+    tab = Tab5Defect(state)
+
+    assert "level 0" in tab.banner.text()
+
+    state.update_variation(p_dot=0.2)
 
     assert tab.banner.text() == ""
-
-
-def test_tab5_warns_when_the_class_list_no_longer_matches(state, backgrounds):
-    from dotgen.core.classes import build_classes
-
-    tab = Tab5Defect(state)
-    prepare_job(state, backgrounds)
-    state.set_classes(build_classes(state.job_characters(), state.lines))
-
-    assert tab.banner.text() == ""
-
-    state.set_line_defect("squeeze", enabled=True, p_line=0.3, max_lines=1)
-
-    assert "Load class" in tab.banner.text()
 
 
 def test_tab5_preview_survives_an_empty_state(state):
@@ -1655,40 +1706,58 @@ def test_tab5_preview_survives_an_empty_state(state):
     assert tab.canvas.has_image() is False
 
 
-def test_tab5_preview_composes_the_job(state, backgrounds):
+def test_tab5_preview_composes_the_job_and_counts_its_levels(state, backgrounds):
     tab = Tab5Defect(state)
-    prepare_job(state, backgrounds)
+    exportable_job(state, backgrounds)  # with formats, so ink is drawn
     tab.refresh()
 
     assert tab.canvas.has_image()
-    assert tab.canvas.overlays == [], "no boxes until they are asked for"
+    assert len(tab.canvas.overlays) == 4, "2 characters + 2 lines, boxes on by default"
+    assert "2 characters" in tab.preview_counts.text()
+    assert "ok: 2" in tab.preview_counts.text()
+
+    tab.show_boxes.setChecked(False)
+    assert tab.canvas.overlays == []
 
 
-def test_tab5_draws_the_composed_boxes_where_they_landed(state, backgrounds):
-    """The one rule of this feature a picture alone cannot show: which boxes
-    survived, and which class the surviving line box carries."""
+def test_tab5_draws_the_boxes_coloured_by_level(state, backgrounds):
     tab = Tab5Defect(state)
     prepare_job(state, backgrounds)
     tab.refresh()
 
+    tab.canvas.clear_overlays()
     tab._draw_boxes(
         [
             ("1", 0.4, 0.45, 0.6, 0.45, 0.6, 0.55, 0.4, 0.55),
-            ("line_squeeze", 0.2, 0.4, 0.8, 0.4, 0.8, 0.6, 0.2, 0.6),
+            ("2", 0.1, 0.45, 0.3, 0.45, 0.3, 0.55, 0.1, 0.55),
+            ("line1", 0.2, 0.4, 0.8, 0.4, 0.8, 0.6, 0.2, 0.6),
         ],
+        [0, 2, -1],
         (640, 480),
     )
 
-    assert len(tab.canvas.overlays) == 2
+    assert len(tab.canvas.overlays) == 3
 
     rect = tab.canvas.overlays[0].polygon().boundingRect()
-
     assert (rect.x(), rect.y(), rect.width(), rect.height()) == (256.0, 216.0, 128.0, 48.0)
 
-    plain = tab.canvas.overlays[0].pen().color()
-    defect = tab.canvas.overlays[1].pen().color()
+    colours = [item.pen().color() for item in tab.canvas.overlays]
+    assert len({c.name() for c in colours}) == 3, "ok, severe and ungraded lines differ"
 
-    assert plain != defect, "a defect class is drawn apart from a character class"
+
+def test_tab5_example_strip_appears_once_there_is_a_dot_model(state, dotted_image, circle_roi):
+    from dotgen.core.registry import get_engines
+
+    tab = Tab5Defect(state)
+    assert tab.strip._pm is None
+
+    state.add_sample_image("orig.png", dotted_image)
+
+    for i in range(3):
+        state.add_dot_sample(get_engines().extract_dot(dotted_image, circle_roi((40 + i * 12, 40))))
+
+    tab._refresh_strip()
+    assert tab.strip._pm is not None
 
 
 def test_tab5_reroll_advances_the_preview_seed(state):
@@ -1712,8 +1781,8 @@ def test_tab6_load_class_builds_the_expected_list(state, backgrounds):
 
     names = [c.name for c in state.classes]
 
-    assert names == ["1", "1_fail", "2", "2_fail", "7", "7_fail", "line1", "line2"]
-    assert tab.summary.text() == "3 char classes + 3 fail classes + 2 line classes = 8 total"
+    assert names == ["1", "2", "7", "line1", "line2"]
+    assert tab.summary.text() == "3 char classes + 2 line classes = 5 total"
 
 
 def test_tab6_load_is_blocked_until_tab4_is_complete(state, backgrounds):
@@ -1830,7 +1899,7 @@ def test_tab7_writes_a_yolo_folder(state, backgrounds, monkeypatch, tmp_path):
     assert len(images) == len(labels)
 
     text = data_yaml.read_text(encoding="utf-8")
-    assert "nc: 8" in text
+    assert "nc: 5" in text  # 1, 2, 7 and the two lines
 
     for label in labels:
         for line in label.read_text(encoding="utf-8").splitlines():
@@ -1921,32 +1990,28 @@ def test_tab7_dataset_class_panel_lists_the_union(state, backgrounds, monkeypatc
     state.set_classes(build_classes(state.job_characters(), state.lines))
     tab._save_job()
 
-    assert tab.class_list.count() == 8
+    assert tab.class_list.count() == 5  # 1, 2, 7 and the two lines
     assert tab.class_list.item(0).text().endswith("1")
 
 
-def test_tab7_job_tooltip_names_the_enabled_defects(state, backgrounds, monkeypatch):
-    """A saved job's defects, readable without loading it back into Tabs 1-6."""
+def test_tab7_job_tooltip_describes_the_variation(state, backgrounds, monkeypatch):
+    """A saved job's defect settings, readable without loading it back into Tabs 1-6."""
     from PySide6.QtWidgets import QMessageBox
-    from dotgen.core.classes import build_classes
 
     monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
 
     tab = Tab7Export(state)
     prepare_job(state, backgrounds)
-    state.set_line_defect("squeeze", enabled=True, p_line=0.5)
-    state.set_classes(
-        build_classes(state.job_characters(), state.lines, line_defects=state.line_defects)
-    )
+    state.update_variation(p_dot=0.25, distribution="normal")
     tab._save_job()
 
     tip = tab.job_list.item(0).toolTip()
 
-    assert "Line horizontally squeezed" in tip
-    assert "Top of line lost" not in tip
+    assert "25% of dots (normal)" in tip
+    assert "ok >= 0, minor >= 0.02, severe >= 0.06" in tip
 
 
-def test_tab7_job_tooltip_says_none_when_nothing_is_armed(state, backgrounds, monkeypatch):
+def test_tab7_job_tooltip_says_off_when_nothing_is_varied(state, backgrounds, monkeypatch):
     from PySide6.QtWidgets import QMessageBox
 
     monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
@@ -1955,15 +2020,23 @@ def test_tab7_job_tooltip_says_none_when_nothing_is_armed(state, backgrounds, mo
     prepare_job(state, backgrounds)
     tab._save_job()
 
-    assert tab.job_list.item(0).toolTip().endswith("Defects: none")
+    assert "Dot variation: off" in tab.job_list.item(0).toolTip()
 
 
-def test_tab7_asks_before_exporting_a_probably_empty_defect_class(
+def test_tab7_offers_yolo_obb_3op(state):
+    tab = Tab7Export(state)
+
+    assert tab.format_combo.findText("yolo-obb-3op") >= 0
+
+    tab.format_combo.setCurrentText("yolo-obb-3op")
+    assert state.export.fmt == "yolo-obb-3op"
+
+
+def test_tab7_asks_before_a_3op_export_that_can_only_be_level_0(
     state, backgrounds, monkeypatch, tmp_path
 ):
     """The warning is a question, and Cancel means nothing is written."""
     from PySide6.QtWidgets import QMessageBox
-    from dotgen.core.classes import build_classes
 
     asked: list[str] = []
 
@@ -1976,16 +2049,12 @@ def test_tab7_asks_before_exporting_a_probably_empty_defect_class(
 
     tab = Tab7Export(state)
     exportable_job(state, backgrounds)
-    state.set_line_defect("top_loss", enabled=True, p_line=0.01)
-    state.set_classes(
-        build_classes(state.job_characters(), state.lines, line_defects=state.line_defects)
-    )
     tab._save_job()
-    state.set_export(out_dir=str(tmp_path), images_per_job=2)
+    state.set_export(out_dir=str(tmp_path), images_per_job=2, fmt="yolo-obb-3op")
 
     tab._export()
 
-    assert any("line_top_loss" in t for t in asked)
+    assert any("level 0" in t for t in asked)
     assert not (tmp_path / "data.yaml").exists()
 
 
