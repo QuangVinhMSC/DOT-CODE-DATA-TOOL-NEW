@@ -6,7 +6,6 @@ import pytest
 
 from dotgen.core.layout import (
     MAX_ATTEMPTS,
-    MIN_SCALE,
     LayoutError,
     layout_job,
 )
@@ -383,18 +382,17 @@ def test_characters_with_no_saved_format_are_skipped_but_still_advance(make_job)
 
 
 # ----------------------------------------------------------------------
-# fitting: shrink, then fail
+# fitting: full size, or fail -- never shrink
 # ----------------------------------------------------------------------
 
 
-def test_a_tight_quad_shrinks_the_block_instead_of_overflowing(make_job):
+def test_a_tight_quad_raises_instead_of_shrinking_the_block(make_job):
+    """The quad says where the code goes, never how big it is."""
     quad = Quad([(100, 100), (150, 100), (150, 160), (100, 160)])
     job = make_job(lines=("12", "34"), quad=quad)
 
-    lines = run(job, 0)
-
-    assert lines[0].scale < 1.0
-    assert all(inside(quad, c.bbox) for c in all_chars(lines))
+    with pytest.raises(LayoutError):
+        run(job, 0)
 
 
 def test_a_hopeless_quad_raises_layout_error_naming_the_background(make_job):
@@ -408,11 +406,28 @@ def test_a_hopeless_quad_raises_layout_error_naming_the_background(make_job):
     assert str(MAX_ATTEMPTS) in str(exc.value)
 
 
-def test_the_block_never_shrinks_below_the_floor(make_job):
-    quad = Quad([(60, 60), (110, 60), (110, 120), (60, 120)])
-    job = make_job(lines=("12", "34"), quad=quad)
+def test_a_block_that_fits_is_placed_at_full_size(make_job):
+    job = make_job(lines=("12", "34"))
 
-    assert run(job, 0)[0].scale >= MIN_SCALE
+    for seed in range(10):
+        assert all(line.scale == 1.0 for line in run(job, seed))
+
+
+def test_the_quad_does_not_change_the_printed_size(make_job):
+    """A big quad and a just-big-enough one print the same-sized glyphs."""
+    big = make_job(lines=("12", "34"))
+    sizes = [c.ink.shape for c in all_chars(run(big, 0))]
+
+    block = run(big, 0)
+    x0 = min(c.bbox[0] for c in all_chars(block))
+    y0 = min(c.bbox[1] for c in all_chars(block))
+    x1 = max(c.bbox[0] + c.bbox[2] for c in all_chars(block))
+    y1 = max(c.bbox[1] + c.bbox[3] for c in all_chars(block))
+
+    snug = Quad([(x0 - 2, y0 - 2), (x1 + 2, y0 - 2), (x1 + 2, y1 + 2), (x0 - 2, y1 + 2)])
+    tight = make_job(lines=("12", "34"), quad=snug)
+
+    assert [c.ink.shape for c in all_chars(run(tight, 0))] == sizes
 
 
 def test_an_empty_job_places_nothing_rather_than_failing(make_job):
@@ -649,15 +664,18 @@ def test_a_turned_block_still_lands_inside_the_quad(make_job):
             assert inside(quad, char.bbox), f"seed {seed}: {char.char} at {char.bbox}"
 
 
-def test_a_turned_block_shrinks_rather_than_leaving_the_quad(make_job):
-    """A block turned in a tight quad is wider than it was, and has to fit."""
+def test_a_turned_block_too_big_for_the_quad_raises_rather_than_shrinking(make_job):
+    """Turning a block widens it; if that no longer fits, it is an error."""
     quad = Quad([(60, 60), (360, 60), (360, 260), (60, 260)])
     job = make_job(lines=("12345",), spacing=60.0, quad=quad)
     set_rotation(job, 45.0)
 
-    line = run(job, 0)[0]
+    try:
+        line = run(job, 0)[0]
+    except LayoutError:
+        return
 
-    assert line.scale <= 1.0
+    assert line.scale == 1.0
     assert inside(quad, line.bbox)
 
 # ----------------------------------------------------------------------

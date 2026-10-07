@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 
 from dotgen.core import layout, line_defects
-from dotgen.core.layout import layout_job
+from dotgen.core.layout import LayoutError, layout_job
 from dotgen.core.models import DEFECT_KINDS, Quad
 
 # ----------------------------------------------------------------------
@@ -382,8 +382,8 @@ def test_every_char_box_is_inside_the_base_quad_with_every_geometry_defect_armed
             assert inside(quad, line.bbox), f"seed {seed}: line {line.index}"
 
 
-def test_a_tight_quad_still_places_a_defected_block(make_job):
-    """The defects only move characters inward, so the shrink search is intact."""
+def test_a_tight_quad_never_shrinks_a_defected_block(make_job):
+    """In a tight quad a defected block lands full-size inside it, or raises."""
     quad = Quad([(100, 100), (200, 100), (200, 200), (100, 200)])
     job = make_job(lines=("1234", "5678"), spacing=SPACING, quad=quad)
 
@@ -391,11 +391,14 @@ def test_a_tight_quad_still_places_a_defected_block(make_job):
         arm(job, kind)
 
     for seed in range(20):
-        lines = run(job, seed)
+        try:
+            lines = run(job, seed)
+        except LayoutError:
+            continue
+
         chars = all_chars(lines)
 
-        assert chars, f"seed {seed} placed nothing"
-        assert lines[0].scale >= 0.25
+        assert all(line.scale == 1.0 for line in lines)
         assert all(inside(quad, c.bbox) for c in chars)
 
 

@@ -67,6 +67,14 @@ QLabel#banner {
     border-radius: 3px;
     padding: 5px 8px;
 }
+QLabel#alarm {
+    background: #fde2e2;
+    color: #a01818;
+    border: 1px solid #c82828;
+    border-radius: 3px;
+    padding: 5px 8px;
+    font-weight: bold;
+}
 QLabel#zoomBadge {
     background: rgba(0, 0, 0, 150);
     color: white;

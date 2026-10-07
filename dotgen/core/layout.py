@@ -13,11 +13,11 @@ would break the spacings the user typed in Tab 4, so every character is laid out
 in a block-local frame first and the block gets a single random translation.
 That also makes containment cheap: four corners instead of four per character.
 
-*Shrinking is the last resort, not the first.*  A block that does not fit is
-retried at 97 % of its size, then 94 %, and so on.  Below :data:`MIN_SCALE` the
-sample would be too small to be worth training on, so :class:`LayoutError` is
-raised instead and the exporter skips that background -- an unreadable image in
-the dataset is worse than a missing one.
+*The block is never resized to fit.*  Its size comes from the measured print
+(Tabs 1-3) and the spacings typed in Tab 4; the base quadrilateral only says
+where it may land.  A block that does not fit at its printed size raises
+:class:`LayoutError` -- Tab 4 shows that as a warning, and the exporter skips the
+background -- rather than quietly printing smaller dots than were measured.
 
 *The base quadrilateral is an area, not a surface.*  It says where the block
 may land and nothing else -- not how big it is, not what angle it runs at.  The
@@ -28,14 +28,14 @@ the whole block, glyphs and all, once per image.
 *Ink is cropped to its own box.*  :class:`PlacedChar` carries the ink already
 trimmed to the pixels it actually covers, so ``bbox`` is not a prediction about
 where the ink is: it *is* the ink's rectangle, and it is what the block is
-scaled, turned and fitted by.
+turned and fitted by.
 
 *The label rides beside the ink, and turns with it.*  Every ``bbox`` here is
 upright, because an upright rectangle is what a raster crop is; the *label* is
 :mod:`~dotgen.core.polygons`' oriented quadrilateral, built around the dot
 lattice back in :mod:`render_char` and carried through each stage below by the
-very matrix that moved the pixels -- ``_rotate_ink``'s affine, ``_scaled``'s
-resample ratio, ``_place``'s translation.  Nothing re-fits it, so a block turned
+very matrix that moved the pixels -- ``_rotate_ink``'s affine and ``_place``'s
+translation.  Nothing re-fits it, so a block turned
 by ``line.rot`` comes out with labels turned by ``line.rot`` rather than with
 upright boxes full of paper.
 
@@ -57,22 +57,13 @@ from .models import BackgroundSpec, CharSpec, Job, LineSpec, Quad
 from .params import ParamSet
 from .render_char import DEFAULT_DIST_H, DEFAULT_DIST_V, INK_FLOOR, render_char
 
-# Placement attempts before giving up.  Each one shrinks the block a little and
-# draws a fresh translation, so the two searches run together.
+# Placement attempts before giving up.  Each one draws a fresh translation; a
+# non-rectangular quad can reject one spot and accept another.
 MAX_ATTEMPTS = 50
-SHRINK = 0.97
-
-# Below this the characters are too small to label honestly.  ``0.97 ** 46``
-# reaches it, leaving the last few attempts to re-draw translations at the floor.
-MIN_SCALE = 0.25
 
 # What a line gap means when Tab 4 never wrote one -- the same default
 # ``AppState._sync_gaps`` uses for a freshly added line.
 DEFAULT_GAP_COEFF = 2.0
-
-# Scales this close to 1 skip the resample entirely: a full-size block must come
-# out bit-identical to the render, not softened by a round trip through resize.
-_SCALE_EPS = 1e-9
 
 # Rotations under this are no rotation at all: turning a line by a millionth of
 # a degree would still cost every glyph a resample it cannot be improved by.
@@ -124,9 +115,8 @@ class PlacedChar:
 class PlacedLine:
     """One line of characters, with the box that bounds all of them.
 
-    ``scale`` records how far the block had to shrink to fit; it is the same for
-    every line of an image and rides here so the export report can say when a
-    background is consistently too tight.
+    ``scale`` is always 1.0 now -- the block is never resized to fit its quad.
+    The field stays so callers that read it keep working.
 
     ``defects`` lists the line-defect kinds that fired on this line, in
     ``DEFECT_KINDS`` order -- the line's own damage, as opposed to the per-dot
@@ -576,42 +566,6 @@ def _render_block(
 # ----------------------------------------------------------------------
 
 
-def _scaled(raws: list[_Raw], scale: float) -> list[_Raw]:
-    """The same block at ``scale``, ink resampled and offsets scaled with it.
-
-    The polygon is scaled by the ratio the *raster* actually came out at, not
-    by ``scale``: ``cv2.resize`` takes whole pixels, so a 31 px glyph at 0.97
-    is 30 px, which is 0.968 rather than 0.97.  Following the raster is what
-    keeps the label on the ink at the small end of the shrink search, where the
-    rounding is worth a fraction of a dot.
-    """
-    if abs(scale - 1.0) < _SCALE_EPS:
-        return raws
-
-    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
-    out: list[_Raw] = []
-
-    for r in raws:
-        h, w = r.ink.shape[:2]
-        size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
-
-        out.append(
-            _Raw(
-                char=r.char,
-                ink=cv2.resize(r.ink, size, interpolation=interp),
-                offset=(r.offset[0] * scale, r.offset[1] * scale),
-                defects=r.defects,
-                line=r.line,
-                quad=polygons.scaled(r.quad, size[0] / w, size[1] / h),
-                cursor=r.cursor * scale,
-                defect=r.defect,
-                rot=r.rot,
-            )
-        )
-
-    return out
-
-
 def _boxes_at(raws: list[_Raw], centres: np.ndarray) -> list[tuple[float, float, float, float]]:
     """Each character's ``(x, y, w, h)`` given where its centre landed."""
     out: list[tuple[float, float, float, float]] = []
@@ -676,10 +630,11 @@ def _placement_quad(bg: BackgroundSpec) -> Quad:
 def _place(
     raws: list[_Raw], quad: Quad, rng: np.random.Generator
 ) -> tuple[list[_Raw], np.ndarray, float] | None:
-    """Find a scale and a translation that put the whole block inside ``quad``.
+    """Find a translation that puts the whole block inside ``quad``.
 
-    Returns ``(scaled raws, centres, scale)`` or ``None`` when every attempt
-    failed.  The translation is drawn over the range that keeps the block's
+    Returns ``(raws, centres, 1.0)`` or ``None`` when every attempt failed.
+    The block keeps its printed size -- it is never scaled to fit.  The
+    translation is drawn over the range that keeps the block's
     bounding box inside the quad's *bounding rectangle*; the quad itself is then
     tested exactly, which is what rejects a corner poking out of a non-rectangular
     quadrilateral.
@@ -696,26 +651,22 @@ def _place(
     qx1, qy1 = float(contour[:, 0].max()), float(contour[:, 1].max())
 
     local = np.array([r.offset for r in raws], dtype=np.float64)
+    box = _union(_boxes_at(raws, local))
 
-    for attempt in range(MAX_ATTEMPTS):
-        scale = max(SHRINK**attempt, MIN_SCALE)
-        scaled = _scaled(raws, scale)
+    lo_x, hi_x = qx0 - box[0], qx1 - (box[0] + box[2])
+    lo_y, hi_y = qy0 - box[1], qy1 - (box[1] + box[3])
 
-        box = _union(_boxes_at(scaled, local * scale))
+    if hi_x < lo_x or hi_y < lo_y:
+        return None  # wider or taller than the quad: no translation can help
 
-        lo_x, hi_x = qx0 - box[0], qx1 - (box[0] + box[2])
-        lo_y, hi_y = qy0 - box[1], qy1 - (box[1] + box[3])
-
-        if hi_x < lo_x or hi_y < lo_y:
-            continue  # the block is wider or taller than the quad: shrink
-
+    for _ in range(MAX_ATTEMPTS):
         tx = float(rng.uniform(lo_x, hi_x))
         ty = float(rng.uniform(lo_y, hi_y))
 
-        centres = local * scale + (tx, ty)
+        centres = local + (tx, ty)
 
-        if _contains(contour, _union(_boxes_at(scaled, centres))):
-            return scaled, centres, scale
+        if _contains(contour, _union(_boxes_at(raws, centres))):
+            return raws, centres, 1.0
 
     return None
 
@@ -758,8 +709,9 @@ def layout_job(job: Job, bg: BackgroundSpec, rng: np.random.Generator) -> list[P
     if result is None:
         raise LayoutError(
             f"The text block does not fit inside the base quadrilateral of "
-            f"{bg.path or 'the background'} (tried {MAX_ATTEMPTS} placements down "
-            f"to {MIN_SCALE:.0%} scale)."
+            f"{bg.path or 'the background'} at its printed size (tried "
+            f"{MAX_ATTEMPTS} placements).  Draw a larger quadrilateral, or reduce "
+            f"the spacings or the number of characters."
         )
 
     scaled, centres, scale = result

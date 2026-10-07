@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 
 from ...core import registry
 from ...core.imageops import load_image
+from ...core.layout import LayoutError
 from ...core.models import DEFECT_CLASS_PREFIX, DefectSpec, Quad
 from ...core.params import RangeParam
 from ...core.state import AppState
@@ -165,6 +166,14 @@ class Tab4Job(QWidget):
         self.banner.setWordWrap(True)
         self.banner.setVisible(False)
         lay.addWidget(self.banner)
+
+        # The block is never shrunk to fit its quad, so a quad that is too
+        # small is an error the user has to see, not a status-bar footnote.
+        self.fit_alarm = QLabel("")
+        self.fit_alarm.setObjectName("alarm")
+        self.fit_alarm.setWordWrap(True)
+        self.fit_alarm.setVisible(False)
+        lay.addWidget(self.fit_alarm)
 
         self.canvas = ImageCanvas()
         self.canvas.roiFinished.connect(self._on_roi)
@@ -462,6 +471,7 @@ class Tab4Job(QWidget):
             self.banner.setVisible(False)
 
         if self.active_bg < 0:
+            self._set_fit_alarm(None)
             self.canvas.set_image(None)
             self.canvas.clear_overlays()
             self._box_items = []
@@ -486,6 +496,7 @@ class Tab4Job(QWidget):
         """Background plus the characters and lines, drawn at its centre."""
         image = spec.array
         quads: list[tuple] = []
+        alarm: str | None = None
 
         if image is not None and self.state.has_content():
             job = self.state.snapshot_job("preview")
@@ -496,14 +507,28 @@ class Tab4Job(QWidget):
                 )
                 image = composed.image
                 quads = list(composed.quads)
+            except LayoutError:
+                alarm = (
+                    f"Background #{self.active_bg + 1}: the dot code does not fit "
+                    "inside the base quadrilateral at its printed size.  Draw a "
+                    "larger quadrilateral, or reduce the spacings or the number "
+                    "of characters.  This background will be skipped on export."
+                )
+                self.statusMessage.emit(alarm)
             except Exception as exc:  # noqa: BLE001 - a preview must never crash the tab
                 self.statusMessage.emit(f"Preview unavailable: {exc}")
+
+        self._set_fit_alarm(alarm)
 
         first = self._shown_bg != self.active_bg
         self.canvas.set_image(image, keep_view=not first)
         self._shown_bg = self.active_bg
         self._sync_quad_overlay(spec, rebuilt=first)
         self._sync_box_overlay(quads, image)
+
+    def _set_fit_alarm(self, text: str | None) -> None:
+        self.fit_alarm.setText(text or "")
+        self.fit_alarm.setVisible(bool(text))
 
     def _sync_box_overlay(self, quads, image) -> None:
         """The composed labels, drawn where they landed -- pad included.
